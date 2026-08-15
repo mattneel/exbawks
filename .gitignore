@@ -11,6 +11,7 @@
 *.trace.jsonl
 *.profraw
 *.profdata
+__pycache__/
 .DS_Store
 Thumbs.db
 /fixtures/private/

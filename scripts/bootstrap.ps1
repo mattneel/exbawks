@@ -19,8 +19,19 @@ if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
 }
 
 rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --target x86_64-pc-windows-msvc
+if ($LASTEXITCODE -ne 0) {
+    throw "rustup toolchain install failed with exit code $LASTEXITCODE."
+}
+
 rustup override set 1.97.1
+if ($LASTEXITCODE -ne 0) {
+    throw "rustup override set failed with exit code $LASTEXITCODE."
+}
+
 cargo fetch
+if ($LASTEXITCODE -ne 0) {
+    throw "cargo fetch failed with exit code $LASTEXITCODE."
+}
 
 Write-Host "Exbawks tools are ready."
 Write-Host "Run: cargo xtask check"

@@ -28,7 +28,7 @@ if (Test-Path -LiteralPath $path) {
 }
 
 $content = @"
-# ADR $prefix: $Title
+# ADR ${prefix}: $Title
 
 ## Status
 

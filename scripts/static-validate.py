@@ -41,6 +41,7 @@ EXPECTED_FILES = {
     "docs/task-board.md",
     "fixtures/synthetic/minimal-retail.xbe",
 }
+EXCLUDED_ROOT_DIRECTORIES = {".git", ".idea", ".vscode", "target"}
 MARKDOWN_LINK = re.compile(r"!?(?:\[[^\]]*\])\(([^)]+)\)")
 MODULE_DECLARATION = re.compile(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
 
@@ -83,12 +84,25 @@ def relative(root: Path, path: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
+def repo_files(root: Path, pattern: str = "*") -> list[Path]:
+    """List repository files, skipping build output and local-only data."""
+    selected: list[Path] = []
+    for path in root.rglob(pattern):
+        if not path.is_file():
+            continue
+        directories = path.relative_to(root).parts[:-1]
+        if directories and directories[0] in EXCLUDED_ROOT_DIRECTORIES:
+            continue
+        if "__pycache__" in directories:
+            continue
+        if directories[:2] == ("fixtures", "private"):
+            continue
+        selected.append(path)
+    return sorted(selected)
+
+
 def text_files(root: Path) -> list[Path]:
-    return sorted(
-        path
-        for path in root.rglob("*")
-        if path.is_file() and path.suffix.lower() in TEXT_SUFFIXES
-    )
+    return [path for path in repo_files(root) if path.suffix.lower() in TEXT_SUFFIXES]
 
 
 def check_expected_files(root: Path) -> str:
@@ -125,7 +139,7 @@ def check_text_hygiene(root: Path) -> str:
 
 
 def check_toml(root: Path) -> str:
-    files = sorted(root.rglob("*.toml"))
+    files = repo_files(root, "*.toml")
     for path in files:
         with path.open("rb") as stream:
             tomllib.load(stream)
@@ -138,7 +152,7 @@ def check_yaml(root: Path) -> str:
     except ImportError as error:
         raise OptionalCheckUnavailable("skipped YAML parsing because PyYAML is unavailable") from error
 
-    files = sorted([*root.rglob("*.yml"), *root.rglob("*.yaml")])
+    files = sorted([*repo_files(root, "*.yml"), *repo_files(root, "*.yaml")])
     for path in files:
         with path.open("r", encoding="utf-8") as stream:
             yaml.safe_load(stream)
@@ -146,7 +160,7 @@ def check_yaml(root: Path) -> str:
 
 
 def check_python(root: Path) -> str:
-    files = sorted(root.rglob("*.py"))
+    files = repo_files(root, "*.py")
     for path in files:
         ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     return f"parsed {len(files)} Python files"
@@ -190,7 +204,7 @@ def check_workspace(root: Path) -> str:
 
 def check_rust_modules(root: Path) -> str:
     declarations = 0
-    for path in sorted(root.rglob("*.rs")):
+    for path in repo_files(root, "*.rs"):
         text = path.read_text(encoding="utf-8")
         for name in MODULE_DECLARATION.findall(text):
             declarations += 1
@@ -244,7 +258,7 @@ def skip_rust_literal(text: str, index: int) -> int | None:
 def check_rust_delimiters(root: Path) -> str:
     pairs = {"(": ")", "[": "]", "{": "}"}
     closers = set(pairs.values())
-    files = sorted(root.rglob("*.rs"))
+    files = repo_files(root, "*.rs")
     for path in files:
         text = path.read_text(encoding="utf-8")
         stack: list[tuple[str, int]] = []
@@ -296,7 +310,7 @@ def check_rust_delimiters(root: Path) -> str:
 
 def check_markdown_links(root: Path) -> str:
     checked = 0
-    for path in sorted(root.rglob("*.md")):
+    for path in repo_files(root, "*.md"):
         text = path.read_text(encoding="utf-8")
         for raw_target in MARKDOWN_LINK.findall(text):
             target = raw_target.strip().split()[0].strip("<>")
@@ -342,7 +356,7 @@ def check_fixture(root: Path) -> str:
 
 
 def check_unsafe_comments(root: Path) -> str:
-    files = sorted(root.rglob("*.rs"))
+    files = repo_files(root, "*.rs")
     unsafe_blocks = 0
     for path in files:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -361,9 +375,7 @@ def check_unsafe_comments(root: Path) -> str:
 def check_private_data_rules(root: Path) -> str:
     forbidden_suffixes = {".iso", ".xbe.orig", ".bin", ".rom"}
     violations = []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
+    for path in repo_files(root):
         rel = relative(root, path)
         if rel == "fixtures/synthetic/minimal-retail.xbe":
             continue
