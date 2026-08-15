@@ -38,7 +38,9 @@ unsafe extern "system" {
     fn VirtualFree(address: *mut c_void, size: usize, free_type: u32) -> i32;
 }
 
-#[link(name = "KernelBase")]
+// Windows SDKs do not ship a KernelBase import library by default, so bind
+// the placeholder APIs directly against kernelbase.dll.
+#[link(name = "kernelbase", kind = "raw-dylib")]
 unsafe extern "system" {
     fn VirtualAlloc2(
         process: Handle,
@@ -203,14 +205,14 @@ impl Placeholder {
         };
         let result = NonNull::new(result).ok_or_else(|| last_error("VirtualAlloc2"))?;
 
-        if let Some(requested) = base {
-            if result.as_ptr() as usize != requested {
-                // SAFETY: The call releases the range returned by VirtualAlloc2.
-                let _ = unsafe { VirtualFree(result.as_ptr(), 0, MEM_RELEASE) };
-                return Err(PlatformError::InvalidArgument(
-                    "VirtualAlloc2 returned a different requested address",
-                ));
-            }
+        if let Some(requested) = base
+            && result.as_ptr() as usize != requested
+        {
+            // SAFETY: The call releases the range returned by VirtualAlloc2.
+            let _ = unsafe { VirtualFree(result.as_ptr(), 0, MEM_RELEASE) };
+            return Err(PlatformError::InvalidArgument(
+                "VirtualAlloc2 returned a different requested address",
+            ));
         }
 
         Ok(Self { base: result, len, armed: true })
