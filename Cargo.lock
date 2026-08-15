@@ -178,6 +178,7 @@ dependencies = [
  "exbawks-types",
  "parking_lot",
  "serde",
+ "thiserror",
 ]
 
 [[package]]
@@ -194,6 +195,7 @@ name = "exbawks-jit"
 version = "0.1.0"
 dependencies = [
  "exbawks-cpu",
+ "exbawks-debug",
  "exbawks-memory",
  "exbawks-platform",
  "exbawks-types",

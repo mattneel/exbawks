@@ -23,6 +23,8 @@ The project follows Keep a Changelog structure before its first release.
 - Register-only direct emission and a dispatcher under the ADR 0006 block
   ABI, verified against an interpreter oracle; `exbawks plan` now reports
   the `Executable` state on Windows (`JIT-002`).
+- Immutable sorted source ranges and fault-site records for every emitted
+  block, with binary-search host-to-guest lookups (`JIT-003`).
 - Initial Rust workspace scaffold.
 - XBE parser and synthetic tests.
 - Software guest address space.

@@ -1,6 +1,7 @@
 use exbawks_cpu::{
     AluOp, CpuState, DecodedBlock, Gpr, RegisterOp, RegisterOperand, classify_register_op, flags,
 };
+use exbawks_debug::{BlockSourceMap, SourceRange};
 use exbawks_platform::{ExecutableCodeBuffer, WritableCodeBuffer};
 use exbawks_types::GuestVa;
 
@@ -20,6 +21,7 @@ pub struct EmittedBlock {
     exit_eip: GuestVa,
     static_exit: BlockExit,
     translated_instructions: usize,
+    source_map: BlockSourceMap,
 }
 
 impl EmittedBlock {
@@ -53,6 +55,12 @@ impl EmittedBlock {
         self.translated_instructions
     }
 
+    /// Returns the sorted source and fault metadata.
+    #[must_use]
+    pub const fn source_map(&self) -> &BlockSourceMap {
+        &self.source_map
+    }
+
     pub(crate) const fn code(&self) -> &ExecutableCodeBuffer {
         &self.code
     }
@@ -74,6 +82,7 @@ impl DirectEmitter {
         }
 
         let mut assembler = BlockAssembler::default();
+        let mut ranges = Vec::new();
         let mut translated_instructions = 0_usize;
         let mut static_exit = BlockExit::DirectSuccessor;
         let mut exit_eip = block.end().ok_or(JitError::BlockEndOverflow { start: block.start })?;
@@ -85,12 +94,20 @@ impl DirectEmitter {
                 break;
             };
 
+            let host_start = host_offset(block.start, assembler.len())?;
             assembler.register_op(op);
+            ranges.push(SourceRange {
+                host_start,
+                host_end: host_offset(block.start, assembler.len())?,
+                guest_ip: GuestVa(u32::try_from(instruction.ip()).unwrap_or(u32::MAX)),
+                guest_len: host_offset(block.start, instruction.len())?,
+            });
             translated_instructions += 1;
         }
 
         assembler.epilogue(exit_eip, static_exit);
         let bytes = assembler.finish();
+        let source_map = BlockSourceMap::new(ranges, Vec::new())?;
 
         let mut buffer = WritableCodeBuffer::new(bytes.len())?;
         buffer.push(&bytes)?;
@@ -103,8 +120,14 @@ impl DirectEmitter {
             exit_eip,
             static_exit,
             translated_instructions,
+            source_map,
         })
     }
+}
+
+/// Converts one host offset into the 32-bit metadata range.
+fn host_offset(start: GuestVa, value: usize) -> Result<u32, JitError> {
+    u32::try_from(value).map_err(|_| JitError::MetadataOverflow { start })
 }
 
 /// Assembles host x86-64 bytes with `RCX` as the `CpuState` pointer.
@@ -114,9 +137,14 @@ struct BlockAssembler {
 }
 
 impl BlockAssembler {
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
     fn register_op(&mut self, op: RegisterOp) {
         match op {
-            RegisterOp::Nop => {}
+            // One host nop keeps a non-empty source range for the guest nop.
+            RegisterOp::Nop => self.bytes.push(0x90),
             RegisterOp::Mov { dst, src } => {
                 self.load_eax(src);
                 self.store_gpr_eax(dst);

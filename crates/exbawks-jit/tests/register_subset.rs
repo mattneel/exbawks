@@ -184,6 +184,48 @@ fn blocks_return_through_one_dispatcher_exit() {
 }
 
 #[test]
+fn every_translated_instruction_has_one_source_range() {
+    let mut code = Vec::new();
+    code.extend(mov_imm(Gpr::Eax, 5));
+    code.push(0x90);
+    code.extend(alu_reg(0x01, Gpr::Eax, Gpr::Ebx));
+    code.push(0xC3);
+
+    let block = BasicBlockDecoder::default()
+        .decode(GuestVa(START), &code)
+        .expect("guest bytes must decode");
+    let emitted = DirectEmitter.emit(&block).expect("emission succeeds");
+    let map = emitted.source_map();
+
+    assert_eq!(map.ranges().len(), emitted.translated_instructions());
+    assert_eq!(map.ranges().len(), 3);
+
+    // The translated prefix is completely covered, in guest order, with no
+    // gap before the epilogue.
+    let mut expected_host = 0;
+    let expected_guest = [(START, 5), (START + 5, 1), (START + 6, 2)];
+    for (range, (guest_ip, guest_len)) in map.ranges().iter().zip(expected_guest) {
+        assert_eq!(range.host_start, expected_host);
+        assert!(range.host_end > range.host_start);
+        assert_eq!(range.guest_ip, GuestVa(guest_ip));
+        assert_eq!(range.guest_len, guest_len);
+        expected_host = range.host_end;
+
+        let middle = range.host_start + (range.host_end - range.host_start) / 2;
+        let found = map.source_for_host_offset(middle).expect("lookup succeeds");
+        assert_eq!(found.guest_ip, range.guest_ip);
+    }
+
+    // Epilogue offsets have no guest source.
+    assert!(map.source_for_host_offset(expected_host).is_none());
+    let last = u32::try_from(emitted.machine_code().len() - 1).expect("offset fits");
+    assert!(map.source_for_host_offset(last).is_none());
+
+    // The register-only subset emits no faultable host instructions.
+    assert!(map.faults().is_empty());
+}
+
+#[test]
 fn empty_blocks_are_rejected() {
     let block =
         BasicBlockDecoder::default().decode(GuestVa(START), &[]).expect("empty input decodes");

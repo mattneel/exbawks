@@ -26,6 +26,14 @@ pub struct CompiledBlock {
     pub executable: Option<EmittedBlock>,
 }
 
+impl CompiledBlock {
+    /// Returns the source and fault metadata of executable blocks.
+    #[must_use]
+    pub fn source_map(&self) -> Option<&exbawks_debug::BlockSourceMap> {
+        self.executable.as_ref().map(EmittedBlock::source_map)
+    }
+}
+
 /// A dynamic code-generation backend.
 pub trait CodegenBackend: Send + Sync {
     /// Returns the backend identifier.

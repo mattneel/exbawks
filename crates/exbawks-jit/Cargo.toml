@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 exbawks-cpu.workspace = true
+exbawks-debug.workspace = true
 exbawks-memory.workspace = true
 exbawks-platform.workspace = true
 exbawks-types.workspace = true

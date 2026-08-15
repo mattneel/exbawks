@@ -28,6 +28,15 @@ pub enum JitError {
         /// The raw returned value.
         value: u64,
     },
+    /// Emitted code exceeded the 32-bit metadata offset range.
+    #[error("emitted block for {start} exceeds the metadata offset range")]
+    MetadataOverflow {
+        /// The guest block start.
+        start: GuestVa,
+    },
+    /// Block metadata construction failed.
+    #[error(transparent)]
+    Metadata(#[from] exbawks_debug::SourceMapError),
     /// A host platform operation failed.
     #[error(transparent)]
     Platform(#[from] PlatformError),
