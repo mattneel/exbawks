@@ -7,7 +7,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use exbawks_core::{BootPlanReport, EmulatorBuilder, EmulatorConfig, KernelThunkTable};
 use exbawks_cpu::{BasicBlockDecoder, DecodeConfig, format_instruction};
-use exbawks_platform::probe_host_capabilities;
+use exbawks_platform::{
+    HostCapabilities, SystemMemoryInfo, probe_host_capabilities, query_system_memory_info,
+};
 use exbawks_types::{BackendKind, GuestVa};
 use exbawks_xbe::XbeImage;
 use serde::Serialize;
@@ -131,23 +133,42 @@ fn initialize_tracing() {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
+#[derive(Debug, Serialize)]
+struct DoctorReport {
+    #[serde(flatten)]
+    capabilities: HostCapabilities,
+    memory: Option<SystemMemoryInfo>,
+}
+
 fn doctor(json: bool) -> Result<()> {
-    let capabilities = probe_host_capabilities();
+    let report = DoctorReport {
+        capabilities: probe_host_capabilities(),
+        memory: query_system_memory_info().ok(),
+    };
+
     if json {
-        print_json(&capabilities)
-    } else {
-        println!("Operating system:       {}", capabilities.operating_system);
-        println!("Architecture:           {}", capabilities.architecture);
-        println!("Windows x86-64 target:  {}", yes_no(capabilities.supported_runtime_target));
-        println!("Placeholder views:      {}", yes_no(capabilities.placeholder_views));
-        println!("FSGSBASE available:     {}", yes_no(capabilities.fsgsbase));
-        if !capabilities.supported_runtime_target {
-            println!(
-                "Runtime status:         unsupported for execution; logic tools remain available"
-            );
-        }
-        Ok(())
+        return print_json(&report);
     }
+
+    let capabilities = &report.capabilities;
+    println!("Operating system:       {}", capabilities.operating_system);
+    println!("Architecture:           {}", capabilities.architecture);
+    println!("Windows x86-64 target:  {}", yes_no(capabilities.supported_runtime_target));
+    println!("Placeholder views:      {}", yes_no(capabilities.placeholder_views));
+    println!("FSGSBASE available:     {}", yes_no(capabilities.fsgsbase));
+    match report.memory {
+        Some(memory) => {
+            println!("Host page size:         {} bytes", memory.page_size);
+            println!("Allocation granularity: {} bytes", memory.allocation_granularity);
+        }
+        None => {
+            println!("Memory geometry:        unavailable on this host");
+        }
+    }
+    if !capabilities.supported_runtime_target {
+        println!("Runtime status:         unsupported for execution; logic tools remain available");
+    }
+    Ok(())
 }
 
 fn inspect(path: &Path, json: bool) -> Result<()> {

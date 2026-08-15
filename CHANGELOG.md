@@ -8,6 +8,8 @@ The project follows Keep a Changelog structure before its first release.
 
 ### Added
 
+- Host memory geometry queries; `exbawks doctor` reports the host page size
+  and allocation granularity (`MEM-001`).
 - Initial Rust workspace scaffold.
 - XBE parser and synthetic tests.
 - Software guest address space.
