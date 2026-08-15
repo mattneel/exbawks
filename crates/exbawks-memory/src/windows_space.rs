@@ -4,8 +4,9 @@ use exbawks_platform::virtual_memory::{MappedView, PageProtection, PagefileSecti
 use exbawks_types::{AccessKind, GUEST_PAGE_SIZE, GuestPa, GuestRange, GuestVa, MemoryPermissions};
 use parking_lot::{Mutex, RwLock};
 
+use crate::access::{AccessBuffer, align_up, physical_offset, walk_pages};
 use crate::allocator::PhysicalAllocator;
-use crate::{GUEST_ARENA_SIZE, GuestArena, MemoryError, PageTable};
+use crate::{GUEST_ARENA_SIZE, GuestArena, GuestMemory, MemoryError, PageTable};
 
 /// The sparse Windows implementation of the guest address space.
 ///
@@ -126,6 +127,36 @@ impl WindowsAddressSpace {
         self.map_view(range, physical_start, permissions)
     }
 
+    /// Maps a virtual region and copies initial bytes into it.
+    pub fn load_region(
+        &self,
+        address: GuestVa,
+        virtual_size: u32,
+        initial: &[u8],
+        permissions: MemoryPermissions,
+    ) -> Result<GuestPa, MemoryError> {
+        if initial.len() > virtual_size as usize {
+            return Err(MemoryError::HostSizeOverflow);
+        }
+
+        let rounded_size = align_up(u64::from(virtual_size), u64::from(GUEST_PAGE_SIZE))?;
+        let range = GuestRange::page_aligned(address, rounded_size)?;
+        let temporary_permissions = permissions | MemoryPermissions::WRITE;
+        let physical = self.map_anonymous(range, temporary_permissions)?;
+        self.write(address, initial)?;
+        self.table.protect(range, permissions)?;
+        Ok(physical)
+    }
+
+    /// Changes page permissions for a page-aligned range.
+    pub fn protect(
+        &self,
+        range: GuestRange,
+        permissions: MemoryPermissions,
+    ) -> Result<(), MemoryError> {
+        self.table.protect(range, permissions)
+    }
+
     /// Unmaps one complete mapped view and restores its placeholder.
     pub fn unmap(&self, range: GuestRange) -> Result<(), MemoryError> {
         range.require_page_alignment()?;
@@ -177,10 +208,14 @@ impl WindowsAddressSpace {
         let start = u64::from(range.start().0);
         let placeholder = regions.carve(start, range.len())?;
 
+        // Arena views always stay host read-write. Guest permissions live in
+        // the sidecar page table, which every checked access consults, so
+        // both backends enforce identical rules. Host protection tightening
+        // arrives with write-fault code invalidation.
         let view = match self.section.map_replace(
             placeholder,
             u64::from(physical_start.0),
-            host_protection(permissions),
+            PageProtection::ReadWrite,
         ) {
             Ok(view) => view,
             Err(replace) => {
@@ -202,9 +237,86 @@ impl WindowsAddressSpace {
         regions.views.insert(start, view);
         Ok(())
     }
+
+    /// Performs one validated access through the mapped views.
+    fn access(
+        &self,
+        access: AccessKind,
+        address: GuestVa,
+        mut buffer: AccessBuffer<'_>,
+    ) -> Result<(), MemoryError> {
+        if buffer.is_empty() {
+            return Ok(());
+        }
+
+        let length = u64::try_from(buffer.len()).map_err(|_| MemoryError::HostSizeOverflow)?;
+        let _ = GuestRange::new(address, length)?;
+
+        let regions = self.regions.read();
+        walk_pages(&self.table, access, address, buffer.len(), |current, descriptor, _, chunk| {
+            let offset = physical_offset(descriptor.physical_page(), current.page_offset())?;
+            let end = offset.checked_add(chunk).ok_or(MemoryError::HostSizeOverflow)?;
+            if end > self.physical_bytes {
+                return Err(MemoryError::PhysicalOutOfRange {
+                    address: descriptor.physical_page().start_pa(),
+                });
+            }
+            if regions.view_at(u64::from(current.0)).is_none() {
+                return Err(MemoryError::Unmapped { address: current, access });
+            }
+            Ok(())
+        })?;
+
+        match &mut buffer {
+            AccessBuffer::Read(output) => {
+                let len = output.len();
+                walk_pages(&self.table, access, address, len, |current, _, offset, chunk| {
+                    let (view, view_offset) = regions
+                        .view_at(u64::from(current.0))
+                        .ok_or(MemoryError::Unmapped { address: current, access })?;
+                    view.read_at(view_offset, &mut output[offset..offset + chunk])?;
+                    Ok(())
+                })
+            }
+            AccessBuffer::Write(input) => {
+                let len = input.len();
+                walk_pages(&self.table, access, address, len, |current, _, offset, chunk| {
+                    let (view, view_offset) = regions
+                        .view_at(u64::from(current.0))
+                        .ok_or(MemoryError::Unmapped { address: current, access })?;
+                    view.write_at(view_offset, &input[offset..offset + chunk])?;
+                    Ok(())
+                })
+            }
+        }
+    }
+}
+
+impl GuestMemory for WindowsAddressSpace {
+    fn read(&self, address: GuestVa, output: &mut [u8]) -> Result<(), MemoryError> {
+        self.access(AccessKind::Read, address, AccessBuffer::Read(output))
+    }
+
+    fn fetch(&self, address: GuestVa, output: &mut [u8]) -> Result<(), MemoryError> {
+        self.access(AccessKind::Execute, address, AccessBuffer::Read(output))
+    }
+
+    fn write(&self, address: GuestVa, input: &[u8]) -> Result<(), MemoryError> {
+        self.access(AccessKind::Write, address, AccessBuffer::Write(input))
+    }
+
+    fn page_table(&self) -> &PageTable {
+        &self.table
+    }
 }
 
 impl RegionMap {
+    /// Returns the view and view offset that contain one guest position.
+    fn view_at(&self, guest_offset: u64) -> Option<(&MappedView, usize)> {
+        let (&start, view) = self.views.range(..=guest_offset).next_back()?;
+        let offset = guest_offset - start;
+        if offset < view.len() as u64 { Some((view, usize::try_from(offset).ok()?)) } else { None }
+    }
     /// Removes the exact free range and returns its placeholder.
     fn carve(&mut self, start: u64, len: u64) -> Result<Placeholder, MemoryError> {
         let address = GuestVa(start as u32);
@@ -293,21 +405,6 @@ impl RegionMap {
         }
 
         self.free.insert(offset, placeholder);
-    }
-}
-
-/// Returns the host protection for guest permissions.
-///
-/// Arena views never receive host execute permission. Translated code runs
-/// from the separate code cache, and guest execute permission lives in the
-/// sidecar page table.
-fn host_protection(permissions: MemoryPermissions) -> PageProtection {
-    if permissions.contains(MemoryPermissions::WRITE) {
-        PageProtection::ReadWrite
-    } else if permissions.is_empty() {
-        PageProtection::NoAccess
-    } else {
-        PageProtection::ReadOnly
     }
 }
 

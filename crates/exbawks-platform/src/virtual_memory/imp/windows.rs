@@ -53,6 +53,12 @@ unsafe extern "system" {
     fn GetCurrentProcess() -> Handle;
     fn GetLastError() -> u32;
     fn VirtualFree(address: *mut c_void, size: usize, free_type: u32) -> i32;
+    fn VirtualProtect(
+        address: *mut c_void,
+        size: usize,
+        new_protection: u32,
+        old_protection: *mut u32,
+    ) -> i32;
 }
 
 // Windows SDKs do not ship a KernelBase import library by default, so bind
@@ -505,6 +511,28 @@ impl MappedView {
         Ok(())
     }
 
+    /// Changes the host protection of the complete view.
+    pub fn protect(&mut self, protection: PageProtection) -> Result<(), PlatformError> {
+        let mut old_protection = 0_u32;
+        // SAFETY: This object keeps [base, base + len) mapped for its
+        // complete lifetime, and the out-pointer targets one writable stack
+        // value that outlives the call.
+        let changed = unsafe {
+            VirtualProtect(
+                self.base.as_ptr(),
+                self.len,
+                protection.to_raw(),
+                &raw mut old_protection,
+            )
+        };
+        if changed == 0 {
+            return Err(last_error("VirtualProtect"));
+        }
+
+        self.protection = protection;
+        Ok(())
+    }
+
     /// Unmaps the view and returns the restored placeholder.
     ///
     /// A failure returns the still-mapped view to the caller.
@@ -644,6 +672,24 @@ mod tests {
         assert_eq!(third.len(), GRANULARITY);
         second.coalesce_with(third).expect("adjacent coalesce still succeeds");
         assert_eq!(second.len(), 2 * GRANULARITY);
+    }
+
+    #[test]
+    fn view_protection_changes_apply() {
+        let placeholder = Placeholder::reserve(None, GRANULARITY).expect("reserve succeeds");
+        let section = PagefileSection::new(GRANULARITY).expect("section succeeds");
+        let mut view =
+            section.map_replace(placeholder, 0, PageProtection::ReadWrite).expect("view succeeds");
+        view.write_at(0, &[1]).expect("write succeeds");
+
+        view.protect(PageProtection::ReadOnly).expect("protect succeeds");
+        assert!(view.write_at(0, &[2]).is_err());
+        let mut output = [0_u8; 1];
+        view.read_at(0, &mut output).expect("read still succeeds");
+        assert_eq!(output, [1]);
+
+        view.protect(PageProtection::ReadWrite).expect("protect succeeds again");
+        view.write_at(0, &[3]).expect("write succeeds again");
     }
 
     #[test]

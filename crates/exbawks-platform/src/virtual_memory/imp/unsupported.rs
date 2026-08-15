@@ -141,6 +141,12 @@ impl MappedView {
         Err(PlatformError::Unsupported("section views require Windows"))
     }
 
+    /// Changes the host protection of the complete view.
+    pub fn protect(&mut self, protection: PageProtection) -> Result<(), PlatformError> {
+        let _ = protection;
+        Err(PlatformError::Unsupported("section views require Windows"))
+    }
+
     /// Unmaps the view and returns the restored placeholder.
     ///
     /// A failure returns the still-mapped view to the caller.

@@ -1,12 +1,9 @@
-use std::cmp;
-
-use exbawks_types::{
-    AccessKind, GUEST_PAGE_SIZE, GuestPa, GuestPage, GuestRange, GuestVa, MemoryPermissions,
-};
+use exbawks_types::{AccessKind, GUEST_PAGE_SIZE, GuestPa, GuestRange, GuestVa, MemoryPermissions};
 use parking_lot::{Mutex, RwLock};
 
+use crate::access::{AccessBuffer, align_up, physical_offset, walk_pages};
 use crate::allocator::PhysicalAllocator;
-use crate::{MemoryError, PageKind, PageTable};
+use crate::{MemoryError, PageTable};
 
 /// Checked guest memory access used by CPU and HLE components.
 pub trait GuestMemory: Send + Sync {
@@ -190,24 +187,6 @@ impl GuestMemory for SoftwareAddressSpace {
     }
 }
 
-enum AccessBuffer<'a> {
-    Read(&'a mut [u8]),
-    Write(&'a [u8]),
-}
-
-impl AccessBuffer<'_> {
-    const fn len(&self) -> usize {
-        match self {
-            Self::Read(value) => value.len(),
-            Self::Write(value) => value.len(),
-        }
-    }
-
-    const fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
 fn validate_access(
     table: &PageTable,
     physical_len: usize,
@@ -215,15 +194,7 @@ fn validate_access(
     address: GuestVa,
     len: usize,
 ) -> Result<(), MemoryError> {
-    let mut guest = address.0;
-    let mut remaining = len;
-
-    while remaining != 0 {
-        let current = GuestVa(guest);
-        let descriptor = checked_descriptor(table, current, access)?;
-        let page_remaining = usize::try_from(GUEST_PAGE_SIZE - current.page_offset())
-            .map_err(|_| MemoryError::HostSizeOverflow)?;
-        let chunk = cmp::min(page_remaining, remaining);
+    walk_pages(table, access, address, len, |current, descriptor, _, chunk| {
         let offset = physical_offset(descriptor.physical_page(), current.page_offset())?;
         let end = offset.checked_add(chunk).ok_or(MemoryError::HostSizeOverflow)?;
         if end > physical_len {
@@ -231,16 +202,8 @@ fn validate_access(
                 address: descriptor.physical_page().start_pa(),
             });
         }
-
-        remaining -= chunk;
-        if remaining != 0 {
-            guest = guest
-                .checked_add(u32::try_from(chunk).map_err(|_| MemoryError::HostSizeOverflow)?)
-                .ok_or(MemoryError::HostSizeOverflow)?;
-        }
-    }
-
-    Ok(())
+        Ok(())
+    })
 }
 
 fn copy_from_guest(
@@ -250,15 +213,8 @@ fn copy_from_guest(
     address: GuestVa,
     output: &mut [u8],
 ) -> Result<(), MemoryError> {
-    let mut guest = address.0;
-    let mut destination_offset = 0_usize;
-
-    while destination_offset < output.len() {
-        let current = GuestVa(guest);
-        let descriptor = checked_descriptor(table, current, access)?;
-        let page_remaining = usize::try_from(GUEST_PAGE_SIZE - current.page_offset())
-            .map_err(|_| MemoryError::HostSizeOverflow)?;
-        let chunk = cmp::min(page_remaining, output.len() - destination_offset);
+    let len = output.len();
+    walk_pages(table, access, address, len, |current, descriptor, buffer_offset, chunk| {
         let physical_offset = physical_offset(descriptor.physical_page(), current.page_offset())?;
         let physical_end =
             physical_offset.checked_add(chunk).ok_or(MemoryError::HostSizeOverflow)?;
@@ -266,17 +222,9 @@ fn copy_from_guest(
             physical.get(physical_offset..physical_end).ok_or(MemoryError::PhysicalOutOfRange {
                 address: GuestPa(u32::try_from(physical_offset).unwrap_or(u32::MAX)),
             })?;
-        output[destination_offset..destination_offset + chunk].copy_from_slice(source);
-
-        destination_offset += chunk;
-        if destination_offset < output.len() {
-            guest = guest
-                .checked_add(u32::try_from(chunk).map_err(|_| MemoryError::HostSizeOverflow)?)
-                .ok_or(MemoryError::HostSizeOverflow)?;
-        }
-    }
-
-    Ok(())
+        output[buffer_offset..buffer_offset + chunk].copy_from_slice(source);
+        Ok(())
+    })
 }
 
 fn copy_to_guest(
@@ -286,15 +234,8 @@ fn copy_to_guest(
     address: GuestVa,
     input: &[u8],
 ) -> Result<(), MemoryError> {
-    let mut guest = address.0;
-    let mut source_offset = 0_usize;
-
-    while source_offset < input.len() {
-        let current = GuestVa(guest);
-        let descriptor = checked_descriptor(table, current, access)?;
-        let page_remaining = usize::try_from(GUEST_PAGE_SIZE - current.page_offset())
-            .map_err(|_| MemoryError::HostSizeOverflow)?;
-        let chunk = cmp::min(page_remaining, input.len() - source_offset);
+    let len = input.len();
+    walk_pages(table, access, address, len, |current, descriptor, buffer_offset, chunk| {
         let physical_offset = physical_offset(descriptor.physical_page(), current.page_offset())?;
         let physical_end =
             physical_offset.checked_add(chunk).ok_or(MemoryError::HostSizeOverflow)?;
@@ -303,56 +244,14 @@ fn copy_to_guest(
                 address: GuestPa(u32::try_from(physical_offset).unwrap_or(u32::MAX)),
             },
         )?;
-        destination.copy_from_slice(&input[source_offset..source_offset + chunk]);
-
-        source_offset += chunk;
-        if source_offset < input.len() {
-            guest = guest
-                .checked_add(u32::try_from(chunk).map_err(|_| MemoryError::HostSizeOverflow)?)
-                .ok_or(MemoryError::HostSizeOverflow)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn checked_descriptor(
-    table: &PageTable,
-    address: GuestVa,
-    access: AccessKind,
-) -> Result<crate::PageDescriptor, MemoryError> {
-    let descriptor = table.get(address.page());
-    if !descriptor.is_valid() || descriptor.kind() == PageKind::Unmapped {
-        return Err(MemoryError::Unmapped { address, access });
-    }
-
-    if !descriptor.permissions().contains(access.required_permission()) {
-        return Err(MemoryError::AccessDenied { address, access });
-    }
-
-    match descriptor.kind() {
-        PageKind::Ram => Ok(descriptor),
-        PageKind::Mmio => Err(MemoryError::Mmio { address, handler_id: descriptor.handler_id() }),
-        PageKind::Reserved | PageKind::Unmapped => Err(MemoryError::Unmapped { address, access }),
-    }
-}
-
-fn physical_offset(page: GuestPage, page_offset: u32) -> Result<usize, MemoryError> {
-    let offset = u64::from(page.0)
-        .checked_mul(u64::from(GUEST_PAGE_SIZE))
-        .and_then(|base| base.checked_add(u64::from(page_offset)))
-        .ok_or(MemoryError::HostSizeOverflow)?;
-    usize::try_from(offset).map_err(|_| MemoryError::HostSizeOverflow)
-}
-
-fn align_up(value: u64, alignment: u64) -> Result<u64, MemoryError> {
-    let mask = alignment - 1;
-    value.checked_add(mask).map(|sum| sum & !mask).ok_or(MemoryError::HostSizeOverflow)
+        destination.copy_from_slice(&input[buffer_offset..buffer_offset + chunk]);
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use exbawks_types::{GuestRange, GuestVa, MemoryPermissions};
+    use exbawks_types::{GuestPage, GuestRange, GuestVa, MemoryPermissions};
 
     use super::*;
 

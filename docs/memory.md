@@ -149,5 +149,9 @@ Do not perform complex HLE work inside the exception handler.
 - Anonymous mappings and coherent aliases through replaced placeholder views.
 - Sidecar page-table records for every view.
 - Unmapping that restores and coalesces free placeholders.
+- Checked reads, writes, and execute-permission fetches through mapped views.
+- Guest permission changes through the sidecar page table.
 
-Checked reads, writes, fetches, and protection changes for the Windows backend remain the next milestone.
+Both backends validate every access through one shared sidecar walk. Generated equivalence tests require identical typed failures and identical readable bytes from both backends.
+
+Arena RAM views keep host read-write protection. The sidecar page table is the permission authority for checked access on both backends. Host protection tightening arrives with write-fault code invalidation. The platform view wrapper already supports host protection changes.

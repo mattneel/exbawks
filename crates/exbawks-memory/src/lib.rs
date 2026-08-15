@@ -1,5 +1,6 @@
 #![doc = "Guest memory mapping and access services for Exbawks."]
 
+mod access;
 mod allocator;
 mod arena;
 mod error;

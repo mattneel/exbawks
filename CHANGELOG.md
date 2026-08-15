@@ -16,6 +16,8 @@ The project follows Keep a Changelog structure before its first release.
   (`MEM-003`).
 - Coherent Windows RAM aliases through pagefile section views with sidecar
   page-table records and placeholder-restoring unmaps (`MEM-004`).
+- A Windows `GuestMemory` backend with checked reads, writes, and fetches,
+  plus generated equivalence tests against the software backend (`MEM-005`).
 - Initial Rust workspace scaffold.
 - XBE parser and synthetic tests.
 - Software guest address space.
