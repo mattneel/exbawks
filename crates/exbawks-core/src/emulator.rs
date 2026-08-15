@@ -1,19 +1,38 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use exbawks_cpu::{BasicBlockDecoder, CpuState, DecodeConfig, DecodedBlock};
+use exbawks_cpu::{BasicBlockDecoder, CpuState, DecodeConfig, DecodedBlock, indirect_call_slot};
 use exbawks_debug::{NoopTrace, TraceEvent, TraceSink};
 use exbawks_gpu::{GraphicsFrontend, NullGraphicsBackend};
 use exbawks_jit::{
     BlockKey, CodeCache, CodegenBackend, CompiledBlock, CraneliftBackend, DirectRewriteBackend,
     PhysicalPageDependency,
 };
-use exbawks_kernel::KernelRegistry;
-use exbawks_memory::{GuestMemory, PageKind, SoftwareAddressSpace};
+use exbawks_kernel::{KernelCallContext, KernelRegistry, KernelStatus, gate_address, gate_ordinal};
+use exbawks_memory::{GuestMemory, MemoryError, PageKind, SoftwareAddressSpace};
 use exbawks_types::{BackendKind, GUEST_PAGE_SIZE, GuestRange, GuestVa, MemoryPermissions};
 use exbawks_xbe::{XbeImage, XbeSection, XbeSectionFlags};
 
-use crate::{BootPlanReport, CoreError, EmulatorConfig, LoadedImage};
+use crate::{BootPlanReport, CoreError, EmulatorConfig, KernelThunkTable, LoadedImage};
+
+/// The outcome of one kernel gate call attempt at the current guest EIP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateAssist {
+    /// One export ran; execution resumes at the address.
+    Dispatched {
+        /// The guest address after the call instruction.
+        resume: GuestVa,
+        /// The status the export returned.
+        status: KernelStatus,
+    },
+    /// A gate call named an ordinal without a registered export.
+    MissingExport {
+        /// The unregistered ordinal.
+        ordinal: u16,
+    },
+    /// The current instruction is not a kernel gate call.
+    NotAGateCall,
+}
 
 /// A decoded and compiled plan for the current XBE entry block.
 #[derive(Debug, Clone)]
@@ -165,14 +184,63 @@ impl Emulator {
         let memory = Arc::new(SoftwareAddressSpace::new(self.config.physical_memory_bytes)?);
         map_xbe(&memory, &image, &bytes)?;
 
+        let thunks = KernelThunkTable::read(
+            memory.as_ref(),
+            image.header.kernel_thunk_address,
+            self.config.max_kernel_thunks,
+        )?;
+        patch_kernel_thunks(&memory, &thunks)?;
+
         self.cpu = CpuState { eip: image.header.entry_point.0, ..CpuState::default() };
         self.memory = memory;
         self.code_cache.clear();
         self.address_space_epoch = self.address_space_epoch.wrapping_add(1);
 
-        let loaded = Arc::new(LoadedImage::new(image, bytes));
+        let loaded = Arc::new(LoadedImage::new(image, bytes, thunks));
         self.loaded = Some(loaded.clone());
         Ok(loaded)
+    }
+
+    /// Attempts one kernel gate call at the current guest EIP.
+    ///
+    /// A dispatched call advances the guest EIP past the call instruction,
+    /// so execution resumes in translated code.
+    pub fn try_kernel_gate_call(&mut self) -> Result<GateAssist, CoreError> {
+        let address = GuestVa(self.cpu.eip);
+        let page_remaining = usize::try_from(GUEST_PAGE_SIZE - address.page_offset())
+            .map_err(|_| CoreError::InvalidConfiguration("guest page size does not fit usize"))?;
+        let fetch_len = page_remaining.min(15);
+        let mut bytes = [0_u8; 15];
+        self.memory.fetch(address, &mut bytes[..fetch_len])?;
+
+        let decoder =
+            BasicBlockDecoder::new(DecodeConfig { max_instructions: 1, max_bytes: fetch_len });
+        let block = decoder.decode(address, &bytes[..fetch_len])?;
+        let Some(instruction) = block.instructions.first() else {
+            return Ok(GateAssist::NotAGateCall);
+        };
+        let Some(slot) = indirect_call_slot(instruction) else {
+            return Ok(GateAssist::NotAGateCall);
+        };
+
+        let target = GuestVa(self.memory.read_u32(slot)?);
+        let Some(ordinal) = gate_ordinal(target) else {
+            return Ok(GateAssist::NotAGateCall);
+        };
+        let Some(export) = self.kernel.get(ordinal) else {
+            return Ok(GateAssist::MissingExport { ordinal });
+        };
+
+        let resume = address
+            .checked_add(u32::try_from(instruction.len()).unwrap_or(u32::MAX))
+            .ok_or(CoreError::KernelThunkAddressOverflow { address })?;
+        tracing::trace!(ordinal, name = export.name(), "dispatching kernel gate call");
+        let memory = self.memory.clone();
+        let mut context = KernelCallContext { cpu: &mut self.cpu, memory: memory.as_ref() };
+        let status = export.call(&mut context);
+
+        self.cpu.eip = resume.0;
+        Ok(GateAssist::Dispatched { resume, status })
     }
 
     /// Decodes and plans the current entry block.
@@ -333,6 +401,34 @@ fn apply_section_page_permissions(
     Ok(())
 }
 
+/// Replaces every parsed thunk slot with its kernel gate address.
+///
+/// Slot pages regain their original permissions after each patch.
+fn patch_kernel_thunks(
+    memory: &SoftwareAddressSpace,
+    table: &KernelThunkTable,
+) -> Result<(), CoreError> {
+    for thunk in &table.entries {
+        let span = GuestRange::new(thunk.slot, 4).map_err(MemoryError::from)?;
+        let mut originals = Vec::new();
+        for page in span.pages() {
+            let original = memory.page_table().get(page).permissions();
+            let range = GuestRange::page_aligned(page.start_va(), u64::from(GUEST_PAGE_SIZE))
+                .map_err(MemoryError::from)?;
+            memory.protect(range, original | MemoryPermissions::WRITE)?;
+            originals.push((range, original));
+        }
+
+        memory.write_u32(thunk.slot, gate_address(thunk.ordinal).0)?;
+
+        for (range, original) in originals {
+            memory.protect(range, original)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn physical_dependencies(
     table: &exbawks_memory::PageTable,
     decoded: &DecodedBlock,
@@ -400,7 +496,15 @@ mod tests {
     }
 
     fn synthetic_xbe() -> Vec<u8> {
-        let mut bytes = vec![0_u8; 0x282];
+        synthetic_xbe_with(&[0x90, 0xC3], &[])
+    }
+
+    /// Builds one retail image with entry code and raw thunk table values.
+    ///
+    /// Code loads at base + 0x1000 and the thunk table at base + 0x1200.
+    fn synthetic_xbe_with(code: &[u8], thunk_values: &[u32]) -> Vec<u8> {
+        assert!(code.len() <= 0x200, "entry code must fit before the thunk table");
+        let mut bytes = vec![0_u8; 0x580];
         bytes[..4].copy_from_slice(b"XBEH");
         let base = 0x0001_0000_u32;
         write_u32(&mut bytes, 0x104, base);
@@ -418,16 +522,137 @@ mod tests {
 
         write_u32(&mut bytes, 0x200, XbeSectionFlags::EXECUTABLE.bits());
         write_u32(&mut bytes, 0x204, base + 0x1000);
-        write_u32(&mut bytes, 0x208, 2);
+        write_u32(&mut bytes, 0x208, 0x300);
         write_u32(&mut bytes, 0x20C, 0x280);
-        write_u32(&mut bytes, 0x210, 2);
+        write_u32(&mut bytes, 0x210, 0x300);
         write_u32(&mut bytes, 0x214, base + 0x238);
         bytes[0x238..0x23E].copy_from_slice(b".text\0");
-        bytes[0x280..0x282].copy_from_slice(&[0x90, 0xC3]);
+
+        bytes[0x280..0x280 + code.len()].copy_from_slice(code);
+        for (index, value) in thunk_values.iter().enumerate() {
+            write_u32(&mut bytes, 0x480 + index * 4, *value);
+        }
         bytes
     }
 
     fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    mod gates {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use exbawks_kernel::KernelExport;
+
+        use super::*;
+
+        /// Guest code: `call dword ptr [0x11200]; nop; ret`.
+        const GATE_CALL_CODE: [u8; 8] = [0xFF, 0x15, 0x00, 0x12, 0x01, 0x00, 0x90, 0xC3];
+
+        struct CountingExport {
+            calls: Arc<AtomicU32>,
+        }
+
+        impl KernelExport for CountingExport {
+            fn ordinal(&self) -> u16 {
+                7
+            }
+
+            fn name(&self) -> &'static str {
+                "CountingExport"
+            }
+
+            fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                context.cpu.gpr[0] = 0xFEED_F00D;
+                KernelStatus::SUCCESS
+            }
+        }
+
+        #[test]
+        fn load_patches_thunks_into_gate_addresses() {
+            let mut emulator = Emulator::new().expect("emulator must initialize");
+            let image = emulator
+                .load_xbe(synthetic_xbe_with(&[0x90, 0xC3], &[0x8000_0007, 0x8000_0170]))
+                .expect("synthetic XBE must load");
+
+            let memory = emulator.memory();
+            assert_eq!(
+                memory.read_u32(GuestVa(0x0001_1200)).expect("slot must read"),
+                gate_address(0x7).0
+            );
+            assert_eq!(
+                memory.read_u32(GuestVa(0x0001_1204)).expect("slot must read"),
+                gate_address(0x170).0
+            );
+
+            // The slot page keeps its original permissions.
+            let descriptor = memory.page_table().get(GuestVa(0x0001_1200).page());
+            assert!(!descriptor.permissions().contains(MemoryPermissions::WRITE));
+
+            // The loaded image records the table as parsed before patching.
+            let thunks = image.kernel_thunks();
+            assert_eq!(thunks.entries.len(), 2);
+            assert_eq!(thunks.entries[0].ordinal, 7);
+            assert_eq!(thunks.entries[1].ordinal, 0x170);
+        }
+
+        #[test]
+        fn synthetic_thunk_calls_one_registered_export() {
+            let mut emulator = Emulator::new().expect("emulator must initialize");
+            let calls = Arc::new(AtomicU32::new(0));
+            emulator
+                .kernel()
+                .register(CountingExport { calls: calls.clone() })
+                .expect("registration must succeed");
+            emulator
+                .load_xbe(synthetic_xbe_with(&GATE_CALL_CODE, &[0x8000_0007]))
+                .expect("synthetic XBE must load");
+
+            let assist = emulator.try_kernel_gate_call().expect("assist must succeed");
+            assert_eq!(
+                assist,
+                GateAssist::Dispatched {
+                    resume: GuestVa(0x0001_1006),
+                    status: KernelStatus::SUCCESS
+                }
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            assert_eq!(emulator.cpu().eip, 0x0001_1006);
+            assert_eq!(emulator.cpu().gpr[0], 0xFEED_F00D);
+        }
+
+        #[test]
+        fn unknown_ordinal_reports_the_missing_export() {
+            let mut emulator = Emulator::new().expect("emulator must initialize");
+            emulator
+                .load_xbe(synthetic_xbe_with(&GATE_CALL_CODE, &[0x8000_0007]))
+                .expect("synthetic XBE must load");
+
+            let assist = emulator.try_kernel_gate_call().expect("assist must succeed");
+            assert_eq!(assist, GateAssist::MissingExport { ordinal: 7 });
+            assert_eq!(emulator.cpu().eip, 0x0001_1000, "a missing export must not advance EIP");
+        }
+
+        #[test]
+        fn non_gate_calls_are_not_dispatched() {
+            // The called slot at 0x11300 holds zero, which is not a gate.
+            let code = [0xFF, 0x15, 0x00, 0x13, 0x01, 0x00, 0x90, 0xC3];
+            let mut emulator = Emulator::new().expect("emulator must initialize");
+            emulator.load_xbe(synthetic_xbe_with(&code, &[])).expect("synthetic XBE must load");
+
+            let assist = emulator.try_kernel_gate_call().expect("assist must succeed");
+            assert_eq!(assist, GateAssist::NotAGateCall);
+        }
+
+        #[test]
+        fn malformed_thunks_stay_typed_load_errors() {
+            let mut emulator = Emulator::new().expect("emulator must initialize");
+            let error = emulator
+                .load_xbe(synthetic_xbe_with(&[0x90, 0xC3], &[0x0000_1234]))
+                .expect_err("a malformed thunk must fail the load");
+            assert!(matches!(error, CoreError::InvalidKernelThunk { .. }));
+        }
     }
 }

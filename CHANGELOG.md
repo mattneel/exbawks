@@ -25,6 +25,9 @@ The project follows Keep a Changelog structure before its first release.
   the `Executable` state on Windows (`JIT-002`).
 - Immutable sorted source ranges and fault-site records for every emitted
   block, with binary-search host-to-guest lookups (`JIT-003`).
+- Kernel thunk gate patching at load time and runtime dispatch of gate
+  calls to registered HLE exports; `exbawks thunks` reports the table as
+  parsed before patching (`HLE-001`).
 - Initial Rust workspace scaffold.
 - XBE parser and synthetic tests.
 - Software guest address space.

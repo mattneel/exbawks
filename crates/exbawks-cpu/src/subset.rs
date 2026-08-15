@@ -1,3 +1,4 @@
+use exbawks_types::GuestVa;
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
 use crate::Gpr;
@@ -64,6 +65,22 @@ pub fn classify_register_op(instruction: &Instruction) -> Option<RegisterOp> {
         Mnemonic::Xor => alu(AluOp::Xor, instruction),
         _ => None,
     }
+}
+
+/// Returns the pointer slot of one absolute indirect call.
+///
+/// Matches the 32-bit `call dword ptr [disp32]` form that patched kernel
+/// thunk calls use.
+#[must_use]
+pub fn indirect_call_slot(instruction: &Instruction) -> Option<GuestVa> {
+    if instruction.mnemonic() != Mnemonic::Call || instruction.op0_kind() != OpKind::Memory {
+        return None;
+    }
+    if instruction.memory_base() != Register::None || instruction.memory_index() != Register::None {
+        return None;
+    }
+
+    u32::try_from(instruction.memory_displacement64()).ok().map(GuestVa)
 }
 
 fn alu(op: AluOp, instruction: &Instruction) -> Option<RegisterOp> {

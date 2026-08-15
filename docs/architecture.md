@@ -48,6 +48,8 @@ Each callback receives guest CPU state and a checked guest memory interface.
 
 Callbacks must not retain guest slices after the call returns.
 
+The loader patches every kernel thunk slot with one gate address from an unmapped guest region. The runtime recognizes indirect calls through patched slots and dispatches the registry. Unknown ordinals produce a named stop outcome.
+
 ### Graphics HLE
 
 The graphics frontend converts guest API calls and push-buffer operations into host-neutral commands.

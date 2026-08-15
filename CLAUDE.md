@@ -79,8 +79,9 @@ Crate dependency direction (lower crates must never depend on `exbawks-core`):
   page (ADR 0005) because guest code can execute via one virtual alias and be written via another.
 - `exbawks-kernel` — kernel HLE: `KernelExport` trait dispatched by ordinal through
   `KernelRegistry`; exports get `&mut CpuState` plus a checked `GuestMemory` handle and return
-  NT-style `KernelStatus` codes. Thunk *patching* does not exist yet — `exbawks-core/src/thunk.rs`
-  only reads the XBE kernel import table.
+  NT-style `KernelStatus` codes. `gate.rs` defines the unmapped gate region (`0xFF80_0000 +
+  ordinal*4`); `Emulator::load_xbe` patches every thunk slot with its gate address, and
+  `Emulator::try_kernel_gate_call` dispatches `call [slot]` instructions at the current EIP.
 - `exbawks-gpu` — graphics HLE: `GraphicsFrontend` validates command ordering and feeds
   host-neutral `GraphicsCommand`s to a `GraphicsBackend` (only `NullGraphicsBackend` exists).
 - `exbawks-debug` — `TraceSink` trait + `TraceEvent`s (only `BlockEnter` is emitted today).

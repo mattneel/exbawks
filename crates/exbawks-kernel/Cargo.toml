@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 exbawks-cpu.workspace = true
 exbawks-memory.workspace = true
+exbawks-types.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

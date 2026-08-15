@@ -12,4 +12,4 @@ pub use decode::{
 };
 pub use interpret::{InterpretError, step_register_only};
 pub use state::{CpuState, Gpr, Segment, SegmentState, X87State};
-pub use subset::{AluOp, RegisterOp, RegisterOperand, classify_register_op};
+pub use subset::{AluOp, RegisterOp, RegisterOperand, classify_register_op, indirect_call_slot};

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use exbawks_core::{BootPlanReport, EmulatorBuilder, EmulatorConfig, KernelThunkTable};
+use exbawks_core::{BootPlanReport, EmulatorBuilder, EmulatorConfig};
 use exbawks_cpu::{BasicBlockDecoder, DecodeConfig, format_instruction};
 use exbawks_platform::{
     HostCapabilities, SystemMemoryInfo, probe_host_capabilities, query_system_memory_info,
@@ -282,19 +282,20 @@ fn print_plan(report: &BootPlanReport, json: bool) -> Result<()> {
 
 fn thunks(path: &Path, limit: usize, json: bool) -> Result<()> {
     let bytes = read_file(path)?;
-    let mut emulator = EmulatorBuilder::new().build()?;
+    let config = EmulatorConfig { max_kernel_thunks: limit, ..EmulatorConfig::default() };
+    let mut emulator = EmulatorBuilder::new().config(config).build()?;
     let loaded =
         emulator.load_xbe(bytes).with_context(|| format!("failed to load {}", path.display()))?;
     let start = loaded.image().header.kernel_thunk_address;
-    let table = KernelThunkTable::read(emulator.memory(), start, limit)?;
+    let table = loaded.kernel_thunks();
 
     if json {
-        return print_json(&table);
+        return print_json(table);
     }
 
     println!("Kernel thunk table: {}", start);
     println!("Entries:            {}", table.entries.len());
-    for thunk in table.entries {
+    for thunk in &table.entries {
         println!("{}  ordinal {}", thunk.slot, thunk.ordinal);
     }
     Ok(())

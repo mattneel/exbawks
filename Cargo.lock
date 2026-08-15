@@ -210,6 +210,7 @@ version = "0.1.0"
 dependencies = [
  "exbawks-cpu",
  "exbawks-memory",
+ "exbawks-types",
  "parking_lot",
  "thiserror",
  "tracing",
