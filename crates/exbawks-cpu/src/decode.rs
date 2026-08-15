@@ -1,7 +1,5 @@
 use exbawks_types::GuestVa;
-use iced_x86::{
-    Decoder, DecoderOptions, FlowControl, Formatter, Instruction, MasmFormatter,
-};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Formatter, Instruction, MasmFormatter};
 use thiserror::Error;
 
 /// Limits for one decoded guest basic block.
@@ -80,12 +78,7 @@ impl BasicBlockDecoder {
 
         let window_len = bytes.len().min(self.config.max_bytes);
         let window = &bytes[..window_len];
-        let mut decoder = Decoder::with_ip(
-            32,
-            window,
-            u64::from(start.0),
-            DecoderOptions::NONE,
-        );
+        let mut decoder = Decoder::with_ip(32, window, u64::from(start.0), DecoderOptions::NONE);
         let mut instructions = Vec::new();
         let mut stop = BlockStop::EndOfInput;
 
@@ -152,9 +145,8 @@ mod tests {
     #[test]
     fn decoder_stops_after_return() {
         let decoder = BasicBlockDecoder::default();
-        let block = decoder
-            .decode(GuestVa(0x1000), &[0x90, 0x40, 0xC3, 0x90])
-            .expect("block must decode");
+        let block =
+            decoder.decode(GuestVa(0x1000), &[0x90, 0x40, 0xC3, 0x90]).expect("block must decode");
 
         assert_eq!(block.instructions.len(), 3);
         assert_eq!(block.byte_len, 3);
@@ -164,9 +156,8 @@ mod tests {
     #[test]
     fn byte_limit_is_reported() {
         let decoder = BasicBlockDecoder::new(DecodeConfig { max_instructions: 10, max_bytes: 2 });
-        let block = decoder
-            .decode(GuestVa(0x1000), &[0x90, 0x90, 0x90])
-            .expect("block must decode");
+        let block =
+            decoder.decode(GuestVa(0x1000), &[0x90, 0x90, 0x90]).expect("block must decode");
         assert_eq!(block.stop, BlockStop::ByteLimit);
     }
 }

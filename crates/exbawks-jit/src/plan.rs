@@ -66,11 +66,7 @@ impl DirectRewritePlanner {
             });
         }
 
-        TranslationPlan {
-            backend: BackendKind::DirectRewrite,
-            guest_start: block.start,
-            actions,
-        }
+        TranslationPlan { backend: BackendKind::DirectRewrite, guest_start: block.start, actions }
     }
 }
 

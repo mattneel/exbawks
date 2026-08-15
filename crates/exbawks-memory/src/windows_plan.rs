@@ -1,5 +1,5 @@
 use exbawks_platform::virtual_memory::PageProtection;
-use exbawks_types::{GuestPa, GuestRange, GUEST_PAGE_SIZE};
+use exbawks_types::{GUEST_PAGE_SIZE, GuestPa, GuestRange};
 
 use crate::MemoryError;
 
@@ -51,9 +51,7 @@ impl WindowsArenaPlan {
     pub fn push(&mut self, view: GuestViewPlan) -> Result<(), MemoryError> {
         view.guest_range.require_page_alignment()?;
         if view.section_offset.page_offset() != 0 {
-            return Err(MemoryError::UnalignedPhysicalAddress {
-                address: view.section_offset,
-            });
+            return Err(MemoryError::UnalignedPhysicalAddress { address: view.section_offset });
         }
 
         let end = u64::from(view.section_offset.0)
@@ -65,13 +63,10 @@ impl WindowsArenaPlan {
 
         let overlaps = self.views.iter().any(|current| {
             u64::from(view.guest_range.start().0) < current.guest_range.end_exclusive()
-                && u64::from(current.guest_range.start().0)
-                    < view.guest_range.end_exclusive()
+                && u64::from(current.guest_range.start().0) < view.guest_range.end_exclusive()
         });
         if overlaps {
-            return Err(MemoryError::ArenaViewOverlap {
-                address: view.guest_range.start(),
-            });
+            return Err(MemoryError::ArenaViewOverlap { address: view.guest_range.start() });
         }
 
         self.views.push(view);
@@ -87,38 +82,32 @@ impl WindowsArenaPlan {
 
 #[cfg(test)]
 mod tests {
-    use exbawks_types::{GuestRange, GuestVa, GUEST_PAGE_SIZE};
+    use exbawks_types::{GUEST_PAGE_SIZE, GuestRange, GuestVa};
 
     use super::*;
 
     #[test]
     fn plan_rejects_an_unaligned_arena() {
-        let error = WindowsArenaPlan::new(0x1_0000, 64 * 1024 * 1024)
-            .expect_err("arena must be aligned");
+        let error =
+            WindowsArenaPlan::new(0x1_0000, 64 * 1024 * 1024).expect_err("arena must be aligned");
         assert!(matches!(error, MemoryError::InvalidArenaBase { .. }));
     }
 
     #[test]
     fn plan_rejects_overlapping_views() {
-        let mut plan = WindowsArenaPlan::new(0x1_0000_0000, 64 * 1024 * 1024)
-            .expect("plan is valid");
+        let mut plan =
+            WindowsArenaPlan::new(0x1_0000_0000, 64 * 1024 * 1024).expect("plan is valid");
         let first = GuestViewPlan {
-            guest_range: GuestRange::page_aligned(
-                GuestVa(0x1000),
-                2 * u64::from(GUEST_PAGE_SIZE),
-            )
-            .expect("range is valid"),
+            guest_range: GuestRange::page_aligned(GuestVa(0x1000), 2 * u64::from(GUEST_PAGE_SIZE))
+                .expect("range is valid"),
             section_offset: GuestPa(0),
             protection: PageProtection::ReadWrite,
         };
         plan.push(first).expect("first view succeeds");
 
         let second = GuestViewPlan {
-            guest_range: GuestRange::page_aligned(
-                GuestVa(0x2000),
-                u64::from(GUEST_PAGE_SIZE),
-            )
-            .expect("range is valid"),
+            guest_range: GuestRange::page_aligned(GuestVa(0x2000), u64::from(GUEST_PAGE_SIZE))
+                .expect("range is valid"),
             section_offset: GuestPa(GUEST_PAGE_SIZE),
             protection: PageProtection::ReadOnly,
         };

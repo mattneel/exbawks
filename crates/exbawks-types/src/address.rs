@@ -11,7 +11,9 @@ pub const GUEST_PAGE_SIZE: u32 = 1 << GUEST_PAGE_SHIFT;
 pub const GUEST_PAGE_COUNT: usize = 1 << (32 - GUEST_PAGE_SHIFT);
 
 /// A guest virtual address.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[repr(transparent)]
 pub struct GuestVa(pub u32);
 
@@ -60,7 +62,9 @@ impl fmt::Display for GuestVa {
 }
 
 /// A guest physical address.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[repr(transparent)]
 pub struct GuestPa(pub u32);
 
@@ -85,7 +89,9 @@ impl fmt::Display for GuestPa {
 }
 
 /// A page number in a 32-bit guest address space.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[repr(transparent)]
 pub struct GuestPage(pub u32);
 

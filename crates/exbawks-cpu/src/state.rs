@@ -72,13 +72,7 @@ pub struct X87State {
 
 impl Default for X87State {
     fn default() -> Self {
-        Self {
-            control: 0x037F,
-            status: 0,
-            tag: 0xFFFF,
-            opcode: 0,
-            registers: [[0; 16]; 8],
-        }
+        Self { control: 0x037F, status: 0, tag: 0xFFFF, opcode: 0, registers: [[0; 16]; 8] }
     }
 }
 

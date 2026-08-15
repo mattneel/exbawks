@@ -17,26 +17,10 @@ fn main() -> Result<()> {
         "build" => cargo(&root, &["check", "--workspace", "--all-targets"]),
         "lint" => cargo(
             &root,
-            &[
-                "clippy",
-                "--workspace",
-                "--all-targets",
-                "--all-features",
-                "--",
-                "-D",
-                "warnings",
-            ],
+            &["clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"],
         ),
         "test" => cargo(&root, &["test", "--workspace", "--all-features"]),
-        "doc" => cargo(
-            &root,
-            &[
-                "doc",
-                "--workspace",
-                "--all-features",
-                "--no-deps",
-            ],
-        ),
+        "doc" => cargo(&root, &["doc", "--workspace", "--all-features", "--no-deps"]),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -50,26 +34,10 @@ fn check(root: &Path) -> Result<()> {
     cargo(root, &["check", "--workspace", "--all-targets"])?;
     cargo(
         root,
-        &[
-            "clippy",
-            "--workspace",
-            "--all-targets",
-            "--all-features",
-            "--",
-            "-D",
-            "warnings",
-        ],
+        &["clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"],
     )?;
     cargo(root, &["test", "--workspace", "--all-features"])?;
-    cargo(
-        root,
-        &[
-            "doc",
-            "--workspace",
-            "--all-features",
-            "--no-deps",
-        ],
-    )?;
+    cargo(root, &["doc", "--workspace", "--all-features", "--no-deps"])?;
     Ok(())
 }
 
@@ -92,10 +60,7 @@ fn cargo(root: &Path, arguments: &[&str]) -> Result<()> {
 
 fn workspace_root() -> Result<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .map(Path::to_path_buf)
-        .context("xtask manifest directory has no parent")
+    manifest.parent().map(Path::to_path_buf).context("xtask manifest directory has no parent")
 }
 
 fn print_help() {

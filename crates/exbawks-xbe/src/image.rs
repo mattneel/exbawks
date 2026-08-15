@@ -59,11 +59,8 @@ impl XbeImage {
             });
         }
 
-        let (build_flavor, entry_point) = decode_entry_point(
-            encoded_entry_point,
-            base_address,
-            size_of_image,
-        )?;
+        let (build_flavor, entry_point) =
+            decode_entry_point(encoded_entry_point, base_address, size_of_image)?;
         let kernel_thunk_address = decode_kernel_thunk(
             encoded_kernel_thunk_address,
             build_flavor,
@@ -93,11 +90,7 @@ impl XbeImage {
         };
 
         let sections = parse_sections(bytes, &header)?;
-        Ok(Self {
-            header,
-            sections,
-            file_size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-        })
+        Ok(Self { header, sections, file_size: u64::try_from(bytes.len()).unwrap_or(u64::MAX) })
     }
 
     /// Returns the raw bytes for one parsed section.
@@ -113,9 +106,7 @@ impl XbeImage {
         let end = start
             .checked_add(size)
             .ok_or(XbeError::SectionRawRange { section_index: section.index })?;
-        bytes
-            .get(start..end)
-            .ok_or(XbeError::SectionRawRange { section_index: section.index })
+        bytes.get(start..end).ok_or(XbeError::SectionRawRange { section_index: section.index })
     }
 }
 
@@ -185,11 +176,8 @@ fn image_contains(base: GuestVa, image_size: u32, address: GuestVa) -> bool {
 }
 
 fn parse_sections(bytes: &[u8], header: &XbeHeader) -> Result<Vec<XbeSection>, XbeError> {
-    let table_offset = header_va_to_file_offset(
-        header,
-        header.section_headers_address,
-        "section header table",
-    )?;
+    let table_offset =
+        header_va_to_file_offset(header, header.section_headers_address, "section header table")?;
     let count = usize::try_from(header.section_count)
         .map_err(|_| XbeError::InvalidHeader("section count does not fit in usize"))?;
     let table_size = count
@@ -305,9 +293,7 @@ mod tests {
         assert_eq!(image.sections[0].name, ".text");
         assert!(image.sections[0].flags.contains(XbeSectionFlags::EXECUTABLE));
         assert_eq!(
-            image
-                .section_data(&bytes, &image.sections[0])
-                .expect("data exists"),
+            image.section_data(&bytes, &image.sections[0]).expect("data exists"),
             [0x90, 0xC3]
         );
     }

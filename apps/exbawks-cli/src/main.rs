@@ -152,8 +152,8 @@ fn doctor(json: bool) -> Result<()> {
 
 fn inspect(path: &Path, json: bool) -> Result<()> {
     let bytes = read_file(path)?;
-    let image = XbeImage::parse(&bytes)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let image =
+        XbeImage::parse(&bytes).with_context(|| format!("failed to parse {}", path.display()))?;
 
     if json {
         return print_json(&image);
@@ -182,13 +182,7 @@ fn inspect(path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn decode(
-    ip: u32,
-    hex: &str,
-    max_instructions: usize,
-    max_bytes: usize,
-    json: bool,
-) -> Result<()> {
+fn decode(ip: u32, hex: &str, max_instructions: usize, max_bytes: usize, json: bool) -> Result<()> {
     let bytes = parse_hex_bytes(hex)?;
     if bytes.is_empty() {
         bail!("the hexadecimal byte sequence is empty");
@@ -234,9 +228,7 @@ fn plan(path: &Path, backend: BackendKind, ram_mib: usize) -> Result<BootPlanRep
         ..EmulatorConfig::default()
     };
     let mut emulator = EmulatorBuilder::new().config(config).build()?;
-    emulator
-        .load_xbe(bytes)
-        .with_context(|| format!("failed to load {}", path.display()))?;
+    emulator.load_xbe(bytes).with_context(|| format!("failed to load {}", path.display()))?;
     Ok(emulator.plan_entry_block()?.report())
 }
 
@@ -270,9 +262,8 @@ fn print_plan(report: &BootPlanReport, json: bool) -> Result<()> {
 fn thunks(path: &Path, limit: usize, json: bool) -> Result<()> {
     let bytes = read_file(path)?;
     let mut emulator = EmulatorBuilder::new().build()?;
-    let loaded = emulator
-        .load_xbe(bytes)
-        .with_context(|| format!("failed to load {}", path.display()))?;
+    let loaded =
+        emulator.load_xbe(bytes).with_context(|| format!("failed to load {}", path.display()))?;
     let start = loaded.image().header.kernel_thunk_address;
     let table = KernelThunkTable::read(emulator.memory(), start, limit)?;
 
@@ -336,10 +327,8 @@ fn parse_hex_bytes(input: &str) -> Result<Vec<u8>> {
         }
     }
 
-    let compact = normalized
-        .chars()
-        .filter(|character| character.is_ascii_hexdigit())
-        .collect::<String>();
+    let compact =
+        normalized.chars().filter(|character| character.is_ascii_hexdigit()).collect::<String>();
     if !compact.len().is_multiple_of(2) {
         bail!("the hexadecimal byte sequence contains an odd digit count");
     }
@@ -358,8 +347,7 @@ fn mib_to_bytes(mib: usize) -> Result<usize> {
     if mib == 0 {
         bail!("RAM size must not be zero");
     }
-    mib.checked_mul(1024 * 1024)
-        .ok_or_else(|| anyhow!("RAM size overflows usize"))
+    mib.checked_mul(1024 * 1024).ok_or_else(|| anyhow!("RAM size overflows usize"))
 }
 
 fn print_json<T>(value: &T) -> Result<()>

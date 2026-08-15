@@ -79,10 +79,7 @@ mod tests {
     #[test]
     fn frontend_requires_device_creation() {
         let mut frontend = GraphicsFrontend::new(NullGraphicsBackend::default());
-        assert_eq!(
-            frontend.submit(GraphicsCommand::Present),
-            Err(GraphicsError::DeviceNotCreated)
-        );
+        assert_eq!(frontend.submit(GraphicsCommand::Present), Err(GraphicsError::DeviceNotCreated));
     }
 
     #[test]
@@ -106,9 +103,7 @@ mod tests {
                 vertex_count: 3,
             })
             .expect("draw must succeed");
-        frontend
-            .submit(GraphicsCommand::Present)
-            .expect("present must succeed");
+        frontend.submit(GraphicsCommand::Present).expect("present must succeed");
 
         let stats = frontend.backend().stats();
         assert_eq!(stats.commands, 4);

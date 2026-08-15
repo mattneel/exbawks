@@ -1,7 +1,7 @@
 use std::cmp;
 
 use exbawks_types::{
-    AccessKind, GuestPa, GuestPage, GuestRange, GuestVa, MemoryPermissions, GUEST_PAGE_SIZE,
+    AccessKind, GUEST_PAGE_SIZE, GuestPa, GuestPage, GuestRange, GuestVa, MemoryPermissions,
 };
 use parking_lot::{Mutex, RwLock};
 
@@ -56,10 +56,8 @@ impl PhysicalAllocator {
     }
 
     fn rollback_last(&mut self, start: GuestPage, page_count: u32) {
-        let expected_end = start
-            .0
-            .checked_add(page_count)
-            .expect("a completed allocation cannot overflow");
+        let expected_end =
+            start.0.checked_add(page_count).expect("a completed allocation cannot overflow");
         assert_eq!(self.next_page, expected_end, "only the latest allocation can roll back");
         self.next_page = start.0;
     }
@@ -76,8 +74,8 @@ pub struct SoftwareAddressSpace {
 impl SoftwareAddressSpace {
     /// Creates a software address space with the requested physical RAM size.
     pub fn new(physical_bytes: usize) -> Result<Self, MemoryError> {
-        let page_size = usize::try_from(GUEST_PAGE_SIZE)
-            .map_err(|_| MemoryError::HostSizeOverflow)?;
+        let page_size =
+            usize::try_from(GUEST_PAGE_SIZE).map_err(|_| MemoryError::HostSizeOverflow)?;
         if physical_bytes == 0 || !physical_bytes.is_multiple_of(page_size) {
             return Err(MemoryError::Address(exbawks_types::AddressError::UnalignedRange {
                 start: GuestVa::ZERO,
@@ -85,8 +83,8 @@ impl SoftwareAddressSpace {
             }));
         }
 
-        let page_count = u32::try_from(physical_bytes / page_size)
-            .map_err(|_| MemoryError::HostSizeOverflow)?;
+        let page_count =
+            u32::try_from(physical_bytes / page_size).map_err(|_| MemoryError::HostSizeOverflow)?;
 
         Ok(Self {
             physical: RwLock::new(vec![0_u8; physical_bytes].into_boxed_slice()),
@@ -102,8 +100,8 @@ impl SoftwareAddressSpace {
         permissions: MemoryPermissions,
     ) -> Result<GuestPa, MemoryError> {
         range.require_page_alignment()?;
-        let page_count = u32::try_from(range.page_count())
-            .map_err(|_| MemoryError::HostSizeOverflow)?;
+        let page_count =
+            u32::try_from(range.page_count()).map_err(|_| MemoryError::HostSizeOverflow)?;
         let mut allocator = self.allocator.lock();
         let physical_page = allocator.allocate(page_count)?;
         if let Err(error) = self.table.map_ram(range, physical_page, permissions) {
@@ -255,9 +253,7 @@ fn validate_access(
             .map_err(|_| MemoryError::HostSizeOverflow)?;
         let chunk = cmp::min(page_remaining, remaining);
         let offset = physical_offset(descriptor.physical_page(), current.page_offset())?;
-        let end = offset
-            .checked_add(chunk)
-            .ok_or(MemoryError::HostSizeOverflow)?;
+        let end = offset.checked_add(chunk).ok_or(MemoryError::HostSizeOverflow)?;
         if end > physical_len {
             return Err(MemoryError::PhysicalOutOfRange {
                 address: descriptor.physical_page().start_pa(),
@@ -292,12 +288,10 @@ fn copy_from_guest(
             .map_err(|_| MemoryError::HostSizeOverflow)?;
         let chunk = cmp::min(page_remaining, output.len() - destination_offset);
         let physical_offset = physical_offset(descriptor.physical_page(), current.page_offset())?;
-        let physical_end = physical_offset
-            .checked_add(chunk)
-            .ok_or(MemoryError::HostSizeOverflow)?;
-        let source = physical
-            .get(physical_offset..physical_end)
-            .ok_or(MemoryError::PhysicalOutOfRange {
+        let physical_end =
+            physical_offset.checked_add(chunk).ok_or(MemoryError::HostSizeOverflow)?;
+        let source =
+            physical.get(physical_offset..physical_end).ok_or(MemoryError::PhysicalOutOfRange {
                 address: GuestPa(u32::try_from(physical_offset).unwrap_or(u32::MAX)),
             })?;
         output[destination_offset..destination_offset + chunk].copy_from_slice(source);
@@ -330,14 +324,13 @@ fn copy_to_guest(
             .map_err(|_| MemoryError::HostSizeOverflow)?;
         let chunk = cmp::min(page_remaining, input.len() - source_offset);
         let physical_offset = physical_offset(descriptor.physical_page(), current.page_offset())?;
-        let physical_end = physical_offset
-            .checked_add(chunk)
-            .ok_or(MemoryError::HostSizeOverflow)?;
-        let destination = physical
-            .get_mut(physical_offset..physical_end)
-            .ok_or(MemoryError::PhysicalOutOfRange {
+        let physical_end =
+            physical_offset.checked_add(chunk).ok_or(MemoryError::HostSizeOverflow)?;
+        let destination = physical.get_mut(physical_offset..physical_end).ok_or(
+            MemoryError::PhysicalOutOfRange {
                 address: GuestPa(u32::try_from(physical_offset).unwrap_or(u32::MAX)),
-            })?;
+            },
+        )?;
         destination.copy_from_slice(&input[source_offset..source_offset + chunk]);
 
         source_offset += chunk;
@@ -382,10 +375,7 @@ fn physical_offset(page: GuestPage, page_offset: u32) -> Result<usize, MemoryErr
 
 fn align_up(value: u64, alignment: u64) -> Result<u64, MemoryError> {
     let mask = alignment - 1;
-    value
-        .checked_add(mask)
-        .map(|sum| sum & !mask)
-        .ok_or(MemoryError::HostSizeOverflow)
+    value.checked_add(mask).map(|sum| sum & !mask).ok_or(MemoryError::HostSizeOverflow)
 }
 
 #[cfg(test)]
@@ -444,60 +434,35 @@ mod tests {
     #[test]
     fn access_can_end_at_the_top_of_the_guest_address_space() {
         let memory = SoftwareAddressSpace::new(1024 * 1024).expect("memory is valid");
-        let range = GuestRange::page_aligned(
-            GuestVa(0xFFFF_F000),
-            u64::from(GUEST_PAGE_SIZE),
-        )
-        .expect("range is valid");
+        let range = GuestRange::page_aligned(GuestVa(0xFFFF_F000), u64::from(GUEST_PAGE_SIZE))
+            .expect("range is valid");
         memory
-            .map_anonymous(
-                range,
-                MemoryPermissions::READ | MemoryPermissions::WRITE,
-            )
+            .map_anonymous(range, MemoryPermissions::READ | MemoryPermissions::WRITE)
             .expect("mapping succeeds");
 
-        memory
-            .write(GuestVa(0xFFFF_FFFF), &[0xA5])
-            .expect("write succeeds");
+        memory.write(GuestVa(0xFFFF_FFFF), &[0xA5]).expect("write succeeds");
         let mut value = [0_u8; 1];
-        memory
-            .read(GuestVa(0xFFFF_FFFF), &mut value)
-            .expect("read succeeds");
+        memory.read(GuestVa(0xFFFF_FFFF), &mut value).expect("read succeeds");
         assert_eq!(value, [0xA5]);
     }
 
     #[test]
     fn failed_cross_page_write_does_not_change_the_first_page() {
         let memory = SoftwareAddressSpace::new(1024 * 1024).expect("memory is valid");
-        let range = GuestRange::page_aligned(
-            GuestVa(0x1000),
-            2 * u64::from(GUEST_PAGE_SIZE),
-        )
-        .expect("range is valid");
+        let range = GuestRange::page_aligned(GuestVa(0x1000), 2 * u64::from(GUEST_PAGE_SIZE))
+            .expect("range is valid");
         memory
-            .map_anonymous(
-                range,
-                MemoryPermissions::READ | MemoryPermissions::WRITE,
-            )
+            .map_anonymous(range, MemoryPermissions::READ | MemoryPermissions::WRITE)
             .expect("mapping succeeds");
-        let second = GuestRange::page_aligned(
-            GuestVa(0x2000),
-            u64::from(GUEST_PAGE_SIZE),
-        )
-        .expect("range is valid");
-        memory
-            .protect(second, MemoryPermissions::READ)
-            .expect("protection succeeds");
+        let second = GuestRange::page_aligned(GuestVa(0x2000), u64::from(GUEST_PAGE_SIZE))
+            .expect("range is valid");
+        memory.protect(second, MemoryPermissions::READ).expect("protection succeeds");
 
-        let error = memory
-            .write(GuestVa(0x1FFF), &[0xAA, 0xBB])
-            .expect_err("write must fail");
+        let error = memory.write(GuestVa(0x1FFF), &[0xAA, 0xBB]).expect_err("write must fail");
         assert!(matches!(error, MemoryError::AccessDenied { .. }));
 
         let mut first = [0_u8; 1];
-        memory
-            .read(GuestVa(0x1FFF), &mut first)
-            .expect("read succeeds");
+        memory.read(GuestVa(0x1FFF), &mut first).expect("read succeeds");
         assert_eq!(first, [0]);
     }
 
@@ -511,16 +476,14 @@ mod tests {
             .map_ram(occupied, GuestPage(100), MemoryPermissions::READ)
             .expect("manual mapping succeeds");
 
-        let error = memory
-            .map_anonymous(occupied, MemoryPermissions::READ)
-            .expect_err("overlap must fail");
+        let error =
+            memory.map_anonymous(occupied, MemoryPermissions::READ).expect_err("overlap must fail");
         assert!(matches!(error, MemoryError::AlreadyMapped { .. }));
 
         let available = GuestRange::page_aligned(GuestVa(0x2000), u64::from(GUEST_PAGE_SIZE))
             .expect("range is valid");
-        let physical = memory
-            .map_anonymous(available, MemoryPermissions::READ)
-            .expect("mapping succeeds");
+        let physical =
+            memory.map_anonymous(available, MemoryPermissions::READ).expect("mapping succeeds");
         assert_eq!(physical, GuestPa(0));
     }
 }

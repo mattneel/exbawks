@@ -5,7 +5,7 @@ mod address;
 mod execution;
 
 pub use address::{
-    AddressError, GuestPa, GuestPage, GuestPageIter, GuestRange, GuestVa, GUEST_PAGE_COUNT,
-    GUEST_PAGE_SHIFT, GUEST_PAGE_SIZE,
+    AddressError, GUEST_PAGE_COUNT, GUEST_PAGE_SHIFT, GUEST_PAGE_SIZE, GuestPa, GuestPage,
+    GuestPageIter, GuestRange, GuestVa,
 };
 pub use execution::{AccessKind, BackendKind, BuildFlavor, MemoryPermissions, StopReason};

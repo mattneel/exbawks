@@ -75,4 +75,3 @@ pub enum StopReason {
     /// The runtime is not implemented yet.
     RuntimeIncomplete,
 }
-

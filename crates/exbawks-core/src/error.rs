@@ -34,11 +34,7 @@ pub enum CoreError {
         "XBE section {section_index} has raw size {raw_size} \
          larger than virtual size {virtual_size}"
     )]
-    SectionRawExceedsVirtual {
-        section_index: u32,
-        raw_size: u32,
-        virtual_size: u32,
-    },
+    SectionRawExceedsVirtual { section_index: u32, raw_size: u32, virtual_size: u32 },
     /// A section start does not use 4 KiB alignment.
     #[error("XBE section {section_index} starts at unaligned guest address {address}")]
     UnalignedSection { section_index: u32, address: GuestVa },

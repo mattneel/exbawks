@@ -77,10 +77,7 @@ impl CodeCache {
         let mut entries = self.entries.write();
         let before = entries.len();
         entries.retain(|_, value| {
-            !value
-                .dependencies
-                .iter()
-                .any(|dependency| dependency.page == page)
+            !value.dependencies.iter().any(|dependency| dependency.page == page)
         });
         before - entries.len()
     }
@@ -106,7 +103,7 @@ impl CodeCache {
 #[cfg(test)]
 mod tests {
     use exbawks_cpu::BasicBlockDecoder;
-    use exbawks_types::{GuestRange, MemoryPermissions, GUEST_PAGE_SIZE};
+    use exbawks_types::{GUEST_PAGE_SIZE, GuestRange, MemoryPermissions};
 
     use crate::{CodegenBackend, DirectRewriteBackend};
 
@@ -121,14 +118,10 @@ mod tests {
             .map_ram(range, GuestPage(3), MemoryPermissions::READ | MemoryPermissions::EXECUTE)
             .expect("mapping succeeds");
 
-        let decoded = BasicBlockDecoder::default()
-            .decode(GuestVa(0x1000), &[0xC3])
-            .expect("block decodes");
-        let block = Arc::new(
-            DirectRewriteBackend::default()
-                .compile(&decoded)
-                .expect("plan succeeds"),
-        );
+        let decoded =
+            BasicBlockDecoder::default().decode(GuestVa(0x1000), &[0xC3]).expect("block decodes");
+        let block =
+            Arc::new(DirectRewriteBackend::default().compile(&decoded).expect("plan succeeds"));
         let cache = CodeCache::default();
         let key = BlockKey {
             guest_start: GuestVa(0x1000),

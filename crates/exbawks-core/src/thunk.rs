@@ -24,15 +24,9 @@ pub struct KernelThunkTable {
 
 impl KernelThunkTable {
     /// Reads an ordinal thunk table from checked guest memory.
-    pub fn read(
-        memory: &dyn GuestMemory,
-        start: GuestVa,
-        limit: usize,
-    ) -> Result<Self, CoreError> {
+    pub fn read(memory: &dyn GuestMemory, start: GuestVa, limit: usize) -> Result<Self, CoreError> {
         if limit == 0 {
-            return Err(CoreError::InvalidConfiguration(
-                "max_kernel_thunks must not be zero",
-            ));
+            return Err(CoreError::InvalidConfiguration("max_kernel_thunks must not be zero"));
         }
 
         let mut entries = Vec::new();
@@ -76,8 +70,7 @@ mod tests {
             .write(GuestVa(0x1000), &[1, 0, 0, 0x80, 2, 0, 0, 0x80, 0, 0, 0, 0])
             .expect("write must succeed");
 
-        let table = KernelThunkTable::read(&memory, GuestVa(0x1000), 8)
-            .expect("table must parse");
+        let table = KernelThunkTable::read(&memory, GuestVa(0x1000), 8).expect("table must parse");
         assert_eq!(table.entries.len(), 2);
         assert_eq!(table.entries[1].ordinal, 2);
     }

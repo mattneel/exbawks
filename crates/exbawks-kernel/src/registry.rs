@@ -1,5 +1,5 @@
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt;
 use std::sync::Arc;
 
@@ -82,10 +82,7 @@ impl fmt::Debug for KernelRegistry {
         let exports = self.exports.read();
         let mut ordinals = exports.keys().copied().collect::<Vec<_>>();
         ordinals.sort_unstable();
-        formatter
-            .debug_struct("KernelRegistry")
-            .field("ordinals", &ordinals)
-            .finish()
+        formatter.debug_struct("KernelRegistry").field("ordinals", &ordinals).finish()
     }
 }
 
@@ -101,9 +98,7 @@ mod tests {
     #[test]
     fn registry_dispatches_a_stub() {
         let registry = KernelRegistry::new();
-        registry
-            .register(StubExport::new(7, "Example"))
-            .expect("registration must succeed");
+        registry.register(StubExport::new(7, "Example")).expect("registration must succeed");
 
         let memory = SoftwareAddressSpace::new(4096).expect("memory must initialize");
         let mut cpu = CpuState::default();
@@ -117,9 +112,7 @@ mod tests {
     #[test]
     fn registry_rejects_duplicate_ordinals() {
         let registry = KernelRegistry::new();
-        registry
-            .register(StubExport::new(7, "First"))
-            .expect("first registration must succeed");
+        registry.register(StubExport::new(7, "First")).expect("first registration must succeed");
 
         assert_eq!(
             registry.register(StubExport::new(7, "Second")),

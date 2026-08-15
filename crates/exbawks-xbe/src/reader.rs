@@ -1,10 +1,6 @@
 use crate::XbeError;
 
-pub(crate) fn read_u32(
-    bytes: &[u8],
-    offset: usize,
-    field: &'static str,
-) -> Result<u32, XbeError> {
+pub(crate) fn read_u32(bytes: &[u8], offset: usize, field: &'static str) -> Result<u32, XbeError> {
     let value = read_array::<4>(bytes, offset, field)?;
     Ok(u32::from_le_bytes(value))
 }
@@ -14,9 +10,7 @@ pub(crate) fn read_array<const N: usize>(
     offset: usize,
     field: &'static str,
 ) -> Result<[u8; N], XbeError> {
-    let end = offset
-        .checked_add(N)
-        .ok_or(XbeError::Truncated { field, offset })?;
+    let end = offset.checked_add(N).ok_or(XbeError::Truncated { field, offset })?;
     let slice = bytes.get(offset..end).ok_or(XbeError::Truncated { field, offset })?;
     let mut value = [0_u8; N];
     value.copy_from_slice(slice);

@@ -5,12 +5,12 @@ use exbawks_cpu::{BasicBlockDecoder, CpuState, DecodeConfig, DecodedBlock};
 use exbawks_debug::{NoopTrace, TraceEvent, TraceSink};
 use exbawks_gpu::{GraphicsFrontend, NullGraphicsBackend};
 use exbawks_jit::{
-    BlockKey, CodeCache, CodegenBackend, CompiledBlock, CraneliftBackend,
-    DirectRewriteBackend, PhysicalPageDependency,
+    BlockKey, CodeCache, CodegenBackend, CompiledBlock, CraneliftBackend, DirectRewriteBackend,
+    PhysicalPageDependency,
 };
 use exbawks_kernel::KernelRegistry;
 use exbawks_memory::{GuestMemory, PageKind, SoftwareAddressSpace};
-use exbawks_types::{BackendKind, GuestRange, GuestVa, MemoryPermissions, GUEST_PAGE_SIZE};
+use exbawks_types::{BackendKind, GUEST_PAGE_SIZE, GuestRange, GuestVa, MemoryPermissions};
 use exbawks_xbe::{XbeImage, XbeSection, XbeSectionFlags};
 
 use crate::{BootPlanReport, CoreError, EmulatorConfig, LoadedImage};
@@ -64,9 +64,7 @@ impl EmulatorBuilder {
     /// Validates settings and creates an emulator.
     pub fn build(self) -> Result<Emulator, CoreError> {
         validate_config(&self.config)?;
-        let memory = Arc::new(SoftwareAddressSpace::new(
-            self.config.physical_memory_bytes,
-        )?);
+        let memory = Arc::new(SoftwareAddressSpace::new(self.config.physical_memory_bytes)?);
         let backend = make_backend(self.config.backend);
 
         Ok(Emulator {
@@ -164,15 +162,10 @@ impl Emulator {
 
         let bytes: Arc<[u8]> = bytes.into();
         let image = XbeImage::parse(&bytes)?;
-        let memory = Arc::new(SoftwareAddressSpace::new(
-            self.config.physical_memory_bytes,
-        )?);
+        let memory = Arc::new(SoftwareAddressSpace::new(self.config.physical_memory_bytes)?);
         map_xbe(&memory, &image, &bytes)?;
 
-        self.cpu = CpuState {
-            eip: image.header.entry_point.0,
-            ..CpuState::default()
-        };
+        self.cpu = CpuState { eip: image.header.entry_point.0, ..CpuState::default() };
         self.memory = memory;
         self.code_cache.clear();
         self.address_space_epoch = self.address_space_epoch.wrapping_add(1);
@@ -217,9 +210,7 @@ impl Emulator {
 
     /// Removes the active image and resets session state.
     pub fn reset(&mut self) -> Result<(), CoreError> {
-        self.memory = Arc::new(SoftwareAddressSpace::new(
-            self.config.physical_memory_bytes,
-        )?);
+        self.memory = Arc::new(SoftwareAddressSpace::new(self.config.physical_memory_bytes)?);
         self.cpu = CpuState::default();
         self.loaded = None;
         self.code_cache.clear();
@@ -235,19 +226,13 @@ fn validate_config(config: &EmulatorConfig) -> Result<(), CoreError> {
         ));
     }
     if config.max_block_instructions == 0 {
-        return Err(CoreError::InvalidConfiguration(
-            "max_block_instructions must not be zero",
-        ));
+        return Err(CoreError::InvalidConfiguration("max_block_instructions must not be zero"));
     }
     if config.max_block_bytes == 0 {
-        return Err(CoreError::InvalidConfiguration(
-            "max_block_bytes must not be zero",
-        ));
+        return Err(CoreError::InvalidConfiguration("max_block_bytes must not be zero"));
     }
     if config.max_kernel_thunks == 0 {
-        return Err(CoreError::InvalidConfiguration(
-            "max_kernel_thunks must not be zero",
-        ));
+        return Err(CoreError::InvalidConfiguration("max_kernel_thunks must not be zero"));
     }
     Ok(())
 }
@@ -259,11 +244,7 @@ fn make_backend(kind: BackendKind) -> Box<dyn CodegenBackend> {
     }
 }
 
-fn map_xbe(
-    memory: &SoftwareAddressSpace,
-    image: &XbeImage,
-    bytes: &[u8],
-) -> Result<(), CoreError> {
+fn map_xbe(memory: &SoftwareAddressSpace, image: &XbeImage, bytes: &[u8]) -> Result<(), CoreError> {
     let header_size = usize::try_from(image.header.size_of_headers)
         .map_err(|_| CoreError::InvalidConfiguration("XBE header size does not fit usize"))?;
     memory.load_region(
@@ -312,12 +293,7 @@ fn map_section(
         permissions |= MemoryPermissions::EXECUTE;
     }
 
-    memory.load_region(
-        section.virtual_address,
-        section.virtual_size,
-        initial,
-        permissions,
-    )?;
+    memory.load_region(section.virtual_address, section.virtual_size, initial, permissions)?;
     apply_section_page_permissions(memory, section, permissions)?;
     Ok(())
 }
@@ -349,8 +325,8 @@ fn apply_section_page_permissions(
             .virtual_address
             .checked_add(tail_offset)
             .ok_or(CoreError::InvalidConfiguration("section tail address overflow"))?;
-        let range = GuestRange::page_aligned(tail, page_size)
-            .map_err(exbawks_memory::MemoryError::from)?;
+        let range =
+            GuestRange::page_aligned(tail, page_size).map_err(exbawks_memory::MemoryError::from)?;
         memory.protect(range, read_only)?;
     }
 
@@ -363,8 +339,8 @@ fn physical_dependencies(
 ) -> Result<Vec<PhysicalPageDependency>, CoreError> {
     let byte_len = u64::try_from(decoded.byte_len)
         .map_err(|_| CoreError::InvalidConfiguration("decoded block size does not fit u64"))?;
-    let range = GuestRange::new(decoded.start, byte_len)
-        .map_err(exbawks_memory::MemoryError::from)?;
+    let range =
+        GuestRange::new(decoded.start, byte_len).map_err(exbawks_memory::MemoryError::from)?;
     let mut pages = BTreeMap::new();
 
     for virtual_page in range.pages() {
@@ -376,9 +352,7 @@ fn physical_dependencies(
             }
             .into());
         }
-        pages
-            .entry(descriptor.physical_page())
-            .or_insert(descriptor.generation());
+        pages.entry(descriptor.physical_page()).or_insert(descriptor.generation());
     }
 
     Ok(pages
@@ -399,9 +373,7 @@ mod tests {
     #[test]
     fn emulator_loads_and_plans_a_synthetic_image() {
         let mut emulator = Emulator::new().expect("emulator must initialize");
-        let image = emulator
-            .load_xbe(synthetic_xbe())
-            .expect("synthetic XBE must load");
+        let image = emulator.load_xbe(synthetic_xbe()).expect("synthetic XBE must load");
         let plan = emulator.plan_entry_block().expect("entry block must plan");
 
         assert_eq!(image.image().header.build_flavor, BuildFlavor::Retail);

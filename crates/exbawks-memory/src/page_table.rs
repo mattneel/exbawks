@@ -1,8 +1,6 @@
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
-use exbawks_types::{
-    GuestPage, GuestRange, MemoryPermissions, GUEST_PAGE_COUNT, GUEST_PAGE_SIZE,
-};
+use exbawks_types::{GUEST_PAGE_COUNT, GUEST_PAGE_SIZE, GuestPage, GuestRange, MemoryPermissions};
 use parking_lot::Mutex;
 
 use crate::MemoryError;
@@ -64,11 +62,7 @@ impl WatchFlags {
     }
 
     const fn from_raw(value: u8) -> Self {
-        Self {
-            read: value & 1 != 0,
-            write: value & 2 != 0,
-            execute: value & 4 != 0,
-        }
+        Self { read: value & 1 != 0, write: value & 2 != 0, execute: value & 4 != 0 }
     }
 }
 
@@ -90,11 +84,7 @@ impl PageDescriptor {
 
     /// Creates an MMIO page descriptor.
     #[must_use]
-    pub const fn mmio(
-        handler_id: u16,
-        permissions: MemoryPermissions,
-        generation: u16,
-    ) -> Self {
+    pub const fn mmio(handler_id: u16, permissions: MemoryPermissions, generation: u16) -> Self {
         Self::pack(PageKind::Mmio, permissions, 0, handler_id, generation, WatchFlags::NONE)
     }
 
@@ -234,10 +224,8 @@ impl PageTable {
     }
 
     fn set(&self, page: GuestPage, descriptor: PageDescriptor) {
-        let entry = self
-            .entries
-            .get(page.index())
-            .expect("validated guest page must fit the page table");
+        let entry =
+            self.entries.get(page.index()).expect("validated guest page must fit the page table");
         entry.store(descriptor.0, Ordering::Release);
     }
 
@@ -249,18 +237,14 @@ impl PageTable {
         permissions: MemoryPermissions,
     ) -> Result<(), MemoryError> {
         range.require_page_alignment()?;
-        let page_count = u32::try_from(range.page_count())
-            .map_err(|_| MemoryError::HostSizeOverflow)?;
+        let page_count =
+            u32::try_from(range.page_count()).map_err(|_| MemoryError::HostSizeOverflow)?;
         let physical_end = physical_start
             .0
             .checked_add(page_count)
-            .ok_or(MemoryError::PhysicalOutOfRange {
-                address: physical_start.start_pa(),
-            })?;
+            .ok_or(MemoryError::PhysicalOutOfRange { address: physical_start.start_pa() })?;
         if physical_end > GUEST_PAGE_COUNT as u32 {
-            return Err(MemoryError::PhysicalOutOfRange {
-                address: physical_start.start_pa(),
-            });
+            return Err(MemoryError::PhysicalOutOfRange { address: physical_start.start_pa() });
         }
 
         let _mutation = self.mutation_lock.lock();
@@ -274,16 +258,11 @@ impl PageTable {
         for (offset, page) in range.pages().enumerate() {
             let offset = u32::try_from(offset).map_err(|_| MemoryError::HostSizeOverflow)?;
             let physical = GuestPage(
-                physical_start
-                    .0
-                    .checked_add(offset)
-                    .ok_or(MemoryError::HostSizeOverflow)?,
+                physical_start.0.checked_add(offset).ok_or(MemoryError::HostSizeOverflow)?,
             );
             let generation = self
                 .physical_generation(physical)
-                .ok_or(MemoryError::PhysicalOutOfRange {
-                    address: physical.start_pa(),
-                })?;
+                .ok_or(MemoryError::PhysicalOutOfRange { address: physical.start_pa() })?;
             self.set(page, PageDescriptor::ram(physical, permissions, generation));
         }
 
@@ -405,10 +384,7 @@ impl PageTable {
                 continue;
             }
 
-            entry.store(
-                descriptor.with_generation(next_generation).0,
-                Ordering::Release,
-            );
+            entry.store(descriptor.with_generation(next_generation).0, Ordering::Release);
         }
 
         Some(next_generation)
@@ -417,8 +393,7 @@ impl PageTable {
     /// Returns the metadata memory size in bytes.
     #[must_use]
     pub const fn byte_len() -> usize {
-        GUEST_PAGE_COUNT
-            * (std::mem::size_of::<AtomicU64>() + std::mem::size_of::<AtomicU16>())
+        GUEST_PAGE_COUNT * (std::mem::size_of::<AtomicU64>() + std::mem::size_of::<AtomicU16>())
     }
 
     /// Returns the fixed guest page size.
@@ -461,9 +436,7 @@ mod tests {
         let table = PageTable::new();
         let range = GuestRange::page_aligned(GuestVa(0x2000), 2 * u64::from(GUEST_PAGE_SIZE))
             .expect("range is aligned");
-        table
-            .map_ram(range, GuestPage(7), MemoryPermissions::READ)
-            .expect("mapping succeeds");
+        table.map_ram(range, GuestPage(7), MemoryPermissions::READ).expect("mapping succeeds");
 
         assert_eq!(table.get(GuestPage(2)).physical_page(), GuestPage(7));
         assert_eq!(table.get(GuestPage(3)).physical_page(), GuestPage(8));
@@ -478,11 +451,8 @@ mod tests {
             .map_ram(occupied, GuestPage(9), MemoryPermissions::READ)
             .expect("initial mapping succeeds");
 
-        let overlap = GuestRange::page_aligned(
-            GuestVa(0x1000),
-            2 * u64::from(GUEST_PAGE_SIZE),
-        )
-        .expect("range is aligned");
+        let overlap = GuestRange::page_aligned(GuestVa(0x1000), 2 * u64::from(GUEST_PAGE_SIZE))
+            .expect("range is aligned");
         let error = table
             .map_ram(overlap, GuestPage(20), MemoryPermissions::READ)
             .expect_err("overlap must fail");
@@ -497,20 +467,13 @@ mod tests {
         let table = PageTable::new();
         let mapped = GuestRange::page_aligned(GuestVa(0x1000), u64::from(GUEST_PAGE_SIZE))
             .expect("range is aligned");
-        table
-            .map_ram(mapped, GuestPage(4), MemoryPermissions::READ)
-            .expect("mapping succeeds");
+        table.map_ram(mapped, GuestPage(4), MemoryPermissions::READ).expect("mapping succeeds");
 
-        let partially_unmapped = GuestRange::page_aligned(
-            GuestVa(0x1000),
-            2 * u64::from(GUEST_PAGE_SIZE),
-        )
-        .expect("range is aligned");
+        let partially_unmapped =
+            GuestRange::page_aligned(GuestVa(0x1000), 2 * u64::from(GUEST_PAGE_SIZE))
+                .expect("range is aligned");
         let error = table
-            .protect(
-                partially_unmapped,
-                MemoryPermissions::READ | MemoryPermissions::WRITE,
-            )
+            .protect(partially_unmapped, MemoryPermissions::READ | MemoryPermissions::WRITE)
             .expect_err("protection must fail");
 
         assert!(matches!(error, MemoryError::Unmapped { .. }));
@@ -556,16 +519,12 @@ mod tests {
         let table = PageTable::new();
         let first = GuestRange::page_aligned(GuestVa(0x1000), u64::from(GUEST_PAGE_SIZE))
             .expect("range is aligned");
-        table
-            .map_ram(first, GuestPage(7), MemoryPermissions::READ)
-            .expect("mapping succeeds");
+        table.map_ram(first, GuestPage(7), MemoryPermissions::READ).expect("mapping succeeds");
         assert_eq!(table.bump_physical_generation(GuestPage(7)), Some(1));
 
         let alias = GuestRange::page_aligned(GuestVa(0x9000), u64::from(GUEST_PAGE_SIZE))
             .expect("range is aligned");
-        table
-            .map_ram(alias, GuestPage(7), MemoryPermissions::READ)
-            .expect("alias succeeds");
+        table.map_ram(alias, GuestPage(7), MemoryPermissions::READ).expect("alias succeeds");
 
         assert_eq!(table.get(GuestPage(1)).generation(), 1);
         assert_eq!(table.get(GuestPage(9)).generation(), 1);
