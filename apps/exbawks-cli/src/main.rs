@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use exbawks_core::{BootPlanReport, EmulatorBuilder, EmulatorConfig};
 use exbawks_cpu::{BasicBlockDecoder, DecodeConfig, format_instruction};
+use exbawks_debug::JsonLinesTrace;
 use exbawks_platform::{
     HostCapabilities, SystemMemoryInfo, probe_host_capabilities, query_system_memory_info,
 };
@@ -69,13 +70,19 @@ enum Command {
         #[arg(long, default_value_t = 4096)]
         limit: usize,
     },
-    /// Performs the implemented load and planning stages.
+    /// Loads and executes one XBE until a controlled stop reason.
     Run {
         /// The XBE file path.
         path: PathBuf,
         /// The emulated physical RAM size in MiB.
         #[arg(long, default_value_t = 64)]
         ram_mib: usize,
+        /// Writes JSON Lines trace events to this file.
+        #[arg(long)]
+        trace: Option<PathBuf>,
+        /// Includes the private XBE host path in trace records.
+        #[arg(long, requires = "trace")]
+        trace_host_paths: bool,
     },
 }
 
@@ -124,7 +131,9 @@ fn main() -> Result<()> {
             print_plan(&report, cli.json)
         }
         Command::Thunks { path, limit } => thunks(&path, limit, cli.json),
-        Command::Run { path, ram_mib } => run(&path, ram_mib, cli.json),
+        Command::Run { path, ram_mib, trace, trace_host_paths } => {
+            run(&path, ram_mib, trace.as_deref(), trace_host_paths, cli.json)
+        }
     }
 }
 
@@ -301,7 +310,13 @@ fn thunks(path: &Path, limit: usize, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run(path: &Path, ram_mib: usize, json: bool) -> Result<()> {
+fn run(
+    path: &Path,
+    ram_mib: usize,
+    trace: Option<&Path>,
+    trace_host_paths: bool,
+    json: bool,
+) -> Result<()> {
     const MAX_RUN_BLOCKS: usize = 1 << 20;
 
     let bytes = read_file(path)?;
@@ -309,7 +324,17 @@ fn run(path: &Path, ram_mib: usize, json: bool) -> Result<()> {
         physical_memory_bytes: mib_to_bytes(ram_mib)?,
         ..EmulatorConfig::default()
     };
-    let mut emulator = EmulatorBuilder::new().config(config).build()?;
+    let mut builder = EmulatorBuilder::new().config(config);
+    if let Some(trace_path) = trace {
+        let file = fs::File::create(trace_path)
+            .with_context(|| format!("failed to create {}", trace_path.display()))?;
+        let mut sink = JsonLinesTrace::new(std::io::BufWriter::new(file));
+        if trace_host_paths {
+            sink = sink.with_host_path(path.display().to_string());
+        }
+        builder = builder.trace(std::sync::Arc::new(sink));
+    }
+    let mut emulator = builder.build()?;
     emulator.load_xbe(bytes).with_context(|| format!("failed to load {}", path.display()))?;
     let stop = emulator.run(MAX_RUN_BLOCKS)?;
 

@@ -136,6 +136,7 @@ dependencies = [
  "clap",
  "exbawks-core",
  "exbawks-cpu",
+ "exbawks-debug",
  "exbawks-platform",
  "exbawks-types",
  "exbawks-xbe",
@@ -178,6 +179,7 @@ dependencies = [
  "exbawks-types",
  "parking_lot",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

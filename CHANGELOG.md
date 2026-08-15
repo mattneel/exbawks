@@ -34,6 +34,9 @@ The project follows Keep a Changelog structure before its first release.
   boot flow and reports the stop reason (`HLE-002`).
 - The synthetic fixture now contains the complete first-milestone boot
   title, so `exbawks run` on the fixture exits with `GuestExit`.
+- A JSON Lines trace writer with sequence numbers and opt-in private host
+  paths; `exbawks run --trace <file>` records block entries, kernel calls,
+  and the stop reason (`DBG-001`).
 - Initial Rust workspace scaffold.
 - XBE parser and synthetic tests.
 - Software guest address space.

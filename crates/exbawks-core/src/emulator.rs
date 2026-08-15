@@ -260,6 +260,7 @@ impl Emulator {
             .checked_add(u32::try_from(instruction.len()).unwrap_or(u32::MAX))
             .ok_or(CoreError::KernelThunkAddressOverflow { address })?;
         tracing::trace!(ordinal, name = export.name(), "dispatching kernel gate call");
+        self.trace.record(TraceEvent::KernelCall { ordinal, caller: address });
         let memory = self.memory.clone();
 
         // Perform the call: push the return address so exports see the real
@@ -288,6 +289,12 @@ impl Emulator {
     /// Execution continues until a controlled stop reason occurs or the
     /// block budget expires.
     pub fn run(&mut self, max_blocks: usize) -> Result<StopReason, CoreError> {
+        let stop = self.run_blocks(max_blocks)?;
+        self.trace.record(TraceEvent::Stop { reason: format!("{stop:?}") });
+        Ok(stop)
+    }
+
+    fn run_blocks(&mut self, max_blocks: usize) -> Result<StopReason, CoreError> {
         if self.loaded.is_none() {
             return Err(CoreError::NoImageLoaded);
         }
