@@ -125,7 +125,7 @@ fn validate_header_sizes(
     if size_of_image < size_of_headers {
         return Err(XbeError::InvalidHeader("image size is smaller than header size"));
     }
-    if usize::try_from(size_of_headers).is_none_or(|size| size > bytes.len()) {
+    if usize::try_from(size_of_headers).ok().is_none_or(|size| size > bytes.len()) {
         return Err(XbeError::InvalidHeader("file does not contain all declared header bytes"));
     }
     Ok(())

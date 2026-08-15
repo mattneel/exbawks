@@ -17,12 +17,12 @@ pub(crate) fn read_array<const N: usize>(
     Ok(value)
 }
 
-pub(crate) fn read_c_string(
-    bytes: &[u8],
+pub(crate) fn read_c_string<'bytes>(
+    bytes: &'bytes [u8],
     offset: usize,
     maximum_len: usize,
     field: &'static str,
-) -> Result<&str, XbeError> {
+) -> Result<&'bytes str, XbeError> {
     let available = bytes.get(offset..).ok_or(XbeError::Truncated { field, offset })?;
     let bounded = &available[..available.len().min(maximum_len)];
     let end = bounded.iter().position(|byte| *byte == 0).unwrap_or(bounded.len());
