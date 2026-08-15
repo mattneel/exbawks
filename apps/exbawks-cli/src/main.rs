@@ -10,7 +10,7 @@ use exbawks_cpu::{BasicBlockDecoder, DecodeConfig, format_instruction};
 use exbawks_platform::{
     HostCapabilities, SystemMemoryInfo, probe_host_capabilities, query_system_memory_info,
 };
-use exbawks_types::{BackendKind, GuestVa};
+use exbawks_types::{BackendKind, GuestVa, StopReason};
 use exbawks_xbe::XbeImage;
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
@@ -302,25 +302,35 @@ fn thunks(path: &Path, limit: usize, json: bool) -> Result<()> {
 }
 
 fn run(path: &Path, ram_mib: usize, json: bool) -> Result<()> {
-    let report = plan(path, BackendKind::DirectRewrite, ram_mib)?;
+    const MAX_RUN_BLOCKS: usize = 1 << 20;
+
+    let bytes = read_file(path)?;
+    let config = EmulatorConfig {
+        physical_memory_bytes: mib_to_bytes(ram_mib)?,
+        ..EmulatorConfig::default()
+    };
+    let mut emulator = EmulatorBuilder::new().config(config).build()?;
+    emulator.load_xbe(bytes).with_context(|| format!("failed to load {}", path.display()))?;
+    let stop = emulator.run(MAX_RUN_BLOCKS)?;
+
     if json {
         #[derive(Serialize)]
-        struct RunReport<'a> {
-            stage: &'static str,
-            execution_available: bool,
-            plan: &'a BootPlanReport,
+        struct RunReport {
+            stop: StopReason,
+            eip: GuestVa,
+            gpr: [u32; 8],
         }
 
         return print_json(&RunReport {
-            stage: "entry-block-planned",
-            execution_available: false,
-            plan: &report,
+            stop,
+            eip: GuestVa(emulator.cpu().eip),
+            gpr: emulator.cpu().gpr,
         });
     }
 
-    print_plan(&report, false)?;
-    println!();
-    println!("Execution status: runtime emission and dispatch are not implemented.");
+    println!("Stop reason:  {stop:?}");
+    println!("Final EIP:    {}", GuestVa(emulator.cpu().eip));
+    println!("Final EAX:    0x{:08X}", emulator.cpu().gpr[0]);
     Ok(())
 }
 

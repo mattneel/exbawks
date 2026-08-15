@@ -6,9 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Exbawks is a Rust research emulator for the original Xbox, targeting Windows 11 x86-64 only as the
 runtime host (Rust 1.97.1, edition 2024, MSVC target). It uses high-level emulation for kernel and
-graphics interfaces and `iced-x86` for guest x86 decoding. It is currently a scaffold: block
-decoding, translation planning, and cache metadata exist, but **no executable guest code is emitted
-yet** — the direct backend returns `CompilationState::Planned` plans and there is no dispatch loop.
+graphics interfaces and `iced-x86` for guest x86 decoding. The first execution milestone works on
+Windows: the direct backend emits the register-only subset (ADR 0006 ABI), `Emulator::run` drives
+blocks through the dispatcher, kernel thunk gates dispatch HLE exports, and the synthetic fixture
+boots to a controlled `GuestExit`. Memory operands, control flow, and fault redirection remain
+untranslated; on non-Windows hosts the backend still returns `CompilationState::Planned`.
 
 `AGENTS.md` is the authoritative instruction file (invariants, unsafe policy, error handling, task
 order). Read it, then `docs/agent-handoff.md` (reading order, acceptance criteria, stop conditions)

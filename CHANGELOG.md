@@ -28,6 +28,12 @@ The project follows Keep a Changelog structure before its first release.
 - Kernel thunk gate patching at load time and runtime dispatch of gate
   calls to registered HLE exports; `exbawks thunks` reports the table as
   parsed before patching (`HLE-001`).
+- The startup kernel export set with real `DbgPrint` and
+  `HalReturnToFirmware` implementations, a guest stack for the first
+  synthetic thread, and an execution loop; `exbawks run` now executes the
+  boot flow and reports the stop reason (`HLE-002`).
+- The synthetic fixture now contains the complete first-milestone boot
+  title, so `exbawks run` on the fixture exits with `GuestExit`.
 - Initial Rust workspace scaffold.
 - XBE parser and synthetic tests.
 - Software guest address space.

@@ -62,9 +62,9 @@ Future vectored exception redirection still needs verification.
 
 ## Known implementation limits
 
-The code does not execute translated guest instructions.
+The direct backend emits and executes the register-only subset on Windows. Memory operands, guest control flow, and fault redirection remain untranslated; blocks that reach them exit through the runtime.
 
-The direct backend creates translation plans only. The Cranelift backend reports that it is unavailable.
+Portable hosts create translation plans only. The Cranelift backend reports that it is unavailable.
 
 The software address space updates physical generation values through an explicit method. Guest writes do not trigger code invalidation automatically.
 

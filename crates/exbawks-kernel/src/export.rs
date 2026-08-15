@@ -8,6 +8,11 @@ pub trait KernelExport: Send + Sync {
     /// Returns a diagnostic export name.
     fn name(&self) -> &'static str;
 
+    /// Returns the stdcall argument bytes the runtime pops after the call.
+    fn stack_bytes(&self) -> u16 {
+        0
+    }
+
     /// Executes the export against checked guest state.
     fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus;
 }

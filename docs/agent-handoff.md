@@ -28,16 +28,25 @@ Implemented components include:
 - Coherent Windows RAM aliases through pagefile section views (`MEM-004`).
 - A Windows `GuestMemory` backend with generated equivalence tests against
   the software backend (`MEM-005`).
-- A CLI for host checks, XBE inspection, decoding, thunk inspection, and entry planning.
-- Generated public test data.
+- Single-owner executable code buffers with write and execute phases
+  (`JIT-001`).
+- Register-only direct emission and a dispatcher under the ADR 0006 block
+  ABI, verified against an interpreter oracle (`JIT-002`).
+- Sorted source ranges and fault-site metadata with binary-search lookups
+  (`JIT-003`).
+- Kernel thunk gate patching and runtime gate-call dispatch (`HLE-001`).
+- The startup kernel export set, a guest stack, and the execution loop
+  (`HLE-002`).
+- A CLI for host checks, XBE inspection, decoding, thunk inspection, entry
+  planning, and synthetic boot execution.
+- Generated public test data that boots to a controlled guest exit.
 
 Incomplete components include:
 
-- Executable code emission.
-- Dispatcher and host ABI implementation.
-- Fault-site redirection.
-- Kernel thunk gates.
-- Startup kernel exports.
+- Memory operand and guest control-flow translation.
+- Fault-site redirection and MMIO dispatch.
+- The Windows backend as the active runtime address space.
+- Extended XBE metadata parsing (certificates, TLS, libraries).
 - Graphics decoding and rendering.
 
 Read [the validation report](../VALIDATION.md) before code changes.
@@ -53,13 +62,15 @@ Read [the validation report](../VALIDATION.md) before code changes.
 
 ## Immediate objective
 
-Tasks `MEM-001` through `MEM-005` are complete. Both memory backends pass
-generated equivalence tests.
+Tasks `MEM-001` through `MEM-005`, `JIT-001` through `JIT-003`, `HLE-001`,
+and `HLE-002` are complete. The first execution milestone passes on
+Windows 11 x86-64.
 
-Implement tasks `JIT-001` through `JIT-003` in order.
+Select the next task from the board: `XBE-001`, `DBG-001`, or `QA-001`.
+Memory operand rewriting and fault-site redirection follow per the
+`AGENTS.md` task sequence.
 
-Do not start graphics or broad kernel work before executable blocks run
-through the dispatcher.
+Do not start graphics work before memory operands translate.
 
 ## First commands
 
@@ -121,16 +132,19 @@ Create or update an ADR before work continues.
 
 ## Definition of done for the first execution milestone
 
-The milestone is complete when all conditions pass:
+The milestone completed on August 15, 2026. Every condition passes:
 
 - Windows maps two coherent guest aliases from one physical section.
 - The direct backend emits the approved register-only subset.
-- The dispatcher enters and leaves generated code under one documented ABI.
-- A synthetic XBE reaches its entry point.
-- One patched kernel thunk calls one registered HLE export.
-- Execution returns to translated code.
-- The runtime exits with a controlled stop reason.
+- The dispatcher enters and leaves generated code under the ADR 0006 ABI.
+- The synthetic XBE reaches its entry point.
+- Patched kernel thunks call the registered `DbgPrint` and
+  `HalReturnToFirmware` exports.
+- Execution returns to translated code after each export.
+- The runtime exits with `GuestExit { code: 0 }`.
 - `cargo xtask check` passes on Windows 11 x86-64.
 - No proprietary data exists in the repository.
+
+Run the milestone: `cargo exbawks run .\fixtures\synthetic\minimal-retail.xbe`.
 
 Use [the task board](task-board.md) for issue details and acceptance tests.

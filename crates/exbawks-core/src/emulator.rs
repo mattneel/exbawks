@@ -5,18 +5,23 @@ use exbawks_cpu::{BasicBlockDecoder, CpuState, DecodeConfig, DecodedBlock, indir
 use exbawks_debug::{NoopTrace, TraceEvent, TraceSink};
 use exbawks_gpu::{GraphicsFrontend, NullGraphicsBackend};
 use exbawks_jit::{
-    BlockKey, CodeCache, CodegenBackend, CompiledBlock, CraneliftBackend, DirectRewriteBackend,
-    PhysicalPageDependency,
+    BlockExit, BlockKey, CodeCache, CodegenBackend, CompiledBlock, CraneliftBackend,
+    DirectRewriteBackend, Dispatcher, PhysicalPageDependency,
 };
-use exbawks_kernel::{KernelCallContext, KernelRegistry, KernelStatus, gate_address, gate_ordinal};
+use exbawks_kernel::{
+    KernelCallContext, KernelRegistry, KernelStatus, gate_address, gate_ordinal,
+    register_startup_exports,
+};
 use exbawks_memory::{GuestMemory, MemoryError, PageKind, SoftwareAddressSpace};
-use exbawks_types::{BackendKind, GUEST_PAGE_SIZE, GuestRange, GuestVa, MemoryPermissions};
+use exbawks_types::{
+    BackendKind, GUEST_PAGE_SIZE, GuestRange, GuestVa, MemoryPermissions, StopReason,
+};
 use exbawks_xbe::{XbeImage, XbeSection, XbeSectionFlags};
 
 use crate::{BootPlanReport, CoreError, EmulatorConfig, KernelThunkTable, LoadedImage};
 
 /// The outcome of one kernel gate call attempt at the current guest EIP.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateAssist {
     /// One export ran; execution resumes at the address.
     Dispatched {
@@ -24,6 +29,8 @@ pub enum GateAssist {
         resume: GuestVa,
         /// The status the export returned.
         status: KernelStatus,
+        /// A controlled stop the export requested.
+        stop: Option<StopReason>,
     },
     /// A gate call named an ordinal without a registered export.
     MissingExport {
@@ -33,6 +40,13 @@ pub enum GateAssist {
     /// The current instruction is not a kernel gate call.
     NotAGateCall,
 }
+
+/// The guest stack range for the first synthetic thread.
+const GUEST_STACK_BASE: GuestVa = GuestVa(0x03FF_0000);
+/// The guest stack size in bytes.
+const GUEST_STACK_BYTES: u32 = 64 * 1024;
+/// The scratch bytes kept above the initial stack pointer.
+const GUEST_STACK_SCRATCH: u32 = 16;
 
 /// A decoded and compiled plan for the current XBE entry block.
 #[derive(Debug, Clone)]
@@ -86,11 +100,15 @@ impl EmulatorBuilder {
         let memory = Arc::new(SoftwareAddressSpace::new(self.config.physical_memory_bytes)?);
         let backend = make_backend(self.config.backend);
 
+        let kernel = KernelRegistry::new();
+        register_startup_exports(&kernel)
+            .map_err(|_| CoreError::InvalidConfiguration("startup exports must register once"))?;
+
         Ok(Emulator {
             config: self.config,
             memory,
             cpu: CpuState::default(),
-            kernel: KernelRegistry::new(),
+            kernel,
             graphics: GraphicsFrontend::new(NullGraphicsBackend::default()),
             code_cache: CodeCache::default(),
             backend,
@@ -191,7 +209,14 @@ impl Emulator {
         )?;
         patch_kernel_thunks(&memory, &thunks)?;
 
+        // The first synthetic guest thread receives one mapped stack.
+        let stack = GuestRange::page_aligned(GUEST_STACK_BASE, u64::from(GUEST_STACK_BYTES))
+            .map_err(MemoryError::from)?;
+        memory.map_anonymous(stack, MemoryPermissions::READ | MemoryPermissions::WRITE)?;
+        let stack_top = GUEST_STACK_BASE.0 + GUEST_STACK_BYTES - GUEST_STACK_SCRATCH;
+
         self.cpu = CpuState { eip: image.header.entry_point.0, ..CpuState::default() };
+        self.cpu.gpr[4] = stack_top;
         self.memory = memory;
         self.code_cache.clear();
         self.address_space_epoch = self.address_space_epoch.wrapping_add(1);
@@ -236,17 +261,81 @@ impl Emulator {
             .ok_or(CoreError::KernelThunkAddressOverflow { address })?;
         tracing::trace!(ordinal, name = export.name(), "dispatching kernel gate call");
         let memory = self.memory.clone();
-        let mut context = KernelCallContext { cpu: &mut self.cpu, memory: memory.as_ref() };
-        let status = export.call(&mut context);
 
-        self.cpu.eip = resume.0;
-        Ok(GateAssist::Dispatched { resume, status })
+        // Perform the call: push the return address so exports see the real
+        // stdcall frame layout with arguments above the return slot.
+        let pushed_esp = self.cpu.gpr[4].wrapping_sub(4);
+        memory.write_u32(GuestVa(pushed_esp), resume.0)?;
+        self.cpu.gpr[4] = pushed_esp;
+
+        let mut context =
+            KernelCallContext { cpu: &mut self.cpu, memory: memory.as_ref(), stop_request: None };
+        let status = export.call(&mut context);
+        let stop = context.stop_request;
+
+        // Perform the return: pop the return address and the stdcall
+        // argument bytes the export declares.
+        let return_address = memory.read_u32(GuestVa(self.cpu.gpr[4]))?;
+        self.cpu.gpr[4] =
+            self.cpu.gpr[4].wrapping_add(4).wrapping_add(u32::from(export.stack_bytes()));
+        self.cpu.eip = return_address;
+
+        Ok(GateAssist::Dispatched { resume: GuestVa(return_address), status, stop })
+    }
+
+    /// Runs translated blocks from the current guest EIP.
+    ///
+    /// Execution continues until a controlled stop reason occurs or the
+    /// block budget expires.
+    pub fn run(&mut self, max_blocks: usize) -> Result<StopReason, CoreError> {
+        if self.loaded.is_none() {
+            return Err(CoreError::NoImageLoaded);
+        }
+
+        for _ in 0..max_blocks {
+            let start = GuestVa(self.cpu.eip);
+            let (_, compiled) = self.compiled_block_at(start)?;
+            let Some(emitted) = compiled.executable.as_ref() else {
+                return Ok(StopReason::RuntimeIncomplete);
+            };
+
+            match Dispatcher.run(emitted, &mut self.cpu)? {
+                BlockExit::DirectSuccessor => {}
+                BlockExit::UnsupportedInstruction => match self.try_kernel_gate_call()? {
+                    GateAssist::Dispatched { stop: Some(stop), .. } => return Ok(stop),
+                    GateAssist::Dispatched { .. } => {}
+                    GateAssist::MissingExport { ordinal } => {
+                        return Ok(StopReason::MissingKernelExport { ordinal });
+                    }
+                    GateAssist::NotAGateCall => {
+                        return Ok(StopReason::UnsupportedInstruction {
+                            address: GuestVa(self.cpu.eip),
+                        });
+                    }
+                },
+                _ => {
+                    return Ok(StopReason::UnsupportedInstruction {
+                        address: GuestVa(self.cpu.eip),
+                    });
+                }
+            }
+        }
+
+        Ok(StopReason::BudgetExhausted)
     }
 
     /// Decodes and plans the current entry block.
     pub fn plan_entry_block(&self) -> Result<EntryBlockPlan, CoreError> {
         let image = self.loaded.clone().ok_or(CoreError::NoImageLoaded)?;
-        let start = GuestVa(self.cpu.eip);
+        let (decoded, compiled) = self.compiled_block_at(GuestVa(self.cpu.eip))?;
+        Ok(EntryBlockPlan { image, decoded, compiled })
+    }
+
+    /// Decodes and compiles one block through the code cache.
+    fn compiled_block_at(
+        &self,
+        start: GuestVa,
+    ) -> Result<(DecodedBlock, Arc<CompiledBlock>), CoreError> {
         let page_remaining = usize::try_from(GUEST_PAGE_SIZE - start.page_offset())
             .map_err(|_| CoreError::InvalidConfiguration("guest page size does not fit usize"))?;
         let fetch_len = self.config.max_block_bytes.min(page_remaining);
@@ -266,14 +355,14 @@ impl Emulator {
             backend: self.backend.kind(),
         };
         if let Some(compiled) = self.code_cache.get(key, self.memory.page_table()) {
-            return Ok(EntryBlockPlan { image, decoded, compiled });
+            return Ok((decoded, compiled));
         }
 
         let dependencies = physical_dependencies(self.memory.page_table(), &decoded)?;
         let compiled = Arc::new(self.backend.compile(&decoded)?);
         self.code_cache.insert(key, compiled.clone(), dependencies);
 
-        Ok(EntryBlockPlan { image, decoded, compiled })
+        Ok((decoded, compiled))
     }
 
     /// Removes the active image and resets session state.
@@ -610,17 +699,20 @@ mod tests {
                 .load_xbe(synthetic_xbe_with(&GATE_CALL_CODE, &[0x8000_0007]))
                 .expect("synthetic XBE must load");
 
+            let stack_before = emulator.cpu().gpr[4];
             let assist = emulator.try_kernel_gate_call().expect("assist must succeed");
             assert_eq!(
                 assist,
                 GateAssist::Dispatched {
                     resume: GuestVa(0x0001_1006),
-                    status: KernelStatus::SUCCESS
+                    status: KernelStatus::SUCCESS,
+                    stop: None
                 }
             );
             assert_eq!(calls.load(Ordering::Relaxed), 1);
             assert_eq!(emulator.cpu().eip, 0x0001_1006);
             assert_eq!(emulator.cpu().gpr[0], 0xFEED_F00D);
+            assert_eq!(emulator.cpu().gpr[4], stack_before, "the call and return balance");
         }
 
         #[test]
@@ -653,6 +745,84 @@ mod tests {
                 .load_xbe(synthetic_xbe_with(&[0x90, 0xC3], &[0x0000_1234]))
                 .expect_err("a malformed thunk must fail the load");
             assert!(matches!(error, CoreError::InvalidKernelThunk { .. }));
+        }
+    }
+
+    mod milestone {
+        use super::*;
+
+        /// The synthetic boot title for the first execution milestone.
+        ///
+        /// ```text
+        /// 0x11000  mov eax, 5
+        /// 0x11005  add eax, 0x25        ; translated work before the call
+        /// 0x11008  call [0x11200]       ; DbgPrint through the first gate
+        /// 0x1100E  mov ebx, eax         ; translated work after the return
+        /// 0x11010  call [0x11204]       ; HalReturnToFirmware exits
+        /// 0x11016  ret
+        /// ```
+        const BOOT_CODE: [u8; 23] = [
+            0xB8, 0x05, 0x00, 0x00, 0x00, // mov eax, 5
+            0x83, 0xC0, 0x25, // add eax, 0x25
+            0xFF, 0x15, 0x00, 0x12, 0x01, 0x00, // call [0x11200]
+            0x89, 0xC3, // mov ebx, eax
+            0xFF, 0x15, 0x04, 0x12, 0x01, 0x00, // call [0x11204]
+            0xC3, // ret
+        ];
+
+        const BOOT_THUNKS: [u32; 2] = [0x8000_0008, 0x8000_0031];
+
+        #[cfg(windows)]
+        #[test]
+        fn synthetic_title_boots_calls_the_kernel_and_exits() {
+            let mut emulator = Emulator::new().expect("emulator must initialize");
+            emulator
+                .load_xbe(synthetic_xbe_with(&BOOT_CODE, &BOOT_THUNKS))
+                .expect("synthetic XBE must load");
+            assert_eq!(emulator.cpu().eip, 0x0001_1000, "the image reaches its entry point");
+
+            let stop = emulator.run(16).expect("the boot flow must run");
+
+            assert_eq!(stop, StopReason::GuestExit { code: 0 });
+            assert_eq!(emulator.cpu().gpr[0], 42, "translated arithmetic ran before the call");
+            assert_eq!(emulator.cpu().gpr[3], 42, "translated code ran after the HLE return");
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn unknown_ordinals_stop_with_the_missing_export_name() {
+            let mut emulator = Emulator::new().expect("emulator must initialize");
+            let code = [0xFF, 0x15, 0x00, 0x12, 0x01, 0x00, 0xC3];
+            emulator
+                .load_xbe(synthetic_xbe_with(&code, &[0x8000_012C]))
+                .expect("synthetic XBE must load");
+
+            let stop = emulator.run(16).expect("the run must stop cleanly");
+            assert_eq!(stop, StopReason::MissingKernelExport { ordinal: 0x12C });
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn zero_budget_reports_exhaustion() {
+            let mut emulator = Emulator::new().expect("emulator must initialize");
+            emulator
+                .load_xbe(synthetic_xbe_with(&BOOT_CODE, &BOOT_THUNKS))
+                .expect("synthetic XBE must load");
+
+            let stop = emulator.run(0).expect("the run must stop cleanly");
+            assert_eq!(stop, StopReason::BudgetExhausted);
+        }
+
+        #[cfg(not(windows))]
+        #[test]
+        fn portable_hosts_stop_with_runtime_incomplete() {
+            let mut emulator = Emulator::new().expect("emulator must initialize");
+            emulator
+                .load_xbe(synthetic_xbe_with(&BOOT_CODE, &BOOT_THUNKS))
+                .expect("synthetic XBE must load");
+
+            let stop = emulator.run(16).expect("the run must stop cleanly");
+            assert_eq!(stop, StopReason::RuntimeIncomplete);
         }
     }
 }

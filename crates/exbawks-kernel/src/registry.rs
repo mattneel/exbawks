@@ -102,7 +102,7 @@ mod tests {
 
         let memory = SoftwareAddressSpace::new(4096).expect("memory must initialize");
         let mut cpu = CpuState::default();
-        let mut context = KernelCallContext { cpu: &mut cpu, memory: &memory };
+        let mut context = KernelCallContext { cpu: &mut cpu, memory: &memory, stop_request: None };
         let status = registry.dispatch(7, &mut context).expect("dispatch must succeed");
 
         assert_eq!(status, KernelStatus::NOT_IMPLEMENTED);
