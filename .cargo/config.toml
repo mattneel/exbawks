@@ -1,0 +1,7 @@
+[alias]
+exbawks = "run --package exbawks-cli --"
+xtask = "run --package xtask --"
+check-all = "run --package xtask -- check"
+
+[env]
+RUST_BACKTRACE = "1"

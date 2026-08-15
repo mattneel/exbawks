@@ -1,0 +1,83 @@
+# Kernel HLE
+
+## Scope
+
+Kernel HLE replaces Xbox kernel imports with host implementations.
+
+The first goal is title startup, not complete kernel compatibility.
+
+## Import resolution
+
+The XBE header contains an encoded kernel thunk table address.
+
+The loader will decode that address with the detected XBE flavor. It will read the terminated ordinal table.
+
+Each thunk entry will point to a generated HLE gate or dispatcher stub.
+
+Do not write host pointers into guest memory when the guest can observe their width or layout.
+
+## Export registry
+
+Register exports by ordinal.
+
+Each export also provides a stable name for traces and errors.
+
+A callback receives these objects:
+
+- Mutable guest CPU state.
+- Checked guest memory access.
+- Kernel object tables.
+- Scheduler and clock services.
+- A trace sink.
+
+The current registry exposes CPU state and guest memory. Later work will add the remaining services.
+
+## Calling convention
+
+Document the guest calling convention for each export.
+
+Read arguments through named helpers. Do not scatter stack offsets through callback bodies.
+
+Write the return value through one common helper.
+
+Preserve guest registers according to the export contract.
+
+## Object model
+
+Use typed handles with generation counters.
+
+Keep host handles outside guest-visible values.
+
+Implement these object groups first:
+
+1. Threads and events.
+2. Files and symbolic links.
+3. Virtual memory and sections.
+4. Timers and synchronization.
+5. Devices and input.
+
+## Time
+
+Use one emulator clock interface.
+
+Do not call the host wall clock directly from kernel exports.
+
+A deterministic test clock must support unit and replay tests.
+
+## File system
+
+Map Xbox device paths through a virtual mount table.
+
+Validate every guest string and length.
+
+Reject path traversal outside configured roots.
+
+Use case-insensitive path lookup where Xbox behavior requires it.
+
+## Error behavior
+
+Return guest status values for expected failures.
+
+Use host errors only for emulator defects or host resource failures.
+
+Trace each missing export once by default. A strict mode can stop immediately.

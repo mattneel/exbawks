@@ -1,0 +1,34 @@
+name: Feature proposal
+description: Propose an emulator feature or architecture change.
+title: "proposal: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the guest behavior or development problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: design
+    attributes:
+      label: Proposed design
+      description: Describe subsystem boundaries and invariants.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Describe other designs and their costs.
+
+  - type: textarea
+    id: tests
+    attributes:
+      label: Acceptance tests
+      description: List synthetic tests that prove completion.
+    validations:
+      required: true

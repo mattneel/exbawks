@@ -1,0 +1,16 @@
+/target/
+/.idea/
+/.vscode/
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.dmp
+*.trace.jsonl
+*.profraw
+*.profdata
+.DS_Store
+Thumbs.db
+/fixtures/private/

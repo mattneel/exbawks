@@ -1,0 +1,49 @@
+name: Compatibility observation
+description: Record legal, non-infringing behavior evidence for one title.
+title: "compat: "
+labels: [compatibility]
+body:
+  - type: markdown
+    attributes:
+      value: Do not upload an XBE, disc image, key, firmware, or extracted proprietary data.
+
+  - type: input
+    id: title
+    attributes:
+      label: Title
+    validations:
+      required: true
+
+  - type: input
+    id: revision
+    attributes:
+      label: Exbawks revision
+    validations:
+      required: true
+
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Furthest stage
+      options:
+        - XBE parse
+        - Section mapping
+        - Entry decode
+        - Kernel HLE
+        - Graphics initialization
+        - In game
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Include hashes, public metadata, or logs without proprietary bytes.

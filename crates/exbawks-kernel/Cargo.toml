@@ -1,0 +1,18 @@
+[package]
+name = "exbawks-kernel"
+description = "Original Xbox kernel HLE interfaces for Exbawks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+exbawks-cpu.workspace = true
+exbawks-memory.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

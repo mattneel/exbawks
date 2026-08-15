@@ -1,0 +1,16 @@
+[package]
+name = "exbawks-xbe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bitflags.workspace = true
+exbawks-types.workspace = true
+serde.workspace = true
+thiserror.workspace = true

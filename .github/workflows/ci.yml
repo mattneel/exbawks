@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    name: Repository structure
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run static validation
+        run: python scripts/static-validate.py
+
+  windows:
+    name: Windows workspace
+    runs-on: windows-2022
+    timeout-minutes: 30
+    needs: static
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: clippy,rustfmt
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run required checks
+        run: cargo xtask check
+
+      - name: Run synthetic CLI smoke test
+        run: cargo exbawks plan .\fixtures\synthetic\minimal-retail.xbe --json
+
+  portable-logic:
+    name: Portable logic crates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: static
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: clippy,rustfmt
+
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check portable workspace
+        run: cargo check --workspace --all-targets
+
+      - name: Test portable workspace
+        run: cargo test --workspace

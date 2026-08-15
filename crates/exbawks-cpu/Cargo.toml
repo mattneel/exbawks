@@ -1,0 +1,16 @@
+[package]
+name = "exbawks-cpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+exbawks-types.workspace = true
+iced-x86.workspace = true
+serde.workspace = true
+thiserror.workspace = true

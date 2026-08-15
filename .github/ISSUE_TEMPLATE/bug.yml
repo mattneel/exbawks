@@ -1,0 +1,49 @@
+name: Bug report
+description: Report a reproducible Exbawks defect.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach copyrighted Xbox software or private keys.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the observed behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide commands and synthetic inputs when possible.
+      placeholder: |
+        1. Run `cargo exbawks ...`.
+        2. Observe the failure.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: host
+    attributes:
+      label: Host details
+      description: Include Windows version, CPU, Rust version, and Exbawks revision.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Remove private paths and copyrighted data.
+      render: text

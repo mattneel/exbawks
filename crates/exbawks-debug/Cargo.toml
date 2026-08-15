@@ -1,0 +1,16 @@
+[package]
+name = "exbawks-debug"
+description = "Debugger primitives and structured tracing for Exbawks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+exbawks-types.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true
