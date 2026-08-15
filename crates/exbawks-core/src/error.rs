@@ -44,6 +44,12 @@ pub enum CoreError {
     /// Two section byte ranges overlap beyond a shared page boundary.
     #[error("XBE section {section_index} byte range at {address} overlaps another section")]
     SectionByteOverlap { section_index: u32, address: GuestVa },
+    /// The declared image window does not fit the 32-bit guest space.
+    #[error("XBE image size {size_of_image:#x} leaves the 32-bit guest space")]
+    ImageLeavesGuestSpace { size_of_image: u32 },
+    /// A header or section range falls outside the declared image window.
+    #[error("XBE range at {address} (section {section_index:?}) leaves the declared image")]
+    RangeOutsideImage { section_index: Option<u32>, address: GuestVa },
     /// A kernel thunk address arithmetic operation overflowed.
     #[error("kernel thunk table address overflow at {address}")]
     KernelThunkAddressOverflow { address: GuestVa },

@@ -454,9 +454,13 @@ struct ImageExtent<'a> {
 
 impl ImageExtent<'_> {
     /// Returns the inclusive first and last covered guest pages.
+    ///
+    /// The last byte is computed in 64 bits so a malformed extent can never
+    /// overflow here; `image_extents` has already rejected any extent whose
+    /// range leaves the guest space.
     fn page_bounds(&self) -> (u32, u32) {
-        let last_byte = self.start + (self.virtual_size - 1);
-        (self.start >> GUEST_PAGE_SHIFT, last_byte >> GUEST_PAGE_SHIFT)
+        let last_byte = u64::from(self.start) + u64::from(self.virtual_size) - 1;
+        (self.start >> GUEST_PAGE_SHIFT, (last_byte >> GUEST_PAGE_SHIFT) as u32)
     }
 
     /// Returns this extent's write contribution to one guest page.
@@ -496,10 +500,28 @@ fn map_xbe(memory: &SoftwareAddressSpace, image: &XbeImage, bytes: &[u8]) -> Res
 }
 
 /// Builds the header pseudo-section and every non-empty section as extents.
+///
+/// Every extent is validated to lie inside the declared image window
+/// `[base, base + size_of_image)`, which must itself fit the 32-bit guest
+/// space. That single bound makes all later page and overlap arithmetic
+/// overflow-free (ADR 0007).
 fn image_extents<'a>(image: &XbeImage, bytes: &'a [u8]) -> Result<Vec<ImageExtent<'a>>, CoreError> {
+    let base = u64::from(image.header.base_address.0);
+    let image_end = base + u64::from(image.header.size_of_image);
+    if image_end > u64::from(u32::MAX) + 1 {
+        return Err(CoreError::ImageLeavesGuestSpace { size_of_image: image.header.size_of_image });
+    }
+
     let mut extents = Vec::with_capacity(image.sections.len() + 1);
 
     if image.header.size_of_headers != 0 {
+        require_within_image(
+            image.header.base_address,
+            image.header.size_of_headers,
+            base,
+            image_end,
+            None,
+        )?;
         let header_size = usize::try_from(image.header.size_of_headers)
             .map_err(|_| CoreError::InvalidConfiguration("XBE header size does not fit usize"))?;
         let data = bytes
@@ -527,9 +549,12 @@ fn image_extents<'a>(image: &XbeImage, bytes: &'a [u8]) -> Result<Vec<ImageExten
                 virtual_size: section.virtual_size,
             });
         }
-        // A section must fit inside the 32-bit guest space.
-        u32::checked_add(section.virtual_address.0, section.virtual_size - 1).ok_or(
-            CoreError::InvalidConfiguration("XBE section range leaves the guest address space"),
+        require_within_image(
+            section.virtual_address,
+            section.virtual_size,
+            base,
+            image_end,
+            Some(section.index),
         )?;
 
         let mut permissions = MemoryPermissions::READ;
@@ -555,15 +580,34 @@ fn image_extents<'a>(image: &XbeImage, bytes: &'a [u8]) -> Result<Vec<ImageExten
     Ok(extents)
 }
 
+/// Rejects an extent whose byte range leaves the declared image window.
+///
+/// `section_index` is `None` for the header pseudo-section.
+fn require_within_image(
+    start: GuestVa,
+    virtual_size: u32,
+    base: u64,
+    image_end: u64,
+    section_index: Option<u32>,
+) -> Result<(), CoreError> {
+    let start_u64 = u64::from(start.0);
+    let end = start_u64 + u64::from(virtual_size);
+    if start_u64 < base || end > image_end {
+        return Err(CoreError::RangeOutsideImage { section_index, address: start });
+    }
+    Ok(())
+}
+
 /// Rejects extents whose byte ranges overlap beyond a shared page boundary.
 ///
-/// Real sections share the boundary page but never the same bytes.
+/// Real sections share the boundary page but never the same bytes. The end
+/// is computed in 64 bits; extents are already known to fit the guest space.
 fn reject_byte_overlap(extents: &[ImageExtent<'_>]) -> Result<(), CoreError> {
     let mut ordered: Vec<&ImageExtent<'_>> = extents.iter().collect();
     ordered.sort_by_key(|extent| extent.start);
     for pair in ordered.windows(2) {
-        let end = pair[0].start + pair[0].virtual_size;
-        if pair[1].start < end {
+        let end = u64::from(pair[0].start) + u64::from(pair[0].virtual_size);
+        if u64::from(pair[1].start) < end {
             return Err(CoreError::SectionByteOverlap {
                 section_index: pair[1].section_index.unwrap_or(u32::MAX),
                 address: GuestVa(pair[1].start),
@@ -1079,7 +1123,10 @@ mod tests {
         /// mid-page 0x12 and spans pages 0x12 and 0x13, so page 0x12 is shared.
         /// When `data_head_read_only` is set, `.data` marks its head page
         /// read-only, suppressing its write contribution to the shared page.
-        fn contiguous_sections_image(data_head_read_only: bool) -> Vec<u8> {
+        fn contiguous_sections_image(
+            data_head_read_only: bool,
+            data_tail_read_only: bool,
+        ) -> Vec<u8> {
             let base = 0x0001_0000_u32;
             let mut bytes = vec![0_u8; 0x440];
             bytes[..4].copy_from_slice(b"XBEH");
@@ -1110,6 +1157,9 @@ mod tests {
             if data_head_read_only {
                 data_flags |= XbeSectionFlags::HEAD_PAGE_READ_ONLY;
             }
+            if data_tail_read_only {
+                data_flags |= XbeSectionFlags::TAIL_PAGE_READ_ONLY;
+            }
             write_u32(&mut bytes, data, data_flags.bits());
             write_u32(&mut bytes, data + 0x04, base + 0x2800);
             write_u32(&mut bytes, data + 0x08, 0x900);
@@ -1138,7 +1188,7 @@ mod tests {
 
         #[test]
         fn contiguous_sections_load_with_merged_shared_page() {
-            let memory = mapped(&contiguous_sections_image(false));
+            let memory = mapped(&contiguous_sections_image(false, false));
 
             // Both sections' bytes sit at their exact guest addresses.
             let mut text = [0_u8; 4];
@@ -1163,7 +1213,7 @@ mod tests {
 
         #[test]
         fn head_read_only_flag_suppresses_write_on_the_shared_page() {
-            let memory = mapped(&contiguous_sections_image(true));
+            let memory = mapped(&contiguous_sections_image(true, false));
 
             // .data suppresses its write on its head page (the shared page),
             // so page 0x12 keeps only .text's R|X.
@@ -1179,12 +1229,66 @@ mod tests {
         #[test]
         fn overlapping_section_bytes_are_rejected() {
             // Point .data's start inside .text's byte range.
-            let mut bytes = contiguous_sections_image(false);
+            let mut bytes = contiguous_sections_image(false, false);
             write_u32(&mut bytes, 0x238 + 0x04, 0x0001_0000 + 0x1400);
             let image = XbeImage::parse(&bytes).expect("image parses");
             let memory = SoftwareAddressSpace::new(4 * 1024 * 1024).expect("memory is valid");
             let error = map_xbe(&memory, &image, &bytes).expect_err("overlap must fail");
             assert!(matches!(error, CoreError::SectionByteOverlap { .. }));
+        }
+
+        #[test]
+        fn tail_read_only_flag_suppresses_write_on_the_tail_page() {
+            let memory = mapped(&contiguous_sections_image(false, true));
+
+            // .data suppresses write on its tail page 0x13, leaving it R only.
+            assert_eq!(page_perms(&memory, 0x0001_3000), Perm::READ);
+            // The shared head page 0x12 keeps .data's write (no head flag): R|W|X.
+            assert_eq!(page_perms(&memory, 0x0001_2000), Perm::READ | Perm::WRITE | Perm::EXECUTE);
+        }
+
+        /// Builds a minimal image whose declared window leaves the guest space.
+        ///
+        /// `base_address = 0xFFFF_0000` with `size_of_image = 0x20000` gives an
+        /// image end above 2^32. The image still parses.
+        fn image_leaving_guest_space() -> Vec<u8> {
+            let base = 0xFFFF_0000_u32;
+            let mut bytes = vec![0_u8; 0x200];
+            bytes[..4].copy_from_slice(b"XBEH");
+            write_u32(&mut bytes, 0x104, base);
+            write_u32(&mut bytes, 0x108, 0x200); // size of headers
+            write_u32(&mut bytes, 0x10C, 0x20000); // size of image
+            write_u32(&mut bytes, 0x110, 0x178);
+            write_u32(&mut bytes, 0x118, base + 0x100);
+            write_u32(&mut bytes, 0x11C, 0); // no sections
+            write_u32(&mut bytes, 0x120, base + 0x100); // section header table (unused)
+            write_u32(&mut bytes, 0x128, (base + 0x1000) ^ ENTRY_RETAIL_XOR);
+            write_u32(&mut bytes, 0x130, 0x1000);
+            write_u32(&mut bytes, 0x158, (base + 0x2000) ^ KERNEL_RETAIL_XOR);
+            bytes
+        }
+
+        #[test]
+        fn image_leaving_the_guest_space_is_a_typed_error() {
+            // This crafted image previously overflowed page arithmetic; the
+            // loader must reject it with a typed error and never panic.
+            let bytes = image_leaving_guest_space();
+            let image = XbeImage::parse(&bytes).expect("the crafted image still parses");
+            let memory = SoftwareAddressSpace::new(1024 * 1024).expect("memory is valid");
+            let error = map_xbe(&memory, &image, &bytes).expect_err("out-of-space image must fail");
+            assert!(matches!(error, CoreError::ImageLeavesGuestSpace { .. }));
+        }
+
+        #[test]
+        fn a_section_outside_the_image_window_is_rejected() {
+            // Move .data's start past the declared image window (0x14000).
+            let mut bytes = contiguous_sections_image(false, false);
+            write_u32(&mut bytes, 0x238 + 0x04, 0x0001_0000 + 0x8000);
+            let image = XbeImage::parse(&bytes).expect("image parses");
+            let memory = SoftwareAddressSpace::new(4 * 1024 * 1024).expect("memory is valid");
+            let error =
+                map_xbe(&memory, &image, &bytes).expect_err("out-of-window section must fail");
+            assert!(matches!(error, CoreError::RangeOutsideImage { .. }));
         }
     }
 }

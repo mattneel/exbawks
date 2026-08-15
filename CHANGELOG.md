@@ -40,6 +40,11 @@ The project follows Keep a Changelog structure before its first release.
 
 ### Fixed
 
+- The loader validates every header and section range against the declared
+  image window in 64-bit arithmetic, so a malformed XBE with a high base
+  address or an oversized image returns a typed error instead of panicking
+  on overflow, and a section outside the image window is rejected (ADR 0007
+  point 5).
 - The loader accepts real retail XBEs: sections are byte-contiguous rather
   than page-aligned, so the header/section union maps as guest RAM and each
   page takes the merged permission of the sections touching it, honoring the
