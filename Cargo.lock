@@ -220,6 +220,7 @@ dependencies = [
  "exbawks-types",
  "parking_lot",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

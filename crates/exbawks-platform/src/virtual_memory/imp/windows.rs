@@ -21,6 +21,21 @@ const MEM_PRESERVE_PLACEHOLDER: u32 = 0x0000_0002;
 
 const INVALID_HANDLE_VALUE: *mut c_void = -1_isize as *mut c_void;
 
+const MEM_EXTENDED_PARAMETER_ADDRESS_REQUIREMENTS: u64 = 1;
+
+#[repr(C)]
+struct MemAddressRequirements {
+    lowest_starting_address: *mut c_void,
+    highest_ending_address: *mut c_void,
+    alignment: usize,
+}
+
+#[repr(C)]
+struct MemExtendedParameter {
+    parameter_type: u64,
+    pointer: *const c_void,
+}
+
 type Handle = *mut c_void;
 
 #[link(name = "Kernel32")]
@@ -213,6 +228,55 @@ impl Placeholder {
             let _ = unsafe { VirtualFree(result.as_ptr(), 0, MEM_RELEASE) };
             return Err(PlatformError::InvalidArgument(
                 "VirtualAlloc2 returned a different requested address",
+            ));
+        }
+
+        Ok(Self { base: result, len, armed: true })
+    }
+
+    /// Reserves one aligned placeholder at a host-selected address.
+    pub fn reserve_aligned(alignment: usize, len: usize) -> Result<Self, PlatformError> {
+        if len == 0 {
+            return Err(PlatformError::InvalidArgument("placeholder length must not be zero"));
+        }
+
+        let granularity = crate::query_system_memory_info()?.allocation_granularity as usize;
+        if !alignment.is_power_of_two() || alignment < granularity {
+            return Err(PlatformError::InvalidArgument(
+                "placeholder alignment must be a power of two at least the allocation granularity",
+            ));
+        }
+
+        let requirements = MemAddressRequirements {
+            lowest_starting_address: ptr::null_mut(),
+            highest_ending_address: ptr::null_mut(),
+            alignment,
+        };
+        let parameter = MemExtendedParameter {
+            parameter_type: MEM_EXTENDED_PARAMETER_ADDRESS_REQUIREMENTS,
+            pointer: (&raw const requirements).cast(),
+        };
+
+        // SAFETY: The extended parameter points at one address-requirements
+        // value that outlives the call on this stack frame.
+        let result = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                ptr::null_mut(),
+                len,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                (&raw const parameter).cast(),
+                1,
+            )
+        };
+        let result = NonNull::new(result).ok_or_else(|| last_error("VirtualAlloc2"))?;
+
+        if !(result.as_ptr() as usize).is_multiple_of(alignment) {
+            // SAFETY: The call releases the range returned by VirtualAlloc2.
+            let _ = unsafe { VirtualFree(result.as_ptr(), 0, MEM_RELEASE) };
+            return Err(PlatformError::InvalidArgument(
+                "VirtualAlloc2 returned an unaligned address",
             ));
         }
 

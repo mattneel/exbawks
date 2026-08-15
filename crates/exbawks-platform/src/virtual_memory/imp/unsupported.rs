@@ -53,6 +53,12 @@ impl Placeholder {
         Err(PlatformError::Unsupported("placeholders require Windows"))
     }
 
+    /// Reserves one aligned placeholder at a host-selected address.
+    pub fn reserve_aligned(alignment: usize, len: usize) -> Result<Self, PlatformError> {
+        let _ = (alignment, len);
+        Err(PlatformError::Unsupported("placeholders require Windows"))
+    }
+
     /// Returns the placeholder base.
     #[must_use]
     pub const fn base(&self) -> usize {
