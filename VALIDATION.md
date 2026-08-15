@@ -43,20 +43,22 @@ cargo exbawks plan .\fixtures\synthetic\minimal-retail.xbe --json
 
 These commands verify formatting, compilation, Clippy, tests, documentation, and the CLI smoke path.
 
+All three commands passed on Windows 11 x86-64 with Rust 1.97.1 on August 15, 2026.
+
 ## Checks that require Windows 11
 
-Run the Windows-specific tests on Windows 11 x86-64.
+The Windows-specific tests passed on Windows 11 x86-64 on August 15, 2026.
 
-The current scaffold contains Windows section and placeholder wrappers. The sparse 4 GiB arena remains incomplete.
-
-The following behavior still needs Windows verification:
+The verified behavior includes:
 
 - Pagefile section creation.
-- Placeholder reservation and release.
-- Section-view replacement.
-- Coherent alias mappings.
-- Memory protection changes.
-- Future vectored exception redirection.
+- Placeholder reservation, aligned reservation, split, coalesce, and release.
+- Section-view replacement at 4 KiB page granularity.
+- Coherent alias mappings through one physical section.
+- Host protection changes on mapped views.
+- Backend equivalence between the software and Windows address spaces.
+
+Future vectored exception redirection still needs verification.
 
 ## Known implementation limits
 
@@ -69,8 +71,6 @@ The software address space updates physical generation values through an explici
 The XBE loader supports the initial header and section subset. It does not parse certificates, TLS metadata, library tables, or debug metadata.
 
 The kernel and graphics crates define dispatch contracts. They do not implement a title-compatible export set or a renderer.
-
-`Cargo.lock` is absent. Generate and commit it during the first successful Rust validation.
 
 ## Final result
 

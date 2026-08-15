@@ -22,12 +22,17 @@ Implemented components include:
 - Code-cache dependency checks.
 - Kernel and graphics HLE interfaces.
 - Windows section and placeholder ownership wrappers.
+- Host memory geometry queries (`MEM-001`).
+- Single-owner placeholder split and coalesce operations (`MEM-002`).
+- A reserved 4 GiB-aligned high guest arena (`MEM-003`).
+- Coherent Windows RAM aliases through pagefile section views (`MEM-004`).
+- A Windows `GuestMemory` backend with generated equivalence tests against
+  the software backend (`MEM-005`).
 - A CLI for host checks, XBE inspection, decoding, thunk inspection, and entry planning.
 - Generated public test data.
 
 Incomplete components include:
 
-- Sparse 4 GiB Windows arena ownership.
 - Executable code emission.
 - Dispatcher and host ABI implementation.
 - Fault-site redirection.
@@ -48,9 +53,13 @@ Read [the validation report](../VALIDATION.md) before code changes.
 
 ## Immediate objective
 
-Implement tasks `MEM-001` through `MEM-005` in order.
+Tasks `MEM-001` through `MEM-005` are complete. Both memory backends pass
+generated equivalence tests.
 
-Do not start graphics or broad kernel work before both memory backends pass equivalent tests.
+Implement tasks `JIT-001` through `JIT-003` in order.
+
+Do not start graphics or broad kernel work before executable blocks run
+through the dispatcher.
 
 ## First commands
 
@@ -62,7 +71,7 @@ cargo exbawks doctor
 cargo exbawks plan .\fixtures\synthetic\minimal-retail.xbe --json
 ```
 
-Generate and commit `Cargo.lock` after the first successful Cargo command.
+`Cargo.lock` is committed. Keep it current with dependency changes.
 
 ## Engineering constraints
 
