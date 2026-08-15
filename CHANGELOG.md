@@ -40,6 +40,12 @@ The project follows Keep a Changelog structure before its first release.
 
 ### Fixed
 
+- The loader accepts real retail XBEs: sections are byte-contiguous rather
+  than page-aligned, so the header/section union maps as guest RAM and each
+  page takes the merged permission of the sections touching it, honoring the
+  head and tail read-only flags on shared pages (ADR 0007). Genuine retail
+  images now load, decode, and execute up to the first unsupported
+  instruction.
 - Kernel export status now reaches guest EAX; the runtime places the
   returned `KernelStatus` in EAX after each gate call.
 - Registered but unimplemented kernel stubs halt the run with a controlled

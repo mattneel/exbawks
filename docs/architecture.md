@@ -14,6 +14,8 @@ The loader validates file ranges before allocation.
 
 It decodes the entry point and kernel thunk address. It maps headers and sections into guest memory.
 
+Retail sections are byte-contiguous, not page-aligned, so adjacent sections share their boundary page. The loader maps the header and section union as guest RAM, copies each section to its exact address, and sets each page to the union permission of the sections that touch it, honoring the head and tail read-only flags on shared pages (ADR 0007).
+
 The loader does not verify Microsoft signatures. It does not bypass media or license controls.
 
 ### Guest memory

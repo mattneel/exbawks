@@ -88,9 +88,11 @@ Crate dependency direction (lower crates must never depend on `exbawks-core`):
   host-neutral `GraphicsCommand`s to a `GraphicsBackend` (only `NullGraphicsBackend` exists).
 - `exbawks-debug` — `TraceSink` trait + `TraceEvent`s (only `BlockEnter` is emitted today).
 - `exbawks-core` — composition root only; must not absorb subsystem logic. `Emulator::load_xbe`
-  maps headers/sections into a fresh `SoftwareAddressSpace` and bumps the address-space epoch
-  (invalidating all cached blocks by key); `plan_entry_block` is the full implemented pipeline:
-  fetch → decode → cache lookup → capture physical-page dependencies → compile plan → report.
+  maps the header/section union into a fresh `SoftwareAddressSpace` (contiguous, byte-granular
+  retail sections share boundary pages; per-page permissions merge with head/tail read-only flags,
+  ADR 0007), patches kernel thunk gates, sets up the guest stack, and bumps the address-space epoch;
+  `plan_entry_block` is fetch → decode → cache lookup → capture physical-page dependencies → compile
+  plan → report; `run` drives blocks through the dispatcher until a controlled `StopReason`.
 - `apps/exbawks-cli` — clap frontend over core; `BootPlanReport` is the shared text/JSON output.
 
 Key design documents: `docs/architecture.md`, `docs/memory.md` (arena + page-table design),

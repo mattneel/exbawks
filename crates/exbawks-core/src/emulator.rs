@@ -14,9 +14,10 @@ use exbawks_kernel::{
 };
 use exbawks_memory::{GuestMemory, MemoryError, PageKind, SoftwareAddressSpace};
 use exbawks_types::{
-    BackendKind, GUEST_PAGE_SIZE, GuestRange, GuestVa, MemoryPermissions, StopReason,
+    BackendKind, GUEST_PAGE_SHIFT, GUEST_PAGE_SIZE, GuestRange, GuestVa, MemoryPermissions,
+    StopReason,
 };
-use exbawks_xbe::{XbeImage, XbeSection, XbeSectionFlags};
+use exbawks_xbe::{XbeImage, XbeSectionFlags};
 
 use crate::{BootPlanReport, CoreError, EmulatorConfig, KernelThunkTable, LoadedImage};
 
@@ -436,90 +437,221 @@ fn make_backend(kind: BackendKind) -> Box<dyn CodegenBackend> {
     }
 }
 
+/// One byte extent to copy into guest RAM, with its permission contribution.
+///
+/// Headers are a read-only pseudo-section; every real section becomes one
+/// extent. See ADR 0007.
+struct ImageExtent<'a> {
+    start: u32,
+    virtual_size: u32,
+    data: &'a [u8],
+    permissions: MemoryPermissions,
+    head_page_read_only: bool,
+    tail_page_read_only: bool,
+    /// The section index, or `None` for the header pseudo-section.
+    section_index: Option<u32>,
+}
+
+impl ImageExtent<'_> {
+    /// Returns the inclusive first and last covered guest pages.
+    fn page_bounds(&self) -> (u32, u32) {
+        let last_byte = self.start + (self.virtual_size - 1);
+        (self.start >> GUEST_PAGE_SHIFT, last_byte >> GUEST_PAGE_SHIFT)
+    }
+
+    /// Returns this extent's write contribution to one guest page.
+    fn writes_page(&self, page: u32) -> bool {
+        if !self.permissions.contains(MemoryPermissions::WRITE) {
+            return false;
+        }
+        let (head, tail) = self.page_bounds();
+        if page == head && self.head_page_read_only {
+            return false;
+        }
+        if page == tail && self.tail_page_read_only {
+            return false;
+        }
+        true
+    }
+}
+
 fn map_xbe(memory: &SoftwareAddressSpace, image: &XbeImage, bytes: &[u8]) -> Result<(), CoreError> {
-    let header_size = usize::try_from(image.header.size_of_headers)
-        .map_err(|_| CoreError::InvalidConfiguration("XBE header size does not fit usize"))?;
-    memory.load_region(
-        image.header.base_address,
-        image.header.size_of_headers,
-        &bytes[..header_size],
-        MemoryPermissions::READ,
-    )?;
+    let extents = image_extents(image, bytes)?;
+    if extents.is_empty() {
+        return Ok(());
+    }
+
+    map_covered_pages(memory, &extents)?;
+
+    // Copy header and section bytes to their exact guest addresses while the
+    // pages are writable.
+    for extent in &extents {
+        if extent.data.is_empty() {
+            continue;
+        }
+        memory.write(GuestVa(extent.start), extent.data)?;
+    }
+
+    apply_merged_permissions(memory, &extents)
+}
+
+/// Builds the header pseudo-section and every non-empty section as extents.
+fn image_extents<'a>(image: &XbeImage, bytes: &'a [u8]) -> Result<Vec<ImageExtent<'a>>, CoreError> {
+    let mut extents = Vec::with_capacity(image.sections.len() + 1);
+
+    if image.header.size_of_headers != 0 {
+        let header_size = usize::try_from(image.header.size_of_headers)
+            .map_err(|_| CoreError::InvalidConfiguration("XBE header size does not fit usize"))?;
+        let data = bytes
+            .get(..header_size)
+            .ok_or(CoreError::InvalidConfiguration("XBE header size exceeds the file"))?;
+        extents.push(ImageExtent {
+            start: image.header.base_address.0,
+            virtual_size: image.header.size_of_headers,
+            data,
+            permissions: MemoryPermissions::READ,
+            head_page_read_only: false,
+            tail_page_read_only: false,
+            section_index: None,
+        });
+    }
 
     for section in &image.sections {
-        map_section(memory, image, bytes, section)?;
-    }
+        if section.virtual_size == 0 {
+            continue;
+        }
+        if section.raw_size > section.virtual_size {
+            return Err(CoreError::SectionRawExceedsVirtual {
+                section_index: section.index,
+                raw_size: section.raw_size,
+                virtual_size: section.virtual_size,
+            });
+        }
+        // A section must fit inside the 32-bit guest space.
+        u32::checked_add(section.virtual_address.0, section.virtual_size - 1).ok_or(
+            CoreError::InvalidConfiguration("XBE section range leaves the guest address space"),
+        )?;
 
-    Ok(())
-}
+        let mut permissions = MemoryPermissions::READ;
+        if section.flags.contains(XbeSectionFlags::WRITABLE) {
+            permissions |= MemoryPermissions::WRITE;
+        }
+        if section.flags.contains(XbeSectionFlags::EXECUTABLE) {
+            permissions |= MemoryPermissions::EXECUTE;
+        }
 
-fn map_section(
-    memory: &SoftwareAddressSpace,
-    image: &XbeImage,
-    bytes: &[u8],
-    section: &XbeSection,
-) -> Result<(), CoreError> {
-    if section.virtual_size == 0 {
-        return Ok(());
-    }
-    if section.virtual_address.page_offset() != 0 {
-        return Err(CoreError::UnalignedSection {
-            section_index: section.index,
-            address: section.virtual_address,
-        });
-    }
-    if section.raw_size > section.virtual_size {
-        return Err(CoreError::SectionRawExceedsVirtual {
-            section_index: section.index,
-            raw_size: section.raw_size,
+        extents.push(ImageExtent {
+            start: section.virtual_address.0,
             virtual_size: section.virtual_size,
+            data: image.section_data(bytes, section)?,
+            permissions,
+            head_page_read_only: section.flags.contains(XbeSectionFlags::HEAD_PAGE_READ_ONLY),
+            tail_page_read_only: section.flags.contains(XbeSectionFlags::TAIL_PAGE_READ_ONLY),
+            section_index: Some(section.index),
         });
     }
 
-    let initial = image.section_data(bytes, section)?;
-    let mut permissions = MemoryPermissions::READ;
-    if section.flags.contains(XbeSectionFlags::WRITABLE) {
-        permissions |= MemoryPermissions::WRITE;
-    }
-    if section.flags.contains(XbeSectionFlags::EXECUTABLE) {
-        permissions |= MemoryPermissions::EXECUTE;
-    }
+    reject_byte_overlap(&extents)?;
+    Ok(extents)
+}
 
-    memory.load_region(section.virtual_address, section.virtual_size, initial, permissions)?;
-    apply_section_page_permissions(memory, section, permissions)?;
+/// Rejects extents whose byte ranges overlap beyond a shared page boundary.
+///
+/// Real sections share the boundary page but never the same bytes.
+fn reject_byte_overlap(extents: &[ImageExtent<'_>]) -> Result<(), CoreError> {
+    let mut ordered: Vec<&ImageExtent<'_>> = extents.iter().collect();
+    ordered.sort_by_key(|extent| extent.start);
+    for pair in ordered.windows(2) {
+        let end = pair[0].start + pair[0].virtual_size;
+        if pair[1].start < end {
+            return Err(CoreError::SectionByteOverlap {
+                section_index: pair[1].section_index.unwrap_or(u32::MAX),
+                address: GuestVa(pair[1].start),
+            });
+        }
+    }
     Ok(())
 }
 
-fn apply_section_page_permissions(
+/// Maps every maximal run of contiguous covered pages as anonymous RAM.
+fn map_covered_pages(
     memory: &SoftwareAddressSpace,
-    section: &XbeSection,
-    permissions: MemoryPermissions,
+    extents: &[ImageExtent<'_>],
 ) -> Result<(), CoreError> {
-    if !permissions.contains(MemoryPermissions::WRITE) {
-        return Ok(());
+    // Collect the covered page set by walking each extent's page span.
+    let mut covered: Vec<u32> = Vec::new();
+    for extent in extents {
+        let (first, last) = extent.page_bounds();
+        for page in first..=last {
+            covered.push(page);
+        }
     }
+    covered.sort_unstable();
+    covered.dedup();
 
     let page_size = u64::from(GUEST_PAGE_SIZE);
-    let rounded_size = (u64::from(section.virtual_size) + page_size - 1) & !(page_size - 1);
-    let page_count = rounded_size / page_size;
-    let read_only = permissions & !MemoryPermissions::WRITE;
+    let mut index = 0;
+    while index < covered.len() {
+        let run_start = covered[index];
+        let mut run_end = run_start;
+        while index + 1 < covered.len() && covered[index + 1] == run_end + 1 {
+            index += 1;
+            run_end = covered[index];
+        }
+        index += 1;
 
-    if section.flags.contains(XbeSectionFlags::HEAD_PAGE_READ_ONLY) {
-        let range = GuestRange::page_aligned(section.virtual_address, page_size)
-            .map_err(exbawks_memory::MemoryError::from)?;
-        memory.protect(range, read_only)?;
+        let start = GuestVa(run_start << GUEST_PAGE_SHIFT);
+        let len = (u64::from(run_end - run_start) + 1) * page_size;
+        let range =
+            GuestRange::page_aligned(start, len).map_err(exbawks_memory::MemoryError::from)?;
+        memory.map_anonymous(range, MemoryPermissions::READ | MemoryPermissions::WRITE)?;
     }
 
-    if section.flags.contains(XbeSectionFlags::TAIL_PAGE_READ_ONLY) {
-        let tail_offset = u32::try_from((page_count - 1) * page_size)
-            .map_err(|_| CoreError::InvalidConfiguration("section tail offset overflow"))?;
-        let tail = section
-            .virtual_address
-            .checked_add(tail_offset)
-            .ok_or(CoreError::InvalidConfiguration("section tail address overflow"))?;
+    Ok(())
+}
+
+/// Sets each covered page to the union permission of its contributors.
+fn apply_merged_permissions(
+    memory: &SoftwareAddressSpace,
+    extents: &[ImageExtent<'_>],
+) -> Result<(), CoreError> {
+    use std::collections::BTreeMap;
+
+    let mut page_perms: BTreeMap<u32, MemoryPermissions> = BTreeMap::new();
+    for extent in extents {
+        let (first, last) = extent.page_bounds();
+        for page in first..=last {
+            let mut perm = MemoryPermissions::READ;
+            if extent.permissions.contains(MemoryPermissions::EXECUTE) {
+                perm |= MemoryPermissions::EXECUTE;
+            }
+            if extent.writes_page(page) {
+                perm |= MemoryPermissions::WRITE;
+            }
+            let entry = page_perms.entry(page).or_insert(MemoryPermissions::empty());
+            *entry |= perm;
+        }
+    }
+
+    // Apply in maximal runs of equal permission.
+    let page_size = u64::from(GUEST_PAGE_SIZE);
+    let mut iter = page_perms.into_iter().peekable();
+    while let Some((run_start, perm)) = iter.next() {
+        let mut run_end = run_start;
+        while let Some((next_page, next_perm)) = iter.peek() {
+            if *next_page == run_end + 1 && *next_perm == perm {
+                run_end = *next_page;
+                iter.next();
+            } else {
+                break;
+            }
+        }
+
+        let start = GuestVa(run_start << GUEST_PAGE_SHIFT);
+        let len = (u64::from(run_end - run_start) + 1) * page_size;
         let range =
-            GuestRange::page_aligned(tail, page_size).map_err(exbawks_memory::MemoryError::from)?;
-        memory.protect(range, read_only)?;
+            GuestRange::page_aligned(start, len).map_err(exbawks_memory::MemoryError::from)?;
+        memory.protect(range, perm)?;
     }
 
     Ok(())
@@ -931,6 +1063,128 @@ mod tests {
             // Kernel thunk table at guest 0x12200 (section offset 0x1200): HalReturnToFirmware.
             write_u32(&mut bytes, body + 0x1200, 0x8000_0031);
             bytes
+        }
+    }
+
+    mod loader {
+        use exbawks_memory::GuestMemory;
+        use exbawks_types::MemoryPermissions as Perm;
+
+        use super::*;
+
+        /// Builds a synthetic image with two byte-contiguous sections that
+        /// share the page at their boundary.
+        ///
+        /// `.text` (R|X) spans pages 0x11 and 0x12; `.data` (writable) starts
+        /// mid-page 0x12 and spans pages 0x12 and 0x13, so page 0x12 is shared.
+        /// When `data_head_read_only` is set, `.data` marks its head page
+        /// read-only, suppressing its write contribution to the shared page.
+        fn contiguous_sections_image(data_head_read_only: bool) -> Vec<u8> {
+            let base = 0x0001_0000_u32;
+            let mut bytes = vec![0_u8; 0x440];
+            bytes[..4].copy_from_slice(b"XBEH");
+            write_u32(&mut bytes, 0x104, base);
+            write_u32(&mut bytes, 0x108, 0x400); // size of headers
+            write_u32(&mut bytes, 0x10C, 0x4000); // size of image
+            write_u32(&mut bytes, 0x110, 0x178);
+            write_u32(&mut bytes, 0x118, base + 0x178);
+            write_u32(&mut bytes, 0x11C, 2); // section count
+            write_u32(&mut bytes, 0x120, base + 0x200); // section header table
+            write_u32(&mut bytes, 0x128, (base + 0x1000) ^ ENTRY_RETAIL_XOR);
+            write_u32(&mut bytes, 0x130, 0x1000);
+            write_u32(&mut bytes, 0x158, (base + 0x1000) ^ KERNEL_RETAIL_XOR);
+
+            // Section 0: .text, R|X, VA 0x11000, size 0x1800 (pages 0x11, 0x12).
+            let text = 0x200;
+            write_u32(&mut bytes, text, XbeSectionFlags::EXECUTABLE.bits());
+            write_u32(&mut bytes, text + 0x04, base + 0x1000);
+            write_u32(&mut bytes, text + 0x08, 0x1800);
+            write_u32(&mut bytes, text + 0x0C, 0x400);
+            write_u32(&mut bytes, text + 0x10, 0x10);
+            write_u32(&mut bytes, text + 0x14, base + 0x270);
+            write_u32(&mut bytes, text + 0x18, 1);
+
+            // Section 1: .data, writable, VA 0x12800 (shares page 0x12), size 0x900.
+            let data = 0x238;
+            let mut data_flags = XbeSectionFlags::WRITABLE;
+            if data_head_read_only {
+                data_flags |= XbeSectionFlags::HEAD_PAGE_READ_ONLY;
+            }
+            write_u32(&mut bytes, data, data_flags.bits());
+            write_u32(&mut bytes, data + 0x04, base + 0x2800);
+            write_u32(&mut bytes, data + 0x08, 0x900);
+            write_u32(&mut bytes, data + 0x0C, 0x420);
+            write_u32(&mut bytes, data + 0x10, 0x10);
+            write_u32(&mut bytes, data + 0x14, base + 0x278);
+            write_u32(&mut bytes, data + 0x18, 1);
+
+            bytes[0x270..0x276].copy_from_slice(b".text\0");
+            bytes[0x278..0x27E].copy_from_slice(b".data\0");
+            bytes[0x400..0x410].copy_from_slice(&[0xAA; 0x10]); // .text raw
+            bytes[0x420..0x430].copy_from_slice(&[0xBB; 0x10]); // .data raw
+            bytes
+        }
+
+        fn mapped(bytes: &[u8]) -> SoftwareAddressSpace {
+            let image = XbeImage::parse(bytes).expect("synthetic image parses");
+            let memory = SoftwareAddressSpace::new(4 * 1024 * 1024).expect("memory is valid");
+            map_xbe(&memory, &image, bytes).expect("map_xbe succeeds");
+            memory
+        }
+
+        fn page_perms(memory: &SoftwareAddressSpace, address: u32) -> Perm {
+            memory.page_table().get(GuestVa(address).page()).permissions()
+        }
+
+        #[test]
+        fn contiguous_sections_load_with_merged_shared_page() {
+            let memory = mapped(&contiguous_sections_image(false));
+
+            // Both sections' bytes sit at their exact guest addresses.
+            let mut text = [0_u8; 4];
+            memory.read(GuestVa(0x0001_1000), &mut text).expect("text reads");
+            assert_eq!(text, [0xAA; 4]);
+            let mut data = [0_u8; 4];
+            memory.read(GuestVa(0x0001_2800), &mut data).expect("data reads");
+            assert_eq!(data, [0xBB; 4]);
+            // The shared page holds .text's (zero) tail below .data's bytes.
+            let mut shared_tail = [0_u8; 4];
+            memory.read(GuestVa(0x0001_27F0), &mut shared_tail).expect("shared tail reads");
+            assert_eq!(shared_tail, [0x00; 4]);
+
+            // Page 0x11: .text only, R|X.
+            assert_eq!(page_perms(&memory, 0x0001_1000), Perm::READ | Perm::EXECUTE);
+            // Page 0x12: shared; .data is writable with no read-only flag, so
+            // the merge grants R|W|X.
+            assert_eq!(page_perms(&memory, 0x0001_2000), Perm::READ | Perm::WRITE | Perm::EXECUTE);
+            // Page 0x13: .data only, R|W.
+            assert_eq!(page_perms(&memory, 0x0001_3000), Perm::READ | Perm::WRITE);
+        }
+
+        #[test]
+        fn head_read_only_flag_suppresses_write_on_the_shared_page() {
+            let memory = mapped(&contiguous_sections_image(true));
+
+            // .data suppresses its write on its head page (the shared page),
+            // so page 0x12 keeps only .text's R|X.
+            assert_eq!(page_perms(&memory, 0x0001_2000), Perm::READ | Perm::EXECUTE);
+            // .data's own tail page stays writable.
+            assert_eq!(page_perms(&memory, 0x0001_3000), Perm::READ | Perm::WRITE);
+            // The read-only shared page still holds the loaded .data bytes.
+            let mut data = [0_u8; 4];
+            memory.read(GuestVa(0x0001_2800), &mut data).expect("data reads");
+            assert_eq!(data, [0xBB; 4]);
+        }
+
+        #[test]
+        fn overlapping_section_bytes_are_rejected() {
+            // Point .data's start inside .text's byte range.
+            let mut bytes = contiguous_sections_image(false);
+            write_u32(&mut bytes, 0x238 + 0x04, 0x0001_0000 + 0x1400);
+            let image = XbeImage::parse(&bytes).expect("image parses");
+            let memory = SoftwareAddressSpace::new(4 * 1024 * 1024).expect("memory is valid");
+            let error = map_xbe(&memory, &image, &bytes).expect_err("overlap must fail");
+            assert!(matches!(error, CoreError::SectionByteOverlap { .. }));
         }
     }
 }

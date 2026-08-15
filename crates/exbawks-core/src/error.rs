@@ -36,8 +36,14 @@ pub enum CoreError {
     )]
     SectionRawExceedsVirtual { section_index: u32, raw_size: u32, virtual_size: u32 },
     /// A section start does not use 4 KiB alignment.
+    ///
+    /// Retail sections are byte-contiguous rather than page-aligned, so the
+    /// loader no longer produces this; it remains for external callers.
     #[error("XBE section {section_index} starts at unaligned guest address {address}")]
     UnalignedSection { section_index: u32, address: GuestVa },
+    /// Two section byte ranges overlap beyond a shared page boundary.
+    #[error("XBE section {section_index} byte range at {address} overlaps another section")]
+    SectionByteOverlap { section_index: u32, address: GuestVa },
     /// A kernel thunk address arithmetic operation overflowed.
     #[error("kernel thunk table address overflow at {address}")]
     KernelThunkAddressOverflow { address: GuestVa },
