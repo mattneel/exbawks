@@ -117,6 +117,12 @@ Each compiled block must contain:
 - Exit records.
 - The selected address mode.
 
+The first executable subset carries the guest start, the exit guest address,
+the static exit kind, source ranges, and fault sites. Physical-page
+dependencies live on the code-cache entry, not the emitted block. The
+register-only subset needs no memory address mode and emits no fault sites,
+so the address-mode field is deferred until memory operands land.
+
 ## Address modes
 
 The first implementation can use identity mappings for supported ranges.
