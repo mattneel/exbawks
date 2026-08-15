@@ -18,6 +18,8 @@ The project follows Keep a Changelog structure before its first release.
   page-table records and placeholder-restoring unmaps (`MEM-004`).
 - A Windows `GuestMemory` backend with checked reads, writes, and fetches,
   plus generated equivalence tests against the software backend (`MEM-005`).
+- Single-owner executable code buffers with separate write and execute
+  phases, sealing, and instruction-cache flushes (`JIT-001`).
 - Initial Rust workspace scaffold.
 - XBE parser and synthetic tests.
 - Software guest address space.

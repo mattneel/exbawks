@@ -115,6 +115,8 @@ Use Cranelift first for blocks that contain complex flags, floating-point behavi
 
 The repository implements block decoding, instruction classification, planning, and cache metadata.
 
-The repository does not emit executable code yet.
+The platform crate owns executable memory. `WritableCodeBuffer` accepts code while writable and non-executable. `seal` consumes the writable owner, marks the pages execute-read, and flushes the host instruction cache. The sealed owner exposes no mutation.
+
+The repository does not emit translated guest code yet.
 
 The first executable subset will contain register-only integer operations and an explicit return to the dispatcher.
