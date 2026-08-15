@@ -38,6 +38,11 @@ impl GuestArena {
     pub fn host_address(&self, guest: GuestVa) -> u64 {
         self.base() + u64::from(guest.0)
     }
+
+    /// Releases arena ownership and returns its placeholder.
+    pub(crate) fn into_placeholder(self) -> Placeholder {
+        self.placeholder
+    }
 }
 
 #[cfg(test)]

@@ -1,10 +1,11 @@
 use std::ffi::c_void;
+use std::mem::ManuallyDrop;
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
 
 use crate::PlatformError;
 
-use super::super::{CoalesceError, PageProtection};
+use super::super::{CoalesceError, PageProtection, ReplaceError, RestoreError};
 
 const PAGE_NOACCESS: u32 = 0x01;
 const PAGE_READONLY: u32 = 0x02;
@@ -145,18 +146,29 @@ impl PagefileSection {
     }
 
     /// Replaces one complete placeholder with a section view.
+    ///
+    /// A failure returns the preserved placeholder to the caller.
     pub fn map_replace(
         &self,
         mut placeholder: Placeholder,
         offset: u64,
         protection: PageProtection,
-    ) -> Result<MappedView, PlatformError> {
+    ) -> Result<MappedView, ReplaceError> {
         let view_len = placeholder.len;
-        let end = offset
-            .checked_add(view_len as u64)
-            .ok_or(PlatformError::InvalidArgument("section view range overflow"))?;
+        let end = match offset.checked_add(view_len as u64) {
+            Some(end) => end,
+            None => {
+                return Err(ReplaceError {
+                    placeholder,
+                    error: PlatformError::InvalidArgument("section view range overflow"),
+                });
+            }
+        };
         if end > self.inner.len as u64 {
-            return Err(PlatformError::InvalidArgument("section view exceeds the section"));
+            return Err(ReplaceError {
+                placeholder,
+                error: PlatformError::InvalidArgument("section view exceeds the section"),
+            });
         }
 
         // SAFETY: The placeholder owns the exact address range passed to the call.
@@ -174,19 +186,24 @@ impl PagefileSection {
             )
         };
 
-        let base = NonNull::new(result).ok_or_else(|| last_error("MapViewOfFile3"))?;
+        let Some(base) = NonNull::new(result) else {
+            return Err(ReplaceError { placeholder, error: last_error("MapViewOfFile3") });
+        };
         if base != placeholder.base {
             // SAFETY: The call removes the unexpected view at its returned base.
             let _ = unsafe { UnmapViewOfFile2(GetCurrentProcess(), base.as_ptr(), 0) };
-            return Err(PlatformError::InvalidArgument(
-                "MapViewOfFile3 returned a different placeholder address",
-            ));
+            return Err(ReplaceError {
+                placeholder,
+                error: PlatformError::InvalidArgument(
+                    "MapViewOfFile3 returned a different placeholder address",
+                ),
+            });
         }
 
         placeholder.armed = false;
         drop(placeholder);
 
-        Ok(MappedView { base, len: view_len, section: self.clone() })
+        Ok(MappedView { base, len: view_len, protection, section: self.clone() })
     }
 }
 
@@ -197,6 +214,12 @@ pub struct Placeholder {
     len: usize,
     armed: bool,
 }
+
+// SAFETY: The owner controls one process-global reservation without
+// thread-affine state.
+unsafe impl Send for Placeholder {}
+// SAFETY: Shared methods only read the stored base and length.
+unsafe impl Sync for Placeholder {}
 
 impl Placeholder {
     /// Reserves one complete placeholder range.
@@ -389,8 +412,16 @@ impl Drop for Placeholder {
 pub struct MappedView {
     base: NonNull<c_void>,
     len: usize,
+    protection: PageProtection,
     section: PagefileSection,
 }
+
+// SAFETY: The owner controls one process-global mapping without
+// thread-affine state.
+unsafe impl Send for MappedView {}
+// SAFETY: Shared copies target disjoint or caller-serialized ranges of one
+// process-global mapping.
+unsafe impl Sync for MappedView {}
 
 impl MappedView {
     /// Returns the host base address.
@@ -415,6 +446,87 @@ impl MappedView {
     #[must_use]
     pub fn section_len(&self) -> usize {
         self.section.len()
+    }
+
+    /// Returns the current host protection.
+    #[must_use]
+    pub const fn protection(&self) -> PageProtection {
+        self.protection
+    }
+
+    /// Copies bytes out of the mapped view.
+    pub fn read_at(&self, offset: usize, output: &mut [u8]) -> Result<(), PlatformError> {
+        let end = offset
+            .checked_add(output.len())
+            .ok_or(PlatformError::InvalidArgument("view read range overflow"))?;
+        if end > self.len {
+            return Err(PlatformError::InvalidArgument("view read exceeds the mapped range"));
+        }
+        if matches!(self.protection, PageProtection::NoAccess) {
+            return Err(PlatformError::InvalidArgument("view protection denies reads"));
+        }
+
+        // SAFETY: This object keeps [base, base + len) mapped with readable
+        // protection for its complete lifetime, the range is bounds-checked
+        // above, and a safe caller cannot alias the raw mapping with `output`.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                (self.base.as_ptr() as *const u8).add(offset),
+                output.as_mut_ptr(),
+                output.len(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Copies bytes into the mapped view.
+    pub fn write_at(&self, offset: usize, input: &[u8]) -> Result<(), PlatformError> {
+        let end = offset
+            .checked_add(input.len())
+            .ok_or(PlatformError::InvalidArgument("view write range overflow"))?;
+        if end > self.len {
+            return Err(PlatformError::InvalidArgument("view write exceeds the mapped range"));
+        }
+        if !matches!(self.protection, PageProtection::ReadWrite | PageProtection::ExecuteReadWrite)
+        {
+            return Err(PlatformError::InvalidArgument("view protection denies writes"));
+        }
+
+        // SAFETY: This object keeps [base, base + len) mapped with writable
+        // protection for its complete lifetime, the range is bounds-checked
+        // above, and a safe caller cannot alias the raw mapping with `input`.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                input.as_ptr(),
+                (self.base.as_ptr() as *mut u8).add(offset),
+                input.len(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Unmaps the view and returns the restored placeholder.
+    ///
+    /// A failure returns the still-mapped view to the caller.
+    pub fn unmap_restore(self) -> Result<Placeholder, RestoreError> {
+        // SAFETY: This object owns the view at the exact base returned by
+        // MapViewOfFile3, and the flag restores its placeholder.
+        let unmapped = unsafe {
+            UnmapViewOfFile2(GetCurrentProcess(), self.base.as_ptr(), MEM_PRESERVE_PLACEHOLDER)
+        };
+        if unmapped == 0 {
+            let error = last_error("UnmapViewOfFile2(MEM_PRESERVE_PLACEHOLDER)");
+            return Err(RestoreError { view: self, error });
+        }
+
+        let base = self.base;
+        let len = self.len;
+        let this = ManuallyDrop::new(self);
+        // SAFETY: `this` skips its normal drop, so the section field is moved
+        // out exactly once and no other field needs a destructor.
+        drop(unsafe { ptr::read(&this.section) });
+
+        Ok(Placeholder { base, len, armed: true })
     }
 }
 

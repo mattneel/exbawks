@@ -14,6 +14,8 @@ The project follows Keep a Changelog structure before its first release.
   Windows arena (`MEM-002`).
 - A 4 GiB-aligned high guest arena reservation with traced base selection
   (`MEM-003`).
+- Coherent Windows RAM aliases through pagefile section views with sidecar
+  page-table records and placeholder-restoring unmaps (`MEM-004`).
 - Initial Rust workspace scaffold.
 - XBE parser and synthetic tests.
 - Software guest address space.

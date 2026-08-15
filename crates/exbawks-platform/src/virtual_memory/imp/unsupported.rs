@@ -1,6 +1,6 @@
 use crate::PlatformError;
 
-use super::super::{CoalesceError, PageProtection};
+use super::super::{CoalesceError, PageProtection, ReplaceError, RestoreError};
 
 /// A pagefile-backed physical memory section.
 #[derive(Debug, Clone)]
@@ -28,14 +28,19 @@ impl PagefileSection {
     }
 
     /// Replaces a placeholder with a section view.
+    ///
+    /// A failure returns the preserved placeholder to the caller.
     pub fn map_replace(
         &self,
         placeholder: Placeholder,
         offset: u64,
         protection: PageProtection,
-    ) -> Result<MappedView, PlatformError> {
-        let _ = (self, placeholder, offset, protection);
-        Err(PlatformError::Unsupported("section views require Windows"))
+    ) -> Result<MappedView, ReplaceError> {
+        let _ = (offset, protection);
+        Err(ReplaceError {
+            placeholder,
+            error: PlatformError::Unsupported("section views require Windows"),
+        })
     }
 }
 
@@ -116,5 +121,33 @@ impl MappedView {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Returns the current host protection.
+    #[must_use]
+    pub const fn protection(&self) -> PageProtection {
+        PageProtection::NoAccess
+    }
+
+    /// Copies bytes out of the mapped view.
+    pub fn read_at(&self, offset: usize, output: &mut [u8]) -> Result<(), PlatformError> {
+        let _ = (offset, output);
+        Err(PlatformError::Unsupported("section views require Windows"))
+    }
+
+    /// Copies bytes into the mapped view.
+    pub fn write_at(&self, offset: usize, input: &[u8]) -> Result<(), PlatformError> {
+        let _ = (offset, input);
+        Err(PlatformError::Unsupported("section views require Windows"))
+    }
+
+    /// Unmaps the view and returns the restored placeholder.
+    ///
+    /// A failure returns the still-mapped view to the caller.
+    pub fn unmap_restore(self) -> Result<Placeholder, RestoreError> {
+        Err(RestoreError {
+            view: self,
+            error: PlatformError::Unsupported("section views require Windows"),
+        })
     }
 }

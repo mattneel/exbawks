@@ -31,6 +31,28 @@ pub struct CoalesceError {
     pub error: PlatformError,
 }
 
+/// A failed view replacement that returns the preserved placeholder.
+#[derive(Debug, Error)]
+#[error("section view replacement failed: {error}")]
+pub struct ReplaceError {
+    /// The placeholder that remains owned by the caller.
+    pub placeholder: Placeholder,
+    /// The failure reason.
+    #[source]
+    pub error: PlatformError,
+}
+
+/// A failed view unmap that returns the still-mapped view.
+#[derive(Debug, Error)]
+#[error("mapped view restore failed: {error}")]
+pub struct RestoreError {
+    /// The view that remains mapped and owned by the caller.
+    pub view: MappedView,
+    /// The failure reason.
+    #[source]
+    pub error: PlatformError,
+}
+
 /// Host page protection for a mapped view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageProtection {

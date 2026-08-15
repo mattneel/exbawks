@@ -142,4 +142,12 @@ Do not perform complex HLE work inside the exception handler.
 
 `WindowsArenaPlan` validates arena alignment, physical ranges, view alignment, and guest overlap.
 
-The Windows sparse mapper remains the first implementation milestone.
+`WindowsAddressSpace` provides these operations on Windows:
+
+- One pagefile-backed physical RAM section.
+- A reserved 4 GiB-aligned guest arena.
+- Anonymous mappings and coherent aliases through replaced placeholder views.
+- Sidecar page-table records for every view.
+- Unmapping that restores and coalesces free placeholders.
+
+Checked reads, writes, fetches, and protection changes for the Windows backend remain the next milestone.
