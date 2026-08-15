@@ -356,20 +356,29 @@ mod tests {
             assert_eq!(query(sealed.base()).protect, PAGE_EXECUTE_READ);
         }
 
+        /// Retries one release observation.
+        ///
+        /// Another test thread can reuse a freed base before the query runs,
+        /// so one attempt can race. A leaked allocation keeps its base on
+        /// every attempt, so a real leak still fails all attempts.
+        fn observe_release(allocate_and_drop: impl Fn() -> usize) -> bool {
+            (0..5).any(|_| query(allocate_and_drop()).state == MEM_FREE)
+        }
+
         #[test]
         fn drop_releases_the_allocation() {
-            let buffer = WritableCodeBuffer::new(4096).expect("allocation succeeds");
-            let base = buffer.imp.base();
-            drop(buffer);
-            assert_eq!(query(base).state, MEM_FREE);
+            assert!(observe_release(|| {
+                let buffer = WritableCodeBuffer::new(4096).expect("allocation succeeds");
+                buffer.imp.base()
+            }));
 
-            let sealed = WritableCodeBuffer::new(4096)
-                .expect("allocation succeeds")
-                .seal()
-                .expect("seal succeeds");
-            let base = sealed.base();
-            drop(sealed);
-            assert_eq!(query(base).state, MEM_FREE);
+            assert!(observe_release(|| {
+                let sealed = WritableCodeBuffer::new(4096)
+                    .expect("allocation succeeds")
+                    .seal()
+                    .expect("seal succeeds");
+                sealed.base()
+            }));
         }
 
         #[test]
