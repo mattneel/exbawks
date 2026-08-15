@@ -62,6 +62,10 @@ Leave unmapped pages as placeholders or `PAGE_NOACCESS` regions.
 
 The initial implementation will use `VirtualAlloc2` placeholders and `MapViewOfFile3` replacement views.
 
+Placeholder split and coalesce operations keep one owner for every live range.
+
+Windows 11 accepts placeholder splits and section-view replacements at 4 KiB page granularity. The platform tests verify this behavior.
+
 ## Identity map
 
 An optional low identity map can make many guest operands directly usable.

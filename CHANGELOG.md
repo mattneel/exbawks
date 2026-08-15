@@ -10,6 +10,8 @@ The project follows Keep a Changelog structure before its first release.
 
 - Host memory geometry queries; `exbawks doctor` reports the host page size
   and allocation granularity (`MEM-001`).
+- Single-owner placeholder split and coalesce operations for the sparse
+  Windows arena (`MEM-002`).
 - Initial Rust workspace scaffold.
 - XBE parser and synthetic tests.
 - Software guest address space.

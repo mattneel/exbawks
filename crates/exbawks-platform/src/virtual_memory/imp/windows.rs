@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::PlatformError;
 
-use super::super::PageProtection;
+use super::super::{CoalesceError, PageProtection};
 
 const PAGE_NOACCESS: u32 = 0x01;
 const PAGE_READONLY: u32 = 0x02;
@@ -16,6 +16,7 @@ const MEM_RESERVE: u32 = 0x0000_2000;
 const MEM_REPLACE_PLACEHOLDER: u32 = 0x0000_4000;
 const MEM_RESERVE_PLACEHOLDER: u32 = 0x0004_0000;
 const MEM_RELEASE: u32 = 0x0000_8000;
+const MEM_COALESCE_PLACEHOLDERS: u32 = 0x0000_0001;
 const MEM_PRESERVE_PLACEHOLDER: u32 = 0x0000_0002;
 
 const INVALID_HANDLE_VALUE: *mut c_void = -1_isize as *mut c_void;
@@ -235,6 +236,77 @@ impl Placeholder {
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// Splits this placeholder and returns the owned tail range.
+    ///
+    /// A failed split leaves this placeholder unchanged.
+    pub fn split_off(&mut self, offset: usize) -> Result<Self, PlatformError> {
+        let page_size = crate::query_system_memory_info()?.page_size as usize;
+        if offset == 0 || offset >= self.len {
+            return Err(PlatformError::InvalidArgument(
+                "split offset must fall inside the placeholder",
+            ));
+        }
+        if !offset.is_multiple_of(page_size) || !(self.len - offset).is_multiple_of(page_size) {
+            return Err(PlatformError::InvalidArgument("split offset must be page aligned"));
+        }
+
+        let tail_len = self.len - offset;
+        let tail_base = self.base.as_ptr() as usize + offset;
+
+        // SAFETY: This object owns the placeholder that contains the tail
+        // range, and the flags split it without releasing the reservation.
+        let split = unsafe {
+            VirtualFree(tail_base as *mut c_void, tail_len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)
+        };
+        if split == 0 {
+            return Err(last_error("VirtualFree(MEM_PRESERVE_PLACEHOLDER)"));
+        }
+
+        let tail_base = NonNull::new(tail_base as *mut c_void)
+            .expect("a nonzero base plus a positive offset cannot be null");
+        self.len = offset;
+        Ok(Self { base: tail_base, len: tail_len, armed: true })
+    }
+
+    /// Coalesces this placeholder with the adjacent following placeholder.
+    ///
+    /// A failure returns the unconsumed placeholder to the caller.
+    pub fn coalesce_with(&mut self, next: Self) -> Result<(), CoalesceError> {
+        let expected_base = self.base.as_ptr() as usize + self.len;
+        if next.base.as_ptr() as usize != expected_base {
+            return Err(CoalesceError {
+                next,
+                error: PlatformError::InvalidArgument(
+                    "coalesce requires an adjacent following placeholder",
+                ),
+            });
+        }
+
+        let Some(total_len) = self.len.checked_add(next.len) else {
+            return Err(CoalesceError {
+                next,
+                error: PlatformError::InvalidArgument("coalesced placeholder length overflows"),
+            });
+        };
+
+        // SAFETY: The two objects own the complete adjacent range, and the
+        // flags merge the placeholders without releasing the reservation.
+        let merged = unsafe {
+            VirtualFree(self.base.as_ptr(), total_len, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)
+        };
+        if merged == 0 {
+            return Err(CoalesceError {
+                next,
+                error: last_error("VirtualFree(MEM_COALESCE_PLACEHOLDERS)"),
+            });
+        }
+
+        let mut next = next;
+        next.armed = false;
+        self.len = total_len;
+        Ok(())
+    }
 }
 
 impl Drop for Placeholder {
@@ -315,4 +387,110 @@ fn last_error(operation: &'static str) -> PlatformError {
     // SAFETY: GetLastError takes no arguments and returns thread-local state.
     let code = unsafe { GetLastError() };
     PlatformError::Win32 { operation, code }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GRANULARITY: usize = 64 * 1024;
+    const PAGE: usize = 4096;
+
+    #[test]
+    fn split_produces_three_owned_ranges() {
+        let mut first = Placeholder::reserve(None, 3 * GRANULARITY).expect("reserve succeeds");
+        let base = first.base();
+        let mut second = first.split_off(GRANULARITY).expect("first split succeeds");
+        let third = second.split_off(GRANULARITY).expect("second split succeeds");
+
+        assert_eq!(first.base(), base);
+        assert_eq!(first.len(), GRANULARITY);
+        assert_eq!(second.base(), base + GRANULARITY);
+        assert_eq!(second.len(), GRANULARITY);
+        assert_eq!(third.base(), base + 2 * GRANULARITY);
+        assert_eq!(third.len(), GRANULARITY);
+
+        // Replacing the middle range proves that each range is one
+        // independent placeholder.
+        let section = PagefileSection::new(GRANULARITY).expect("section succeeds");
+        let view =
+            section.map_replace(second, 0, PageProtection::ReadWrite).expect("view succeeds");
+        assert_eq!(view.base(), base + GRANULARITY);
+    }
+
+    #[test]
+    fn coalesce_restores_one_placeholder() {
+        let mut first = Placeholder::reserve(None, 3 * GRANULARITY).expect("reserve succeeds");
+        let base = first.base();
+        let mut second = first.split_off(GRANULARITY).expect("first split succeeds");
+        let third = second.split_off(GRANULARITY).expect("second split succeeds");
+
+        second.coalesce_with(third).expect("tail coalesce succeeds");
+        first.coalesce_with(second).expect("head coalesce succeeds");
+        assert_eq!(first.base(), base);
+        assert_eq!(first.len(), 3 * GRANULARITY);
+
+        // One full-range view replacement proves that one placeholder remains.
+        let section = PagefileSection::new(3 * GRANULARITY).expect("section succeeds");
+        let view = section.map_replace(first, 0, PageProtection::ReadOnly).expect("view succeeds");
+        assert_eq!(view.len(), 3 * GRANULARITY);
+    }
+
+    #[test]
+    fn failed_split_preserves_valid_ownership() {
+        let mut placeholder =
+            Placeholder::reserve(None, 2 * GRANULARITY).expect("reserve succeeds");
+
+        let zero = placeholder.split_off(0).expect_err("zero offset must fail");
+        assert!(matches!(zero, PlatformError::InvalidArgument(_)));
+        let outside = placeholder.split_off(2 * GRANULARITY).expect_err("end offset must fail");
+        assert!(matches!(outside, PlatformError::InvalidArgument(_)));
+        let unaligned =
+            placeholder.split_off(GRANULARITY + 1).expect_err("unaligned offset must fail");
+        assert!(matches!(unaligned, PlatformError::InvalidArgument(_)));
+
+        assert_eq!(placeholder.len(), 2 * GRANULARITY);
+        let tail = placeholder.split_off(GRANULARITY).expect("valid split still succeeds");
+        assert_eq!(placeholder.len(), GRANULARITY);
+        assert_eq!(tail.len(), GRANULARITY);
+    }
+
+    #[test]
+    fn failed_coalesce_returns_the_next_placeholder() {
+        let mut first = Placeholder::reserve(None, 3 * GRANULARITY).expect("reserve succeeds");
+        let mut second = first.split_off(GRANULARITY).expect("first split succeeds");
+        let third = second.split_off(GRANULARITY).expect("second split succeeds");
+
+        let error = first.coalesce_with(third).expect_err("skipping a range must fail");
+        assert!(matches!(error.error, PlatformError::InvalidArgument(_)));
+
+        let third = error.next;
+        assert_eq!(third.len(), GRANULARITY);
+        second.coalesce_with(third).expect("adjacent coalesce still succeeds");
+        assert_eq!(second.len(), 2 * GRANULARITY);
+    }
+
+    #[test]
+    fn split_supports_page_granularity() {
+        let mut placeholder = Placeholder::reserve(None, GRANULARITY).expect("reserve succeeds");
+        let tail = placeholder.split_off(PAGE).expect("page-granular split succeeds");
+        assert_eq!(placeholder.len(), PAGE);
+        assert_eq!(tail.len(), GRANULARITY - PAGE);
+    }
+
+    #[test]
+    fn page_granular_view_replacement_works() {
+        let mut placeholder = Placeholder::reserve(None, GRANULARITY).expect("reserve succeeds");
+        let tail = placeholder.split_off(PAGE).expect("page-granular split succeeds");
+
+        let section = PagefileSection::new(GRANULARITY).expect("section succeeds");
+        let head_view = section
+            .map_replace(placeholder, 0, PageProtection::ReadWrite)
+            .expect("page-sized view succeeds");
+        let tail_view = section
+            .map_replace(tail, PAGE as u64, PageProtection::ReadWrite)
+            .expect("page-offset view succeeds");
+        assert_eq!(head_view.len(), PAGE);
+        assert_eq!(tail_view.len(), GRANULARITY - PAGE);
+    }
 }

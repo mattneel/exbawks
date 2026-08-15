@@ -1,6 +1,6 @@
 use crate::PlatformError;
 
-use super::super::PageProtection;
+use super::super::{CoalesceError, PageProtection};
 
 /// A pagefile-backed physical memory section.
 #[derive(Debug, Clone)]
@@ -69,6 +69,20 @@ impl Placeholder {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Splits this placeholder and returns the owned tail range.
+    pub fn split_off(&mut self, offset: usize) -> Result<Self, PlatformError> {
+        let _ = offset;
+        Err(PlatformError::Unsupported("placeholders require Windows"))
+    }
+
+    /// Coalesces this placeholder with the adjacent following placeholder.
+    pub fn coalesce_with(&mut self, next: Self) -> Result<(), CoalesceError> {
+        Err(CoalesceError {
+            next,
+            error: PlatformError::Unsupported("placeholders require Windows"),
+        })
     }
 }
 
