@@ -51,7 +51,7 @@ unsafe_op_in_unsafe_fn = "deny"
 unused_lifetimes = "warn"
 
 [workspace.lints.clippy]
-all = "warn"
+all = { level = "warn", priority = -1 }
 dbg_macro = "deny"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
