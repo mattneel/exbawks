@@ -111,7 +111,7 @@ impl PageDescriptor {
     ) -> Self {
         let mut raw = VALID_BIT;
         raw |= (kind as u64) << KIND_SHIFT;
-        raw |= (permissions.bits() as u64) << PERMISSIONS_SHIFT;
+        raw |= ((permissions.bits() as u64) & PERMISSIONS_MASK) << PERMISSIONS_SHIFT;
         raw |= ((physical_page as u64) & PHYSICAL_PAGE_MASK) << PHYSICAL_PAGE_SHIFT;
         raw |= ((aux as u64) & AUX_MASK) << AUX_SHIFT;
         raw |= ((generation as u64) & GENERATION_MASK) << GENERATION_SHIFT;
@@ -167,7 +167,7 @@ impl PageDescriptor {
     #[must_use]
     pub const fn with_permissions(self, permissions: MemoryPermissions) -> Self {
         let raw = self.0 & !(PERMISSIONS_MASK << PERMISSIONS_SHIFT);
-        Self(raw | ((permissions.bits() as u64) << PERMISSIONS_SHIFT))
+        Self(raw | (((permissions.bits() as u64) & PERMISSIONS_MASK) << PERMISSIONS_SHIFT))
     }
 
     /// Returns a copy with a new generation.
@@ -429,6 +429,18 @@ mod tests {
         assert_eq!(descriptor.generation(), 77);
         assert!(descriptor.permissions().contains(MemoryPermissions::EXECUTE));
         assert_eq!(descriptor.watch(), WatchFlags { read: true, write: false, execute: true });
+    }
+
+    #[test]
+    fn undefined_permission_bits_cannot_corrupt_other_fields() {
+        let poisoned = MemoryPermissions::from_bits_retain(0xFF);
+        let descriptor =
+            PageDescriptor::ram(GuestPage(0x12345), poisoned, 7).with_permissions(poisoned);
+
+        assert_eq!(descriptor.kind(), PageKind::Ram);
+        assert_eq!(descriptor.physical_page(), GuestPage(0x12345));
+        assert_eq!(descriptor.generation(), 7);
+        assert_eq!(descriptor.permissions().bits(), 0b111);
     }
 
     #[test]

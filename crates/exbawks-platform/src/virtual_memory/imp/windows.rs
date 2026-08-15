@@ -123,12 +123,14 @@ impl PagefileSection {
         let high = (size >> 32) as u32;
         let low = size as u32;
 
+        // The execute-read-write protection class sets the ceiling for view
+        // protections; individual views still map with their own protection.
         // SAFETY: The call uses the pagefile handle and null optional pointers.
         let handle = unsafe {
             CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 ptr::null(),
-                PAGE_READWRITE,
+                PAGE_EXECUTE_READWRITE,
                 high,
                 low,
                 ptr::null(),
@@ -425,8 +427,8 @@ pub struct MappedView {
 // SAFETY: The owner controls one process-global mapping without
 // thread-affine state.
 unsafe impl Send for MappedView {}
-// SAFETY: Shared copies target disjoint or caller-serialized ranges of one
-// process-global mapping.
+// SAFETY: Shared methods only read the mapping or the stored base, length,
+// and protection; mutation of the mapped bytes requires exclusive access.
 unsafe impl Sync for MappedView {}
 
 impl MappedView {
@@ -486,7 +488,11 @@ impl MappedView {
     }
 
     /// Copies bytes into the mapped view.
-    pub fn write_at(&self, offset: usize, input: &[u8]) -> Result<(), PlatformError> {
+    ///
+    /// Exclusive access serializes writers against every reader and writer
+    /// of this view. Views that alias one section range still require
+    /// caller serialization.
+    pub fn write_at(&mut self, offset: usize, input: &[u8]) -> Result<(), PlatformError> {
         let end = offset
             .checked_add(input.len())
             .ok_or(PlatformError::InvalidArgument("view write range overflow"))?;
@@ -512,6 +518,10 @@ impl MappedView {
     }
 
     /// Changes the host protection of the complete view.
+    ///
+    /// Windows caps view protections at the protection class the view was
+    /// mapped with. Raising a read-write view to an execute class fails;
+    /// map the view with an execute class when execution is required.
     pub fn protect(&mut self, protection: PageProtection) -> Result<(), PlatformError> {
         let mut old_protection = 0_u32;
         // SAFETY: This object keeps [base, base + len) mapped for its
@@ -690,6 +700,29 @@ mod tests {
 
         view.protect(PageProtection::ReadWrite).expect("protect succeeds again");
         view.write_at(0, &[3]).expect("write succeeds again");
+
+        // Windows caps view protections at the map-time class, so raising a
+        // read-write view to an execute class stays a typed failure.
+        let error =
+            view.protect(PageProtection::ExecuteRead).expect_err("raising the class must fail");
+        assert!(matches!(error, PlatformError::Win32 { .. }));
+    }
+
+    #[test]
+    fn executable_views_map_and_protect_within_their_class() {
+        let placeholder = Placeholder::reserve(None, GRANULARITY).expect("reserve succeeds");
+        let section = PagefileSection::new(GRANULARITY).expect("section succeeds");
+        let mut view = section
+            .map_replace(placeholder, 0, PageProtection::ExecuteReadWrite)
+            .expect("executable view succeeds");
+
+        view.write_at(0, &[0xC3]).expect("write succeeds");
+        view.protect(PageProtection::ExecuteRead).expect("protect within the class succeeds");
+        assert!(view.write_at(0, &[0x90]).is_err());
+
+        let mut output = [0_u8; 1];
+        view.read_at(0, &mut output).expect("read succeeds");
+        assert_eq!(output, [0xC3]);
     }
 
     #[test]

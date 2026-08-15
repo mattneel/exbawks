@@ -136,7 +136,7 @@ impl MappedView {
     }
 
     /// Copies bytes into the mapped view.
-    pub fn write_at(&self, offset: usize, input: &[u8]) -> Result<(), PlatformError> {
+    pub fn write_at(&mut self, offset: usize, input: &[u8]) -> Result<(), PlatformError> {
         let _ = (offset, input);
         Err(PlatformError::Unsupported("section views require Windows"))
     }

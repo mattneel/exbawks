@@ -145,7 +145,8 @@ mod imp {
     // SAFETY: The owner controls one process-global allocation without
     // thread-affine state.
     unsafe impl Send for CodeAllocation {}
-    // SAFETY: Shared methods only read the stored base and capacity.
+    // SAFETY: Shared methods only read the stored base and capacity;
+    // mutation of the allocation requires exclusive access.
     unsafe impl Sync for CodeAllocation {}
 
     impl CodeAllocation {
@@ -167,7 +168,11 @@ mod imp {
             self.base.as_ptr() as usize
         }
 
-        pub(super) fn write_at(&self, offset: usize, bytes: &[u8]) -> Result<(), PlatformError> {
+        pub(super) fn write_at(
+            &mut self,
+            offset: usize,
+            bytes: &[u8],
+        ) -> Result<(), PlatformError> {
             let end = offset
                 .checked_add(bytes.len())
                 .ok_or(PlatformError::InvalidArgument("code buffer write overflows"))?;
@@ -256,7 +261,11 @@ mod imp {
             0
         }
 
-        pub(super) fn write_at(&self, offset: usize, bytes: &[u8]) -> Result<(), PlatformError> {
+        pub(super) fn write_at(
+            &mut self,
+            offset: usize,
+            bytes: &[u8],
+        ) -> Result<(), PlatformError> {
             let _ = (offset, bytes);
             Err(PlatformError::Unsupported("code buffers require Windows"))
         }

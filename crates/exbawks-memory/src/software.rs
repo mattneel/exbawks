@@ -51,6 +51,9 @@ impl SoftwareAddressSpace {
                 len: physical_bytes as u64,
             }));
         }
+        if physical_bytes as u64 > crate::GUEST_ARENA_SIZE {
+            return Err(MemoryError::InvalidPhysicalSize { bytes: physical_bytes as u64 });
+        }
 
         let page_count =
             u32::try_from(physical_bytes / page_size).map_err(|_| MemoryError::HostSizeOverflow)?;
@@ -89,10 +92,7 @@ impl SoftwareAddressSpace {
     ) -> Result<(), MemoryError> {
         range.require_page_alignment()?;
         if physical_start.page_offset() != 0 {
-            return Err(MemoryError::Address(exbawks_types::AddressError::UnalignedRange {
-                start: range.start(),
-                len: range.len(),
-            }));
+            return Err(MemoryError::UnalignedPhysicalAddress { address: physical_start });
         }
 
         let physical_end = u64::from(physical_start.0)
@@ -122,7 +122,7 @@ impl SoftwareAddressSpace {
         let temporary_permissions = permissions | MemoryPermissions::WRITE;
         let physical = self.map_anonymous(range, temporary_permissions)?;
         self.write(address, initial)?;
-        self.table.protect(range, permissions)?;
+        self.protect(range, permissions)?;
         Ok(physical)
     }
 
@@ -132,6 +132,9 @@ impl SoftwareAddressSpace {
         range: GuestRange,
         permissions: MemoryPermissions,
     ) -> Result<(), MemoryError> {
+        // The exclusive physical lock keeps permission changes out of the
+        // window between access validation and the byte copies.
+        let _physical = self.physical.write();
         self.table.protect(range, permissions)
     }
 

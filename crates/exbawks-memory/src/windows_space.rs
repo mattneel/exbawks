@@ -13,6 +13,10 @@ use crate::{GUEST_ARENA_SIZE, GuestArena, GuestMemory, MemoryError, PageTable};
 /// One pagefile-backed section holds guest physical RAM. Guest mappings
 /// replace arena placeholders with coherent section views, and every view is
 /// recorded in the sidecar page table.
+///
+/// RAM entries written directly through [`Self::page_table`] have no backing
+/// view, so checked accesses to them return typed unmapped errors. Use the
+/// mapping methods on this type for accessible guest RAM.
 #[derive(Debug)]
 pub struct WindowsAddressSpace {
     arena_base: u64,
@@ -118,10 +122,7 @@ impl WindowsAddressSpace {
     ) -> Result<(), MemoryError> {
         range.require_page_alignment()?;
         if physical_start.page_offset() != 0 {
-            return Err(MemoryError::Address(exbawks_types::AddressError::UnalignedRange {
-                start: range.start(),
-                len: range.len(),
-            }));
+            return Err(MemoryError::UnalignedPhysicalAddress { address: physical_start });
         }
 
         self.map_view(range, physical_start, permissions)
@@ -144,7 +145,7 @@ impl WindowsAddressSpace {
         let temporary_permissions = permissions | MemoryPermissions::WRITE;
         let physical = self.map_anonymous(range, temporary_permissions)?;
         self.write(address, initial)?;
-        self.table.protect(range, permissions)?;
+        self.protect(range, permissions)?;
         Ok(physical)
     }
 
@@ -154,6 +155,9 @@ impl WindowsAddressSpace {
         range: GuestRange,
         permissions: MemoryPermissions,
     ) -> Result<(), MemoryError> {
+        // The exclusive region lock keeps permission changes out of the
+        // window between access validation and the raw view copies.
+        let _regions = self.regions.write();
         self.table.protect(range, permissions)
     }
 
@@ -239,6 +243,10 @@ impl WindowsAddressSpace {
     }
 
     /// Performs one validated access through the mapped views.
+    ///
+    /// Reads share the region lock. Writes hold it exclusively, which
+    /// serializes every raw view copy against overlapping accesses and
+    /// mapping changes.
     fn access(
         &self,
         access: AccessKind,
@@ -252,8 +260,43 @@ impl WindowsAddressSpace {
         let length = u64::try_from(buffer.len()).map_err(|_| MemoryError::HostSizeOverflow)?;
         let _ = GuestRange::new(address, length)?;
 
-        let regions = self.regions.read();
-        walk_pages(&self.table, access, address, buffer.len(), |current, descriptor, _, chunk| {
+        match &mut buffer {
+            AccessBuffer::Read(output) => {
+                let regions = self.regions.read();
+                self.validate(&regions, access, address, output.len())?;
+                let len = output.len();
+                walk_pages(&self.table, access, address, len, |current, _, offset, chunk| {
+                    let (view, view_offset) = regions
+                        .view_at(u64::from(current.0))
+                        .ok_or(MemoryError::Unmapped { address: current, access })?;
+                    view.read_at(view_offset, &mut output[offset..offset + chunk])?;
+                    Ok(())
+                })
+            }
+            AccessBuffer::Write(input) => {
+                let mut regions = self.regions.write();
+                self.validate(&regions, access, address, input.len())?;
+                let len = input.len();
+                walk_pages(&self.table, access, address, len, |current, _, offset, chunk| {
+                    let (view, view_offset) = regions
+                        .view_at_mut(u64::from(current.0))
+                        .ok_or(MemoryError::Unmapped { address: current, access })?;
+                    view.write_at(view_offset, &input[offset..offset + chunk])?;
+                    Ok(())
+                })
+            }
+        }
+    }
+
+    /// Validates one complete access range against the sidecar and views.
+    fn validate(
+        &self,
+        regions: &RegionMap,
+        access: AccessKind,
+        address: GuestVa,
+        len: usize,
+    ) -> Result<(), MemoryError> {
+        walk_pages(&self.table, access, address, len, |current, descriptor, _, chunk| {
             let offset = physical_offset(descriptor.physical_page(), current.page_offset())?;
             let end = offset.checked_add(chunk).ok_or(MemoryError::HostSizeOverflow)?;
             if end > self.physical_bytes {
@@ -265,30 +308,7 @@ impl WindowsAddressSpace {
                 return Err(MemoryError::Unmapped { address: current, access });
             }
             Ok(())
-        })?;
-
-        match &mut buffer {
-            AccessBuffer::Read(output) => {
-                let len = output.len();
-                walk_pages(&self.table, access, address, len, |current, _, offset, chunk| {
-                    let (view, view_offset) = regions
-                        .view_at(u64::from(current.0))
-                        .ok_or(MemoryError::Unmapped { address: current, access })?;
-                    view.read_at(view_offset, &mut output[offset..offset + chunk])?;
-                    Ok(())
-                })
-            }
-            AccessBuffer::Write(input) => {
-                let len = input.len();
-                walk_pages(&self.table, access, address, len, |current, _, offset, chunk| {
-                    let (view, view_offset) = regions
-                        .view_at(u64::from(current.0))
-                        .ok_or(MemoryError::Unmapped { address: current, access })?;
-                    view.write_at(view_offset, &input[offset..offset + chunk])?;
-                    Ok(())
-                })
-            }
-        }
+        })
     }
 }
 
@@ -314,6 +334,13 @@ impl RegionMap {
     /// Returns the view and view offset that contain one guest position.
     fn view_at(&self, guest_offset: u64) -> Option<(&MappedView, usize)> {
         let (&start, view) = self.views.range(..=guest_offset).next_back()?;
+        let offset = guest_offset - start;
+        if offset < view.len() as u64 { Some((view, usize::try_from(offset).ok()?)) } else { None }
+    }
+
+    /// Returns the mutable view and view offset for one guest position.
+    fn view_at_mut(&mut self, guest_offset: u64) -> Option<(&mut MappedView, usize)> {
+        let (&start, view) = self.views.range_mut(..=guest_offset).next_back()?;
         let offset = guest_offset - start;
         if offset < view.len() as u64 { Some((view, usize::try_from(offset).ok()?)) } else { None }
     }
@@ -433,13 +460,14 @@ mod tests {
         let second = GuestRange::page_aligned(GuestVa(0x9000), PAGE).expect("range is valid");
         space.map_alias(second, physical, READ_WRITE).expect("alias succeeds");
 
-        let regions = space.regions.read();
-        let first_view = regions.views.get(&0x1000).expect("first view exists");
-        let second_view = regions.views.get(&0x9000).expect("second view exists");
+        let mut regions = space.regions.write();
+        let first_view = regions.views.get_mut(&0x1000).expect("first view exists");
         first_view.write_at(0x10, b"exbawks").expect("write succeeds");
+        let second_view = regions.views.get(&0x9000).expect("second view exists");
         let mut output = [0_u8; 7];
         second_view.read_at(0x10, &mut output).expect("read succeeds");
         assert_eq!(&output, b"exbawks");
+        drop(regions);
 
         assert_eq!(space.page_table().get(GuestPage(1)).physical_page(), GuestPage(0));
         assert_eq!(space.page_table().get(GuestPage(9)).physical_page(), GuestPage(0));
@@ -455,8 +483,8 @@ mod tests {
         space.map_alias(second, physical, READ_WRITE).expect("alias succeeds");
 
         {
-            let regions = space.regions.read();
-            let second_view = regions.views.get(&0x9000).expect("second view exists");
+            let mut regions = space.regions.write();
+            let second_view = regions.views.get_mut(&0x9000).expect("second view exists");
             second_view.write_at(0, &[0xA5]).expect("write succeeds");
         }
 

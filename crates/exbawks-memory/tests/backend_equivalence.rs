@@ -9,7 +9,8 @@ use exbawks_memory::{GuestMemory, MemoryError, SoftwareAddressSpace, WindowsAddr
 use exbawks_types::{GUEST_PAGE_SIZE, GuestPa, GuestRange, GuestVa, MemoryPermissions};
 
 const PAGE: u64 = GUEST_PAGE_SIZE as u64;
-const PHYSICAL_BYTES: usize = 1024 * 1024;
+// 64 physical pages, so generated scenarios reach allocator exhaustion.
+const PHYSICAL_BYTES: usize = 256 * 1024;
 const WINDOW_PAGES: u32 = 64;
 
 /// One backend-neutral mapping interface for generated scenarios.
@@ -144,31 +145,45 @@ fn generated_permissions(generator: &mut Lcg) -> MemoryPermissions {
 }
 
 /// Generates one operation inside a small page window.
+///
+/// One map input in eight is unaligned, so both backends must reject it
+/// with identical typed failures. Physical offsets can exceed the section.
 fn generated_op(generator: &mut Lcg) -> Op {
-    let page_start = |generator: &mut Lcg| (generator.below(u64::from(WINDOW_PAGES)) as u32) << 12;
     let byte_address = |generator: &mut Lcg| generator.below(u64::from(WINDOW_PAGES) * PAGE) as u32;
+    let map_start = |generator: &mut Lcg| {
+        let page = (generator.below(u64::from(WINDOW_PAGES)) as u32) << 12;
+        if generator.below(8) == 0 { page | (generator.below(PAGE) as u32) } else { page }
+    };
+    let map_len = |generator: &mut Lcg| {
+        let pages = (generator.below(4) + 1) * PAGE;
+        if generator.below(8) == 0 { pages + generator.below(PAGE) + 1 } else { pages }
+    };
+    let physical = |generator: &mut Lcg| {
+        let page = (generator.below(80) as u32) << 12;
+        if generator.below(8) == 0 { page | (generator.below(PAGE) as u32) } else { page }
+    };
 
     match generator.below(9) {
         0 | 1 => Op::MapAnonymous {
-            start: page_start(generator),
-            len: (generator.below(4) + 1) * PAGE,
+            start: map_start(generator),
+            len: map_len(generator),
             permissions: generated_permissions(generator),
         },
         2 => Op::MapAlias {
-            start: page_start(generator),
-            len: (generator.below(4) + 1) * PAGE,
-            physical: (generator.below(48) as u32) << 12,
+            start: map_start(generator),
+            len: map_len(generator),
+            physical: physical(generator),
             permissions: generated_permissions(generator),
         },
         3 => Op::LoadRegion {
-            start: page_start(generator),
+            start: map_start(generator),
             virtual_size: generator.below(3 * PAGE) as u32 + 1,
             payload_len: generator.below(2 * PAGE) as usize,
             permissions: generated_permissions(generator),
         },
         4 => Op::Protect {
-            start: page_start(generator),
-            len: (generator.below(4) + 1) * PAGE,
+            start: map_start(generator),
+            len: map_len(generator),
             permissions: generated_permissions(generator),
         },
         5 | 6 => Op::Write {

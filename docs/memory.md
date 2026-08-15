@@ -154,4 +154,8 @@ Do not perform complex HLE work inside the exception handler.
 
 Both backends validate every access through one shared sidecar walk. Generated equivalence tests require identical typed failures and identical readable bytes from both backends.
 
+Checked reads share one backend lock. Checked writes and permission changes hold it exclusively, so raw view copies never race and permission changes never interleave with an in-flight access.
+
+Windows caps view protections at the map-time protection class. Views that need host execute permission must map with an execute class.
+
 Arena RAM views keep host read-write protection. The sidecar page table is the permission authority for checked access on both backends. Host protection tightening arrives with write-fault code invalidation. The platform view wrapper already supports host protection changes.
