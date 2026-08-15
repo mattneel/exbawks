@@ -12,19 +12,21 @@ EXECUTABLE_SECTION = 0x00000004
 
 # The boot title for the first execution milestone:
 #   0x11000  mov eax, 5
-#   0x11005  add eax, 0x25        ; translated work before the kernel call
-#   0x11008  call [0x11200]       ; DbgPrint through the first thunk gate
-#   0x1100E  mov ebx, eax         ; translated work after the HLE return
-#   0x11010  call [0x11204]       ; HalReturnToFirmware requests a guest exit
-#   0x11016  ret
+#   0x11005  add eax, 0x25        ; translated work before the kernel call (eax=42)
+#   0x11008  mov esi, eax         ; esi=42, preserved across the call
+#   0x1100A  call [0x11200]       ; DbgPrint through the first thunk gate
+#   0x11010  mov edi, eax         ; edi = returned status (translated work after return)
+#   0x11012  call [0x11204]       ; HalReturnToFirmware requests a guest exit
+#   0x11018  ret
 BOOT_CODE = bytes(
     [
-        0xB8, 0x05, 0x00, 0x00, 0x00,
-        0x83, 0xC0, 0x25,
-        0xFF, 0x15, 0x00, 0x12, 0x01, 0x00,
-        0x89, 0xC3,
-        0xFF, 0x15, 0x04, 0x12, 0x01, 0x00,
-        0xC3,
+        0xB8, 0x05, 0x00, 0x00, 0x00,  # mov eax, 5
+        0x83, 0xC0, 0x25,  # add eax, 0x25   -> eax = 42
+        0x89, 0xC6,  # mov esi, eax          -> esi preserved across the call
+        0xFF, 0x15, 0x00, 0x12, 0x01, 0x00,  # call [0x11200]  DbgPrint
+        0x89, 0xC7,  # mov edi, eax          -> edi = returned status
+        0xFF, 0x15, 0x04, 0x12, 0x01, 0x00,  # call [0x11204]  HalReturnToFirmware
+        0xC3,  # ret
     ]
 )
 

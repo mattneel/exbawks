@@ -25,6 +25,8 @@ use crate::{BootPlanReport, CoreError, EmulatorConfig, KernelThunkTable, LoadedI
 pub enum GateAssist {
     /// One export ran; execution resumes at the address.
     Dispatched {
+        /// The dispatched export ordinal.
+        ordinal: u16,
         /// The guest address after the call instruction.
         resume: GuestVa,
         /// The status the export returned.
@@ -232,15 +234,11 @@ impl Emulator {
     /// so execution resumes in translated code.
     pub fn try_kernel_gate_call(&mut self) -> Result<GateAssist, CoreError> {
         let address = GuestVa(self.cpu.eip);
-        let page_remaining = usize::try_from(GUEST_PAGE_SIZE - address.page_offset())
-            .map_err(|_| CoreError::InvalidConfiguration("guest page size does not fit usize"))?;
-        let fetch_len = page_remaining.min(15);
-        let mut bytes = [0_u8; 15];
-        self.memory.fetch(address, &mut bytes[..fetch_len])?;
+        let bytes = self.fetch_executable(address, 15)?;
 
         let decoder =
-            BasicBlockDecoder::new(DecodeConfig { max_instructions: 1, max_bytes: fetch_len });
-        let block = decoder.decode(address, &bytes[..fetch_len])?;
+            BasicBlockDecoder::new(DecodeConfig { max_instructions: 1, max_bytes: bytes.len() });
+        let block = decoder.decode(address, &bytes)?;
         let Some(instruction) = block.instructions.first() else {
             return Ok(GateAssist::NotAGateCall);
         };
@@ -280,8 +278,11 @@ impl Emulator {
         self.cpu.gpr[4] =
             self.cpu.gpr[4].wrapping_add(4).wrapping_add(u32::from(export.stack_bytes()));
         self.cpu.eip = return_address;
+        // Xbox kernel exports return their NTSTATUS in EAX; EAX is a
+        // caller-clobbered register under the guest ABI.
+        self.cpu.gpr[0] = status.0;
 
-        Ok(GateAssist::Dispatched { resume: GuestVa(return_address), status, stop })
+        Ok(GateAssist::Dispatched { ordinal, resume: GuestVa(return_address), status, stop })
     }
 
     /// Runs translated blocks from the current guest EIP.
@@ -292,6 +293,29 @@ impl Emulator {
         let stop = self.run_blocks(max_blocks)?;
         self.trace.record(TraceEvent::Stop { reason: format!("{stop:?}") });
         Ok(stop)
+    }
+
+    /// Fetches executable bytes across contiguous mapped pages.
+    ///
+    /// The fetch spans as many mapped executable pages as the length allows,
+    /// so an instruction straddling a page boundary decodes when both pages
+    /// are mapped. It falls back to the current page when a later page is
+    /// unmapped, and an instruction that straddles into an unmapped page
+    /// then surfaces as a genuine fault through the decoder.
+    fn fetch_executable(&self, start: GuestVa, max_len: usize) -> Result<Vec<u8>, CoreError> {
+        let to_top = (u64::from(u32::MAX) - u64::from(start.0) + 1) as usize;
+        let want = max_len.min(to_top);
+        let mut bytes = vec![0_u8; want];
+        if self.memory.fetch(start, &mut bytes).is_ok() {
+            return Ok(bytes);
+        }
+
+        let page_remaining = usize::try_from(GUEST_PAGE_SIZE - start.page_offset())
+            .map_err(|_| CoreError::InvalidConfiguration("guest page size does not fit usize"))?;
+        let fallback = want.min(page_remaining);
+        bytes.truncate(fallback);
+        self.memory.fetch(start, &mut bytes)?;
+        Ok(bytes)
     }
 
     fn run_blocks(&mut self, max_blocks: usize) -> Result<StopReason, CoreError> {
@@ -310,6 +334,14 @@ impl Emulator {
                 BlockExit::DirectSuccessor => {}
                 BlockExit::UnsupportedInstruction => match self.try_kernel_gate_call()? {
                     GateAssist::Dispatched { stop: Some(stop), .. } => return Ok(stop),
+                    // An unimplemented stub cannot correctly clean the stdcall
+                    // stack or return meaningful values, so halt rather than
+                    // continue past it with corrupted guest state.
+                    GateAssist::Dispatched { ordinal, status, .. }
+                        if status == KernelStatus::NOT_IMPLEMENTED =>
+                    {
+                        return Ok(StopReason::UnimplementedKernelExport { ordinal });
+                    }
                     GateAssist::Dispatched { .. } => {}
                     GateAssist::MissingExport { ordinal } => {
                         return Ok(StopReason::MissingKernelExport { ordinal });
@@ -343,11 +375,7 @@ impl Emulator {
         &self,
         start: GuestVa,
     ) -> Result<(DecodedBlock, Arc<CompiledBlock>), CoreError> {
-        let page_remaining = usize::try_from(GUEST_PAGE_SIZE - start.page_offset())
-            .map_err(|_| CoreError::InvalidConfiguration("guest page size does not fit usize"))?;
-        let fetch_len = self.config.max_block_bytes.min(page_remaining);
-        let mut bytes = vec![0_u8; fetch_len];
-        self.memory.fetch(start, &mut bytes)?;
+        let bytes = self.fetch_executable(start, self.config.max_block_bytes)?;
 
         let decoder = BasicBlockDecoder::new(DecodeConfig {
             max_instructions: self.config.max_block_instructions,
@@ -661,8 +689,8 @@ mod tests {
 
             fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
                 self.calls.fetch_add(1, Ordering::Relaxed);
-                context.cpu.gpr[0] = 0xFEED_F00D;
-                KernelStatus::SUCCESS
+                let _ = context;
+                KernelStatus(0xFEED_F00D)
             }
         }
 
@@ -711,13 +739,15 @@ mod tests {
             assert_eq!(
                 assist,
                 GateAssist::Dispatched {
+                    ordinal: 7,
                     resume: GuestVa(0x0001_1006),
-                    status: KernelStatus::SUCCESS,
+                    status: KernelStatus(0xFEED_F00D),
                     stop: None
                 }
             );
             assert_eq!(calls.load(Ordering::Relaxed), 1);
             assert_eq!(emulator.cpu().eip, 0x0001_1006);
+            // The runtime places the returned status in guest EAX.
             assert_eq!(emulator.cpu().gpr[0], 0xFEED_F00D);
             assert_eq!(emulator.cpu().gpr[4], stack_before, "the call and return balance");
         }
@@ -761,23 +791,33 @@ mod tests {
         /// The synthetic boot title for the first execution milestone.
         ///
         /// ```text
-        /// 0x11000  mov eax, 5
-        /// 0x11005  add eax, 0x25        ; translated work before the call
-        /// 0x11008  call [0x11200]       ; DbgPrint through the first gate
-        /// 0x1100E  mov ebx, eax         ; translated work after the return
-        /// 0x11010  call [0x11204]       ; HalReturnToFirmware exits
-        /// 0x11016  ret
+        /// 0x11000  mov eax, 5           ; translated arithmetic
+        /// 0x11005  add eax, 0x25        ; eax = 42
+        /// 0x11008  mov esi, eax         ; esi = 42, a register preserved across the call
+        /// 0x1100A  call [0x11200]       ; DbgPrint through the first gate
+        /// 0x11010  mov edi, eax         ; edi = the returned status (translated work after the return)
+        /// 0x11012  call [0x11204]       ; HalReturnToFirmware requests a guest exit
+        /// 0x11018  ret
         /// ```
-        const BOOT_CODE: [u8; 23] = [
+        ///
+        /// The register-only guest cannot push a format pointer, so DbgPrint
+        /// sees a null argument and returns INVALID_PARAMETER; the milestone
+        /// verifies that this status reaches guest EAX and that ESI survives
+        /// the kernel call unchanged.
+        const BOOT_CODE: [u8; 25] = [
             0xB8, 0x05, 0x00, 0x00, 0x00, // mov eax, 5
             0x83, 0xC0, 0x25, // add eax, 0x25
+            0x89, 0xC6, // mov esi, eax
             0xFF, 0x15, 0x00, 0x12, 0x01, 0x00, // call [0x11200]
-            0x89, 0xC3, // mov ebx, eax
+            0x89, 0xC7, // mov edi, eax
             0xFF, 0x15, 0x04, 0x12, 0x01, 0x00, // call [0x11204]
             0xC3, // ret
         ];
 
         const BOOT_THUNKS: [u32; 2] = [0x8000_0008, 0x8000_0031];
+
+        /// The NTSTATUS DbgPrint returns for a null format pointer.
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 
         #[cfg(windows)]
         #[test]
@@ -791,8 +831,12 @@ mod tests {
             let stop = emulator.run(16).expect("the boot flow must run");
 
             assert_eq!(stop, StopReason::GuestExit { code: 0 });
-            assert_eq!(emulator.cpu().gpr[0], 42, "translated arithmetic ran before the call");
-            assert_eq!(emulator.cpu().gpr[3], 42, "translated code ran after the HLE return");
+            assert_eq!(emulator.cpu().gpr[6], 42, "esi survived the kernel call unchanged");
+            assert_eq!(
+                emulator.cpu().gpr[7],
+                STATUS_INVALID_PARAMETER,
+                "the export status reached guest eax and translated code ran after the return"
+            );
         }
 
         #[cfg(windows)]
@@ -810,6 +854,20 @@ mod tests {
 
         #[cfg(windows)]
         #[test]
+        fn unimplemented_stub_halts_the_run() {
+            // Ordinal 187 (NtClose) is a registered but unimplemented stub.
+            let code = [0xFF, 0x15, 0x00, 0x12, 0x01, 0x00, 0xC3];
+            let mut emulator = Emulator::new().expect("emulator must initialize");
+            emulator
+                .load_xbe(synthetic_xbe_with(&code, &[0x8000_00BB]))
+                .expect("synthetic XBE must load");
+
+            let stop = emulator.run(16).expect("the run must stop cleanly");
+            assert_eq!(stop, StopReason::UnimplementedKernelExport { ordinal: 187 });
+        }
+
+        #[cfg(windows)]
+        #[test]
         fn zero_budget_reports_exhaustion() {
             let mut emulator = Emulator::new().expect("emulator must initialize");
             emulator
@@ -820,16 +878,59 @@ mod tests {
             assert_eq!(stop, StopReason::BudgetExhausted);
         }
 
-        #[cfg(not(windows))]
+        #[cfg(windows)]
         #[test]
-        fn portable_hosts_stop_with_runtime_incomplete() {
+        fn instructions_straddling_a_page_boundary_still_decode() {
+            // A two-page executable image with `mov edi, 0x11223344` placed so
+            // its five bytes straddle the 0x12000 page boundary, followed by
+            // HalReturnToFirmware. Both pages are mapped, so the fetch must
+            // span them instead of truncating at the boundary.
             let mut emulator = Emulator::new().expect("emulator must initialize");
-            emulator
-                .load_xbe(synthetic_xbe_with(&BOOT_CODE, &BOOT_THUNKS))
-                .expect("synthetic XBE must load");
+            emulator.load_xbe(two_page_straddle_image()).expect("synthetic XBE must load");
+            emulator.cpu_mut().eip = 0x0001_1FFE;
 
-            let stop = emulator.run(16).expect("the run must stop cleanly");
-            assert_eq!(stop, StopReason::RuntimeIncomplete);
+            let stop = emulator.run(16).expect("the straddling block must run");
+            assert_eq!(stop, StopReason::GuestExit { code: 0 });
+            assert_eq!(emulator.cpu().gpr[7], 0x1122_3344, "the straddling mov executed");
+        }
+
+        /// Builds a two-page executable image for the straddle test.
+        fn two_page_straddle_image() -> Vec<u8> {
+            let base = 0x0001_0000_u32;
+            // File: headers to 0x280, then a 0x1400-byte section body.
+            let mut bytes = vec![0_u8; 0x280 + 0x1400];
+            bytes[..4].copy_from_slice(b"XBEH");
+            write_u32(&mut bytes, 0x104, base);
+            write_u32(&mut bytes, 0x108, 0x280);
+            write_u32(&mut bytes, 0x10C, 0x4000);
+            write_u32(&mut bytes, 0x110, 0x178);
+            write_u32(&mut bytes, 0x118, base + 0x178);
+            write_u32(&mut bytes, 0x11C, 1);
+            write_u32(&mut bytes, 0x120, base + 0x200);
+            write_u32(&mut bytes, 0x128, (base + 0x1000) ^ ENTRY_RETAIL_XOR);
+            write_u32(&mut bytes, 0x130, 0x10000);
+            write_u32(&mut bytes, 0x134, 0x100000);
+            write_u32(&mut bytes, 0x138, 0x1000);
+            write_u32(&mut bytes, 0x158, (base + 0x2200) ^ KERNEL_RETAIL_XOR);
+
+            write_u32(&mut bytes, 0x200, XbeSectionFlags::EXECUTABLE.bits());
+            write_u32(&mut bytes, 0x204, base + 0x1000);
+            write_u32(&mut bytes, 0x208, 0x1400);
+            write_u32(&mut bytes, 0x20C, 0x280);
+            write_u32(&mut bytes, 0x210, 0x1400);
+            write_u32(&mut bytes, 0x214, base + 0x238);
+            bytes[0x238..0x23E].copy_from_slice(b".text\0");
+
+            // Section body starts at file 0x280 and guest 0x11000.
+            let body = 0x280;
+            // mov edi, 0x11223344 at guest 0x11FFE (section offset 0xFFE).
+            bytes[body + 0xFFE..body + 0xFFE + 5].copy_from_slice(&[0xBF, 0x44, 0x33, 0x22, 0x11]);
+            // call [0x12200]; ret at guest 0x12003.
+            bytes[body + 0x1003..body + 0x1003 + 7]
+                .copy_from_slice(&[0xFF, 0x15, 0x00, 0x22, 0x01, 0x00, 0xC3]);
+            // Kernel thunk table at guest 0x12200 (section offset 0x1200): HalReturnToFirmware.
+            write_u32(&mut bytes, body + 0x1200, 0x8000_0031);
+            bytes
         }
     }
 }

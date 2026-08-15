@@ -70,6 +70,8 @@ pub enum StopReason {
     UnsupportedInstruction { address: GuestVa },
     /// The emulator reached a missing HLE export.
     MissingKernelExport { ordinal: u16 },
+    /// The emulator reached a registered but unimplemented HLE export.
+    UnimplementedKernelExport { ordinal: u16 },
     /// The configured execution budget expired.
     BudgetExhausted,
     /// The runtime is not implemented yet.

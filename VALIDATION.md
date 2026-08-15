@@ -66,6 +66,12 @@ The direct backend emits and executes the register-only subset on Windows. Memor
 
 Portable hosts create translation plans only. The Cranelift backend reports that it is unavailable.
 
+Runtime guest writes do not yet bump physical-page generations, so self-modifying guest code is not detected during execution. The code cache tracks physical-page generations (ADR 0005); wiring automatic write detection is future work. The milestone title is not self-modifying.
+
+The kernel gate region at `0xFF80_0000` is not reserved in the sidecar page table. The loader controls all guest mappings, so no synthetic path maps there; reserving the region is future hardening.
+
+Registered but unimplemented kernel exports halt the run with `UnimplementedKernelExport` rather than continuing past a stub with an unbalanced guest stack.
+
 The software address space updates physical generation values through an explicit method. Guest writes do not trigger code invalidation automatically.
 
 The XBE loader supports the initial header and section subset. It does not parse certificates, TLS metadata, library tables, or debug metadata.

@@ -21,5 +21,7 @@ cargo exbawks plan .\fixtures\synthetic\minimal-retail.xbe
 cargo exbawks run .\fixtures\synthetic\minimal-retail.xbe
 ```
 
-On Windows the run command reports `GuestExit { code: 0 }` with `EAX`
-holding `0x2A`.
+On Windows the run command reports `GuestExit { code: 0 }`. `ESI` holds
+`0x2A` (translated arithmetic that survived the kernel call), and `EDI`
+holds the status `DbgPrint` returned for the register-only guest's null
+format pointer.

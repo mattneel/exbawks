@@ -353,9 +353,12 @@ fn run(
         });
     }
 
+    let gpr = emulator.cpu().gpr;
     println!("Stop reason:  {stop:?}");
     println!("Final EIP:    {}", GuestVa(emulator.cpu().eip));
-    println!("Final EAX:    0x{:08X}", emulator.cpu().gpr[0]);
+    println!("Final EAX:    0x{:08X}", gpr[0]);
+    println!("Final ESI:    0x{:08X}", gpr[6]);
+    println!("Final EDI:    0x{:08X}", gpr[7]);
     Ok(())
 }
 

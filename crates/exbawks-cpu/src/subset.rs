@@ -1,5 +1,5 @@
 use exbawks_types::GuestVa;
-use iced_x86::{Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
 
 use crate::Gpr;
 
@@ -67,13 +67,15 @@ pub fn classify_register_op(instruction: &Instruction) -> Option<RegisterOp> {
     }
 }
 
-/// Returns the pointer slot of one absolute indirect call.
+/// Returns the pointer slot of one absolute near indirect call.
 ///
-/// Matches the 32-bit `call dword ptr [disp32]` form that patched kernel
-/// thunk calls use.
+/// Matches only the 32-bit near form `call dword ptr [disp32]`
+/// (`Code::Call_rm32`) that patched kernel thunk calls use. The far
+/// indirect form `call m16:32` (`FF /3`) shares the `Call` mnemonic but has
+/// different stack semantics, so it is intentionally rejected.
 #[must_use]
 pub fn indirect_call_slot(instruction: &Instruction) -> Option<GuestVa> {
-    if instruction.mnemonic() != Mnemonic::Call || instruction.op0_kind() != OpKind::Memory {
+    if instruction.code() != Code::Call_rm32 || instruction.op0_kind() != OpKind::Memory {
         return None;
     }
     if instruction.memory_base() != Register::None || instruction.memory_index() != Register::None {
@@ -180,5 +182,29 @@ mod tests {
         assert_eq!(classify(&[0xC3]), None);
         assert_eq!(classify(&[0x66, 0x01, 0xCB]), None);
         assert_eq!(classify(&[0x00, 0xCB]), None);
+    }
+
+    fn first(bytes: &[u8]) -> iced_x86::Instruction {
+        BasicBlockDecoder::default().decode(GuestVa(0x1000), bytes).expect("decodes").instructions
+            [0]
+    }
+
+    #[test]
+    fn indirect_call_slot_matches_only_the_near_form() {
+        // FF /2: call dword ptr [0x00011200] (near indirect).
+        let near = first(&[0xFF, 0x15, 0x00, 0x12, 0x01, 0x00]);
+        assert_eq!(indirect_call_slot(&near), Some(GuestVa(0x0001_1200)));
+
+        // FF /3: call fword ptr [0x00011200] (far indirect) must not match.
+        let far = first(&[0xFF, 0x1D, 0x00, 0x12, 0x01, 0x00]);
+        assert_eq!(indirect_call_slot(&far), None);
+
+        // FF /2 with a register base is not a bare [disp32] slot.
+        let based = first(&[0xFF, 0x10]);
+        assert_eq!(indirect_call_slot(&based), None);
+
+        // A register-only instruction is not a call.
+        let mov = first(&[0x89, 0xD8]);
+        assert_eq!(indirect_call_slot(&mov), None);
     }
 }

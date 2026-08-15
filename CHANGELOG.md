@@ -37,6 +37,18 @@ The project follows Keep a Changelog structure before its first release.
 - A JSON Lines trace writer with sequence numbers and opt-in private host
   paths; `exbawks run --trace <file>` records block entries, kernel calls,
   and the stop reason (`DBG-001`).
+
+### Fixed
+
+- Kernel export status now reaches guest EAX; the runtime places the
+  returned `KernelStatus` in EAX after each gate call.
+- Registered but unimplemented kernel stubs halt the run with a controlled
+  `UnimplementedKernelExport` stop instead of continuing past an unbalanced
+  guest stack.
+- `indirect_call_slot` no longer misclassifies the far `call m16:32` form as
+  a near kernel gate call.
+- Block fetch spans contiguous mapped pages, so an instruction straddling a
+  page boundary decodes instead of aborting the run.
 - Initial Rust workspace scaffold.
 - XBE parser and synthetic tests.
 - Software guest address space.
