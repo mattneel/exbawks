@@ -37,6 +37,8 @@ Implemented components include:
 - Kernel thunk gate patching and runtime gate-call dispatch (`HLE-001`).
 - The startup kernel export set, a guest stack, and the execution loop
   (`HLE-002`).
+- A JSON Lines trace writer with sequence numbers and opt-in private host
+  paths (`DBG-001`).
 - A CLI for host checks, XBE inspection, decoding, thunk inspection, entry
   planning, and synthetic boot execution.
 - Generated public test data that boots to a controlled guest exit.
@@ -66,7 +68,7 @@ Tasks `MEM-001` through `MEM-005`, `JIT-001` through `JIT-003`, `HLE-001`,
 and `HLE-002` are complete. The first execution milestone passes on
 Windows 11 x86-64.
 
-Select the next task from the board: `XBE-001`, `DBG-001`, or `QA-001`.
+Select the next task from the board: `XBE-001` or `QA-001`.
 Memory operand rewriting and fault-site redirection follow per the
 `AGENTS.md` task sequence.
 
