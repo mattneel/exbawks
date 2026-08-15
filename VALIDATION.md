@@ -64,6 +64,8 @@ Future vectored exception redirection still needs verification.
 
 The direct backend emits and executes the register-only subset on Windows. Memory operands, guest control flow, and fault redirection remain untranslated; blocks that reach them exit through the runtime.
 
+The loader accepts genuine retail XBEs whose sections are byte-contiguous and share boundary pages (ADR 0007). A real retail image loads, decodes, and executes up to its first memory-operand or control-flow instruction, then stops with `UnsupportedInstruction`. Real titles reach memory operands almost immediately, so translated execution of a commercial title needs the next JIT tier.
+
 Portable hosts create translation plans only. The Cranelift backend reports that it is unavailable.
 
 Runtime guest writes do not yet bump physical-page generations, so self-modifying guest code is not detected during execution. The code cache tracks physical-page generations (ADR 0005); wiring automatic write detection is future work. The milestone title is not self-modifying.

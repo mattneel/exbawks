@@ -39,6 +39,8 @@ Implemented components include:
   (`HLE-002`).
 - A JSON Lines trace writer with sequence numbers and opt-in private host
   paths (`DBG-001`).
+- Contiguous XBE section mapping with merged shared-page permissions, so
+  genuine retail images load (ADR 0007).
 - A CLI for host checks, XBE inspection, decoding, thunk inspection, entry
   planning, and synthetic boot execution.
 - Generated public test data that boots to a controlled guest exit.
