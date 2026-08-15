@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 exbawks-cpu.workspace = true
 exbawks-memory.workspace = true
+exbawks-platform.workspace = true
 exbawks-types.workspace = true
 iced-x86.workspace = true
 parking_lot.workspace = true

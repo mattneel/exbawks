@@ -57,9 +57,11 @@ Crate dependency direction (lower crates must never depend on `exbawks-core`):
 - `exbawks-types` — root; shared newtypes only. `GuestVa` / `GuestPa` / `GuestPage` / `GuestRange`
   are distinct types so virtual-vs-physical confusion is a compile error; host pointers never enter
   guest state. Also `MemoryPermissions`, `AccessKind`, `BackendKind`, `BuildFlavor`.
-- `exbawks-platform` — owns all host OS calls; the only crate with unsafe code
+- `exbawks-platform` — owns all host OS calls and nearly all unsafe code
   (`virtual_memory/imp/windows.rs`: `VirtualAlloc2` placeholders, pagefile sections,
-  `MapViewOfFile3` replace-placeholder views, all RAII-wrapped).
+  `MapViewOfFile3` replace-placeholder views; `code_memory.rs`: W^X code buffers — all
+  RAII-wrapped). The only other unsafe module is `exbawks-jit/src/dispatch.rs`, which
+  enters sealed code buffers under the ADR 0006 block ABI.
 - `exbawks-xbe` — checked parsing of untrusted XBE files; every read is bounds-checked, entry point
   and kernel-thunk address are XOR-obfuscated per build flavor (retail/debug) and must decode inside
   the image.

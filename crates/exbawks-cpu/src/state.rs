@@ -97,6 +97,19 @@ pub struct CpuState {
 }
 
 impl CpuState {
+    /// The byte offset of the general-purpose register file.
+    pub const GPR_OFFSET: usize = core::mem::offset_of!(CpuState, gpr);
+    /// The byte offset of the guest instruction pointer.
+    pub const EIP_OFFSET: usize = core::mem::offset_of!(CpuState, eip);
+    /// The byte offset of the guest EFLAGS value.
+    pub const EFLAGS_OFFSET: usize = core::mem::offset_of!(CpuState, eflags);
+
+    /// Returns the byte offset of one general-purpose register.
+    #[must_use]
+    pub const fn gpr_offset(register: Gpr) -> usize {
+        Self::GPR_OFFSET + (register as usize) * 4
+    }
+
     /// Reads one general-purpose register.
     #[must_use]
     pub const fn get(&self, register: Gpr) -> u32 {

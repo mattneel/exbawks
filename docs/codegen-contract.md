@@ -12,9 +12,7 @@ The dispatcher calls generated code through one architecture-specific entry stub
 
 The entry stub receives one pointer to `CpuState`.
 
-The initial backend keeps the pointer in a reserved nonvolatile host register.
-
-The exact register remains open until `JIT-002` starts.
+ADR 0006 fixes the first ABI: `extern "C" fn(*mut CpuState) -> u64` on x86-64 Windows. The pointer arrives in `RCX` and stays there for the block lifetime. First-subset blocks are leaf functions with `RAX` and `RDX` as scratch registers.
 
 ## Guest values
 
@@ -90,6 +88,8 @@ Initial exit kinds are:
 - Memory slow path.
 - Unsupported instruction.
 - Budget exhaustion.
+
+The exit value returns in `RAX`. The low 32 bits select the exit kind in the order above, starting at zero. The high 32 bits stay zero. The epilogue writes the successor `EIP` into `CpuState` before the return.
 
 The dispatcher owns cross-block linking until safe patching lands.
 

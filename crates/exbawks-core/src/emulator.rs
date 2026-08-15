@@ -379,6 +379,15 @@ mod tests {
         assert_eq!(image.image().header.build_flavor, BuildFlavor::Retail);
         assert_eq!(plan.decoded.instructions.len(), 2);
         assert_eq!(plan.compiled.plan.actions.len(), 2);
+
+        // Windows hosts emit executable code; portable hosts keep the plan.
+        #[cfg(windows)]
+        {
+            use exbawks_jit::CompilationState;
+            assert_eq!(plan.compiled.state, CompilationState::Executable);
+            assert!(!plan.compiled.machine_code.is_empty());
+        }
+        #[cfg(not(windows))]
         assert!(plan.compiled.machine_code.is_empty());
     }
 

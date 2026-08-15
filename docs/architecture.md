@@ -72,7 +72,7 @@ exbawks-types
     +-- exbawks-gpu
 
 exbawks-memory --> exbawks-platform
-exbawks-jit    --> exbawks-cpu + exbawks-memory
+exbawks-jit    --> exbawks-cpu + exbawks-memory + exbawks-platform
 exbawks-kernel --> exbawks-cpu + exbawks-memory
 exbawks-core   --> all subsystem crates
 exbawks-cli    --> exbawks-core and inspection crates

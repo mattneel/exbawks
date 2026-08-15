@@ -1,7 +1,8 @@
 use exbawks_cpu::DecodedBlock;
+use exbawks_platform::PlatformError;
 use exbawks_types::BackendKind;
 
-use crate::{DirectRewritePlanner, JitError, TranslationPlan};
+use crate::{DirectEmitter, DirectRewritePlanner, EmittedBlock, JitError, TranslationPlan};
 
 /// The state of a compiled block artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,7 +14,7 @@ pub enum CompilationState {
 }
 
 /// A translation artifact stored by the code cache.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct CompiledBlock {
     /// The translation plan.
     pub plan: TranslationPlan,
@@ -21,6 +22,8 @@ pub struct CompiledBlock {
     pub machine_code: Box<[u8]>,
     /// The current artifact state.
     pub state: CompilationState,
+    /// The sealed executable block on supported hosts.
+    pub executable: Option<EmittedBlock>,
 }
 
 /// A dynamic code-generation backend.
@@ -36,6 +39,7 @@ pub trait CodegenBackend: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DirectRewriteBackend {
     planner: DirectRewritePlanner,
+    emitter: DirectEmitter,
 }
 
 impl CodegenBackend for DirectRewriteBackend {
@@ -48,11 +52,23 @@ impl CodegenBackend for DirectRewriteBackend {
             return Err(JitError::EmptyBlock);
         }
 
-        Ok(CompiledBlock {
-            plan: self.planner.plan(block),
-            machine_code: Box::default(),
-            state: CompilationState::Planned,
-        })
+        let plan = self.planner.plan(block);
+        match self.emitter.emit(block) {
+            Ok(emitted) => Ok(CompiledBlock {
+                plan,
+                machine_code: emitted.machine_code().into(),
+                state: CompilationState::Executable,
+                executable: Some(emitted),
+            }),
+            // Hosts without executable-memory support keep the plan.
+            Err(JitError::Platform(PlatformError::Unsupported(_))) => Ok(CompiledBlock {
+                plan,
+                machine_code: Box::default(),
+                state: CompilationState::Planned,
+                executable: None,
+            }),
+            Err(error) => Err(error),
+        }
     }
 }
 

@@ -195,6 +195,7 @@ version = "0.1.0"
 dependencies = [
  "exbawks-cpu",
  "exbawks-memory",
+ "exbawks-platform",
  "exbawks-types",
  "iced-x86",
  "parking_lot",

@@ -20,6 +20,9 @@ The project follows Keep a Changelog structure before its first release.
   plus generated equivalence tests against the software backend (`MEM-005`).
 - Single-owner executable code buffers with separate write and execute
   phases, sealing, and instruction-cache flushes (`JIT-001`).
+- Register-only direct emission and a dispatcher under the ADR 0006 block
+  ABI, verified against an interpreter oracle; `exbawks plan` now reports
+  the `Executable` state on Windows (`JIT-002`).
 - Initial Rust workspace scaffold.
 - XBE parser and synthetic tests.
 - Software guest address space.

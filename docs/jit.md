@@ -117,6 +117,6 @@ The repository implements block decoding, instruction classification, planning, 
 
 The platform crate owns executable memory. `WritableCodeBuffer` accepts code while writable and non-executable. `seal` consumes the writable owner, marks the pages execute-read, and flushes the host instruction cache. The sealed owner exposes no mutation.
 
-The repository does not emit translated guest code yet.
+The direct emitter translates the register-only subset from ADR 0006: `NOP`, register and immediate `MOV`, and register and immediate `ADD`, `SUB`, `AND`, `OR`, and `XOR`. Guest registers spill through the `CpuState` pointer, guest arithmetic flags materialize after every flag-writing instruction, and every block returns through one dispatcher exit. An interpreter oracle in `exbawks-cpu` verifies every operation and its flags.
 
-The first executable subset will contain register-only integer operations and an explicit return to the dispatcher.
+Memory operands, control flow, and cross-block linking remain untranslated. Blocks that reach them exit with the unsupported-instruction code and the untranslated guest address.
