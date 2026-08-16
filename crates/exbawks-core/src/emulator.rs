@@ -766,6 +766,18 @@ impl Emulator {
         let action = self.threads.as_mut().and_then(ThreadManager::take_pending)?;
         match action {
             PendingAction::Exit { status } => self.exit_current_thread(status),
+            PendingAction::Wait { handle } => {
+                let cpu = &mut self.cpu;
+                let parked =
+                    self.threads.as_mut().is_some_and(|threads| threads.park_active(handle, cpu));
+                // The wait service only reports Pending when another thread
+                // is runnable, so a failed park cannot strand the guest;
+                // continuing on the caller is the safe fallback.
+                if !parked {
+                    tracing::warn!(handle, "a pending wait found no runnable thread");
+                }
+                None
+            }
         }
     }
 
@@ -899,20 +911,33 @@ impl Emulator {
 
         let tick_cell = self.threads.as_ref().and_then(ThreadManager::tick_count_cell);
         let mut last_tick = std::time::Instant::now();
-        let mut advance_clock = |memory: &SoftwareAddressSpace| {
+        // Advances both guest clocks by wall time: the KeTickCount cell
+        // (milliseconds) and the virtual TSC that KeQuerySystemTime derives
+        // from (100 ns units — frozen otherwise under WHP, where the
+        // interpreter that normally advances it only runs for MMIO steps;
+        // DirectSound's time-based startup waits forever on a frozen clock).
+        fn advance_clock(
+            memory: &SoftwareAddressSpace,
+            cpu: &mut CpuState,
+            tick_cell: Option<GuestVa>,
+            last_tick: &mut std::time::Instant,
+        ) {
             let elapsed = last_tick.elapsed();
             let ticks = u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX);
-            if ticks > 0
-                && let Some(cell) = tick_cell
-                && let Ok(current) = memory.read_u32(cell)
-            {
-                let _ = memory.write_u32(cell, current.wrapping_add(ticks));
-                last_tick += std::time::Duration::from_millis(u64::from(ticks));
+            if ticks > 0 {
+                if let Some(cell) = tick_cell
+                    && let Ok(current) = memory.read_u32(cell)
+                {
+                    let _ = memory.write_u32(cell, current.wrapping_add(ticks));
+                }
+                cpu.tsc = cpu.tsc.wrapping_add(u64::from(ticks) * 10_000);
+                *last_tick += std::time::Duration::from_millis(u64::from(ticks));
             }
-        };
+        }
 
         let mut relaunches = 0_u32;
         let mut serviced = 0_usize;
+        let mut cancels = 0_u64;
         // How many identified DSP mailbox pages are out of the partition.
         fn unmap_mailboxes(
             devices: &crate::mmio::DeviceSpace,
@@ -932,6 +957,42 @@ impl Emulator {
         }
         let mut mailboxes_applied = 0_usize;
         unmap_mailboxes(&self.devices, &mut machine, &mut mailboxes_applied, true)?;
+        // Alias the claimed GPU instance region at the PRAMIN window so the
+        // guest's instance-memory traffic is plain RAM, not exits (ADR 0013
+        // exit economics). Applied once the claim exists.
+        let mut pramin_mapped = false;
+        let map_pramin = |emulator_memory: &std::sync::Arc<SoftwareAddressSpace>,
+                          devices: &crate::mmio::DeviceSpace,
+                          threads: &Option<ThreadManager>,
+                          machine: &mut exbawks_whp::Machine,
+                          mapped: &mut bool|
+         -> Result<(), CoreError> {
+            if *mapped {
+                return Ok(());
+            }
+            if let Some((base, size)) = threads.as_ref().and_then(ThreadManager::gpu_instance) {
+                let physical = u64::from(base.0 & 0x1FFF_FFFF);
+                let bytes = u64::from(size).div_ceil(4096) * 4096;
+                devices.set_pramin(base.0, size);
+                machine
+                    .map_address_space(
+                        emulator_memory,
+                        physical,
+                        0xFD70_0000,
+                        bytes,
+                        exbawks_whp::MapFlags::READ_WRITE,
+                    )
+                    .map_err(|error| CoreError::Hypervisor(error.to_string()))?;
+                tracing::debug!(
+                    base = format_args!("{:#010x}", base.0),
+                    size,
+                    "PRAMIN aliased to the GPU instance claim"
+                );
+                *mapped = true;
+            }
+            Ok(())
+        };
+        map_pramin(&self.memory, &self.devices, &self.threads, &mut machine, &mut pramin_mapped)?;
         while serviced < max_exits {
             let exit = machine.run().map_err(|error| CoreError::Hypervisor(error.to_string()))?;
             let exit_rip = machine.exit_context().rip;
@@ -940,17 +1001,33 @@ impl Emulator {
                     // The pump doubles as a sampling profiler: the exit RIP
                     // is wherever the guest was interrupted.
                     if tracing::enabled!(tracing::Level::TRACE) {
-                        let rbx = machine
-                            .get_registers(&[exbawks_whp::Register::Rbx])
-                            .map(|values| values[0].low)
-                            .unwrap_or(0);
+                        let sampled = machine
+                            .get_registers(&[exbawks_whp::Register::Rbx, exbawks_whp::Register::Fs])
+                            .unwrap_or_default();
+                        let rbx = sampled.first().map(|value| value.low).unwrap_or(0);
+                        let fs_base = sampled.get(1).map(|value| value.low).unwrap_or(0);
                         tracing::trace!(
                             rip = format_args!("{exit_rip:#010x}"),
                             rbx = format_args!("{rbx:#010x}"),
+                            fs = format_args!("{fs_base:#010x}"),
                             "whp cancel sample"
                         );
                     }
-                    advance_clock(&self.memory);
+                    advance_clock(&self.memory, &mut self.cpu, tick_cell, &mut last_tick);
+                    // Every few cancellations is a time slice (ADR 0017):
+                    // rotate ready threads so a compute-only loop cannot
+                    // starve the rest of the guest.
+                    cancels += 1;
+                    if cancels.is_multiple_of(4) {
+                        self.whp_read_cpu(&mut machine)?;
+                        let rotated = self
+                            .threads
+                            .as_mut()
+                            .is_some_and(|threads| threads.rotate_active(&mut self.cpu));
+                        if rotated {
+                            self.whp_write_cpu(&mut machine)?;
+                        }
+                    }
                     continue;
                 }
                 exbawks_whp::WhpExit::MemoryAccess(access) => {
@@ -1042,7 +1119,7 @@ impl Emulator {
                     // shape (CORE-004).
                     self.whp_read_cpu(&mut machine)?;
                     self.cpu.eip = fault_va;
-                    advance_clock(&self.memory);
+                    advance_clock(&self.memory, &mut self.cpu, tick_cell, &mut last_tick);
                     if let Some(stop) = self.dispatch_gate_by_eip(ordinal, GuestVa(fault_va))? {
                         if let StopReason::Reboot { .. } = stop
                             && relaunches < MAX_RELAUNCHES
@@ -1069,7 +1146,47 @@ impl Emulator {
                         // must come back out.
                         unmap_mailboxes(&self.devices, &mut machine, &mut mailboxes_applied, true)?;
                     }
+                    map_pramin(
+                        &self.memory,
+                        &self.devices,
+                        &self.threads,
+                        &mut machine,
+                        &mut pramin_mapped,
+                    )?;
                     self.whp_write_cpu(&mut machine)?;
+                }
+                exbawks_whp::WhpExit::IoPort(io) => {
+                    serviced += 1;
+                    if io.string_op {
+                        return Err(CoreError::Hypervisor(format!(
+                            "unhandled string port I/O at rip {exit_rip:#x}"
+                        )));
+                    }
+                    let width_mask: u64 = match io.access_size {
+                        1 => 0xFF,
+                        2 => 0xFFFF,
+                        _ => 0xFFFF_FFFF,
+                    };
+                    let length = u64::from(machine.exit_context().instruction_length());
+                    let next_rip = (
+                        exbawks_whp::Register::Rip,
+                        exbawks_whp::RegisterValue::scalar(exit_rip.wrapping_add(length)),
+                    );
+                    let writes = if io.is_write {
+                        self.devices.port_write(io.port, (io.rax & width_mask) as u32);
+                        vec![next_rip]
+                    } else {
+                        let value = u64::from(self.devices.port_read(io.port)) & width_mask;
+                        let rax = (io.rax & !width_mask) | value;
+                        vec![
+                            next_rip,
+                            (exbawks_whp::Register::Rax, exbawks_whp::RegisterValue::scalar(rax)),
+                        ]
+                    };
+                    machine
+                        .set_registers(&writes)
+                        .map_err(|error| CoreError::Hypervisor(error.to_string()))?;
+                    continue;
                 }
                 exbawks_whp::WhpExit::Exception(exception) => {
                     self.whp_read_cpu(&mut machine)?;

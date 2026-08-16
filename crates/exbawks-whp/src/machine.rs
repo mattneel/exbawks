@@ -180,11 +180,28 @@ pub struct GuestException {
     pub parameter: u64,
 }
 
+/// One port-I/O exit's decoded payload (non-string forms).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoPortAccess {
+    /// The 16-bit port number.
+    pub port: u16,
+    /// True for `OUT`, false for `IN`.
+    pub is_write: bool,
+    /// The access width in bytes (1, 2, or 4).
+    pub access_size: u8,
+    /// True for the string/rep forms (`INS`/`OUTS`), which carry more state.
+    pub string_op: bool,
+    /// The guest RAX at exit (the OUT value source / IN destination).
+    pub rax: u64,
+}
+
 /// One decoded virtual-processor exit.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WhpExit {
     /// The guest executed `HLT`.
     Halt,
+    /// The guest executed a port I/O instruction.
+    IoPort(IoPortAccess),
     /// The guest touched an unmapped or protected guest physical address.
     MemoryAccess(MemoryAccess),
     /// The guest raised an intercepted exception.
@@ -202,6 +219,7 @@ pub enum WhpExit {
 /// Exit reason codes (`WHV_RUN_VP_EXIT_REASON`).
 mod exit_reason {
     pub const MEMORY_ACCESS: u32 = 0x0000_0001;
+    pub const IO_PORT_ACCESS: u32 = 0x0000_0002;
     pub const UNRECOVERABLE_EXCEPTION: u32 = 0x0000_0004;
     pub const INVALID_VP_REGISTER_VALUE: u32 = 0x0000_0005;
     pub const X64_HALT: u32 = 0x0000_0008;
@@ -550,6 +568,7 @@ impl Machine {
             exit_reason::MEMORY_ACCESS => {
                 WhpExit::MemoryAccess(decode_memory_access(&self.exit.payload))
             }
+            exit_reason::IO_PORT_ACCESS => WhpExit::IoPort(decode_io_port(&self.exit.payload)),
             exit_reason::EXCEPTION => WhpExit::Exception(decode_exception(&self.exit.payload)),
             exit_reason::INVALID_VP_REGISTER_VALUE => WhpExit::InvalidRegisterValue,
             exit_reason::UNRECOVERABLE_EXCEPTION => WhpExit::UnrecoverableException,
@@ -583,6 +602,22 @@ impl Drop for Machine {
             }
             let _ = (self.api.delete_partition)(self.partition);
         }
+    }
+}
+
+/// Decodes a `WHV_X64_IO_PORT_ACCESS_CONTEXT` payload (per
+/// WinHvPlatformDefs.h: access info at 20 — `IsWrite` bit 0, `AccessSize`
+/// bits 1..4, `StringOp` bit 4 — port at 24, `Rax` at 32).
+fn decode_io_port(payload: &[u8; 96]) -> IoPortAccess {
+    let access_info = u32::from_le_bytes([payload[20], payload[21], payload[22], payload[23]]);
+    let mut quad = [0_u8; 8];
+    quad.copy_from_slice(&payload[32..40]);
+    IoPortAccess {
+        port: u16::from_le_bytes([payload[24], payload[25]]),
+        is_write: access_info & 1 != 0,
+        access_size: ((access_info >> 1) & 0x7) as u8,
+        string_op: access_info & 0x10 != 0,
+        rax: u64::from_le_bytes(quad),
     }
 }
 

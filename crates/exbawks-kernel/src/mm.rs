@@ -60,7 +60,10 @@ impl KernelExport for MmClaimGpuInstanceMemory {
         if padding_out != 0 {
             let _ = context.memory.write_u32(GuestVa(padding_out), 0);
         }
-        allocate(context, bytes.max(GUEST_PAGE_SIZE))
+        match context.services.claim_gpu_instance(bytes.max(GUEST_PAGE_SIZE)) {
+            Ok(address) => KernelStatus(address.0),
+            Err(_) => KernelStatus(0),
+        }
     }
 }
 

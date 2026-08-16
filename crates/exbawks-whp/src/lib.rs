@@ -19,7 +19,7 @@ mod machine;
 pub use api::WhpError;
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub use machine::{
-    Canceller, GuestException, HostRegion, Machine, MapFlags, MemoryAccess, Register,
+    Canceller, GuestException, HostRegion, IoPortAccess, Machine, MapFlags, MemoryAccess, Register,
     RegisterValue, VpExitContext, WhpExit,
 };
 

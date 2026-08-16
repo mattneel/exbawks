@@ -23,7 +23,71 @@ pub(crate) fn register_irql_exports(registry: &KernelRegistry) -> Result<(), Ker
     registry.register(HalGetInterruptVector)?;
     registry.register(KeInitializeInterrupt)?;
     registry.register(KeConnectInterrupt)?;
+    registry.register(HalReadWritePCISpace)?;
     Ok(())
+}
+
+/// Reads or writes PCI configuration space.
+///
+/// Reads serve a synthetic NV2A identity (vendor `0x10DE`, device `0x02A0`)
+/// at register 0 and zeros elsewhere; writes are ignored. Titles probe the
+/// GPU's identity during Direct3D initialization.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HalReadWritePCISpace;
+
+impl KernelExport for HalReadWritePCISpace {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::HAL_READ_WRITE_PCI_SPACE
+    }
+
+    fn name(&self) -> &'static str {
+        "HalReadWritePCISpace"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        24
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        use crate::startup::stack_argument;
+
+        // HalReadWritePCISpace(BusNumber, SlotNumber, RegisterNumber,
+        //                      Buffer, Length, WritePCISpace).
+        let register = stack_argument(context, 2).unwrap_or(0);
+        let buffer = stack_argument(context, 3).unwrap_or(0);
+        let length = stack_argument(context, 4).unwrap_or(0);
+        let write = stack_argument(context, 5).unwrap_or(0) & 0xFF != 0;
+        if write || buffer == 0 {
+            return KernelStatus::SUCCESS;
+        }
+
+        // A synthetic NV2A config space: identity, enabled command
+        // register, and the register/framebuffer BARs a driver reads to
+        // locate the device. Zeros elsewhere.
+        fn config_byte(offset: u32) -> u8 {
+            const NV2A_ID: u32 = 0x02A0_10DE;
+            /// I/O, memory, and bus-master enable.
+            const COMMAND: u32 = 0x0000_0007;
+            /// BAR0: the register block (32-bit memory BAR).
+            const BAR0: u32 = 0xFD00_0000;
+            /// BAR1: the RAM/framebuffer aperture (prefetchable).
+            const BAR1: u32 = 0xF000_0008;
+            let (dword, byte) = (offset / 4, (offset % 4) as usize);
+            match dword {
+                0 => NV2A_ID.to_le_bytes()[byte],
+                1 => COMMAND.to_le_bytes()[byte],
+                4 => BAR0.to_le_bytes()[byte],
+                5 => BAR1.to_le_bytes()[byte],
+                _ => 0,
+            }
+        }
+        let capped = length.min(256);
+        for offset in 0..capped {
+            let byte = config_byte(register.wrapping_add(offset));
+            let _ = context.memory.write(GuestVa(buffer + offset), &[byte]);
+        }
+        KernelStatus::SUCCESS
+    }
 }
 
 /// Fills a guest `KINTERRUPT` object.

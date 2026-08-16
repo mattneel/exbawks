@@ -174,18 +174,36 @@ Two active threads:
    survives), which completed DirectSound initialization, and
    `MmClaimGpuInstanceMemory` landed — Direct3D is initializing.
 
-   **Current DC3 state (WHP tier): a quiet 10-minute native run.** No stop,
-   no exit storms, no dominant spin RIP — cancel-pump samples spread across
-   D3DX (`0x1D4xxx`), DSOUND work loops (`0x20C2xx`, `0x2160xx`), and XAPI
-   (`0x1ACxxx`). Either the game genuinely churns (asset staging) or the
-   main thread waits on cross-subsystem state while a worker spins politely.
-   Next: sample longer and by THREAD (add the fs base or a thread id to the
-   cancel sample), check whether NV2A register traffic ever starts (the GPU
-   stub would log it: `RUST_LOG=exbawks_core::mmio=trace`, region=Gpu), and
-   drive toward the D3D init path — the GPU frontier is where the graphics
-   HLE (`GraphicsFrontend`) picks up and the screenshot command lands. The
-   interpreter tier remains the deterministic oracle (frontier: `movss` at
-   `0x1685A0`).
+   That quiet run was two things: DirectSound's sample-mixer thread
+   (`fs=0x80223000`, loop `0x216017`) monopolizing the cooperative
+   scheduler, and the main thread waiting on an event nobody could signal.
+   Both fixed: **ADR 0017 preemptive time slices** (the cancel pump rotates
+   ready threads) and **real blocking waits**
+   (`NtWaitForSingleObject`/`Ex` park on a `Waiting` state; `NtSetEvent` and
+   thread exit wake them; no-runnable-thread → `STATUS_TIMEOUT`). Then D3D
+   init advanced through: `PRAMIN` RAM aliasing of the GPU instance claim,
+   wall-time TSC advance, serviced **port I/O** (new WHP exit `0x2`,
+   latching port model), and `HalReadWritePCISpace` (synthetic NV2A config
+   with real BARs).
+
+   **Current DC3 wall (WHP tier): the cached physical window (ADR 0010).**
+   Fault: write to `ds:[0x8000_0000]` at guest `0x1CD82F` (D3D's GPU init
+   touching the window base, physical page 0). The Xbox maps a cached
+   window where `VA = 0x8000_0000 | PA` aliasing *all* of physical RAM, but
+   the current `allocate_kernel_block` places kernel blocks at
+   `0x8010_0000+` with independently bump-allocated physical pages, so the
+   window invariant does not hold and low window addresses are unmapped.
+   **Next: make the kernel window real** — either map the whole
+   `[0x8000_0000, 0x8000_0000+ram)` range as an alias of physical `[0, ram)`
+   at boot AND allocate kernel blocks so their VA satisfies
+   `VA = 0x8000_0000 | PA` (the two must agree — today they conflict), or
+   the narrower fix of mapping the specific low-window pages D3D touches.
+   The clean version is the ADR 0010 design; it moves the KPCR/kernel-var
+   addresses, so re-verify the boot layout. After the window, the GPU
+   register model (`region=Gpu` traffic is already flowing —
+   `RUST_LOG=exbawks_core::mmio=trace`) is the graphics frontier where
+   `GraphicsFrontend` and the screenshot command land. The interpreter tier
+   remains the deterministic oracle (frontier: `movss` at `0x1685A0`).
 
 2. **Kernel HLE burndown** (substrate-independent, needed under either
    engine). Done this session, in order the retail image demanded them:

@@ -260,6 +260,28 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- The Direct3D-init burndown on the hypervisor tier. The GPU instance
+  claim now backs the NV2A `PRAMIN` window: the engine aliases the claimed
+  region into the partition (and the interpreter's device view redirects
+  `PRAMIN` to it), so instance-memory traffic is plain RAM instead of
+  per-access exits. Both guest clocks advance from wall time on the WHP
+  tier (`KeTickCount` and the `KeQuerySystemTime` TSC — the interpreter
+  that normally ticks the TSC only runs for MMIO steps here, so a
+  time-based startup would otherwise wait on a frozen clock). Port I/O
+  exits are serviced against a latching port model (the VGA CRTC path
+  D3D drives), and `HalReadWritePCISpace` serves a synthetic NV2A PCI
+  configuration space (identity `0x02A0_10DE`, enabled command register,
+  register/framebuffer BARs).
+- Preemptive time slices on the hypervisor tier (ADR 0017): the cancel
+  pump rotates ready guest threads round-robin every few cancellations, so
+  a compute-only thread (DirectSound's sample mixer) can no longer starve
+  the rest of the guest — the flaw the cooperative-only ADR 0011 scheduler
+  hit once real work ran deep. Blocking waits became real to match:
+  `NtWaitForSingleObject`/`NtWaitForSingleObjectEx` park the caller on an
+  event or thread handle (a new `Waiting` thread state), `NtSetEvent` and
+  thread exit wake the parked waiters, and a wait with no other runnable
+  thread reports `STATUS_TIMEOUT` rather than deadlocking. The interpreter
+  tier stays purely cooperative and deterministic.
 - The DSP mailbox refined to write-through semantics: writes land in RAM
   and only the most recently written cell (the polled FIFO head) reads as
   consumed, so setup data sharing the comm page survives. DirectSound's

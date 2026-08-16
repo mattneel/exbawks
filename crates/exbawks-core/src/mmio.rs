@@ -72,7 +72,15 @@ pub struct DeviceSpace {
     mailbox_pages: Mutex<Vec<u32>>,
     /// The most recently written mailbox cell (the FIFO head being polled).
     mailbox_head: Mutex<Option<u32>>,
+    /// The claimed GPU instance region backing the `PRAMIN` window:
+    /// (kernel-window VA, size). Accesses through `PRAMIN` redirect here.
+    pramin: Mutex<Option<(u32, u32)>>,
+    /// Latched I/O port values (VGA CRTC and friends).
+    ports: Mutex<std::collections::HashMap<u16, u32>>,
 }
+
+/// The NV2A `PRAMIN` window: the GPU instance-memory aperture.
+const PRAMIN_BASE: u32 = 0xFD70_0000;
 
 /// The APU register receiving the GP comm region's physical base address.
 const APU_GP_COMM_BASE: u32 = 0xFE82_0808;
@@ -175,6 +183,43 @@ impl DeviceSpace {
         );
     }
 
+    /// Serves one port read: the latched value, or zero when unwritten.
+    pub fn port_read(&self, port: u16) -> u32 {
+        let value = self
+            .ports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&port)
+            .copied()
+            .unwrap_or(0);
+        tracing::trace!(port = format_args!("{port:#06x}"), value, "port read");
+        value
+    }
+
+    /// Accepts one port write, latching it for readback.
+    pub fn port_write(&self, port: u16, value: u32) {
+        tracing::trace!(port = format_args!("{port:#06x}"), value, "port write");
+        self.ports.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(port, value);
+    }
+
+    /// Backs the `PRAMIN` window with the claimed instance region.
+    pub fn set_pramin(&self, base_va: u32, size: u32) {
+        *self.pramin.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((base_va, size));
+    }
+
+    /// Translates a `PRAMIN`-window address to its backing RAM VA.
+    fn pramin_target(&self, address: u32, len: usize) -> Option<u32> {
+        let (base_va, size) =
+            (*self.pramin.lock().unwrap_or_else(std::sync::PoisonError::into_inner))?;
+        let offset = address.checked_sub(PRAMIN_BASE)?;
+        if u64::from(offset) + len as u64 <= u64::from(size) {
+            Some(base_va + offset)
+        } else {
+            None
+        }
+    }
+
     /// The identified DSP mailbox pages.
     #[must_use]
     pub fn mailbox_pages(&self) -> Vec<u32> {
@@ -242,6 +287,9 @@ impl<'a> MmioView<'a> {
 
 impl GuestMemory for MmioView<'_> {
     fn read(&self, address: GuestVa, output: &mut [u8]) -> Result<(), MemoryError> {
+        if let Some(target) = self.devices.pramin_target(address.0, output.len()) {
+            return self.ram.read(GuestVa(target), output);
+        }
         if self.devices.in_mailbox(address.0, output.len()) {
             if self.devices.mailbox_consumed(address.0) {
                 // The infinitely fast DSP consumed the FIFO head.
@@ -263,6 +311,9 @@ impl GuestMemory for MmioView<'_> {
     }
 
     fn write(&self, address: GuestVa, input: &[u8]) -> Result<(), MemoryError> {
+        if let Some(target) = self.devices.pramin_target(address.0, input.len()) {
+            return self.ram.write(GuestVa(target), input);
+        }
         if self.devices.in_mailbox(address.0, input.len()) {
             // The write lands, and the cell becomes the consumed FIFO head.
             self.devices.consume_mailbox_write(address.0);
