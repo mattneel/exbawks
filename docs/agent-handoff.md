@@ -111,18 +111,31 @@ missing burndown across CPU/kernel/GPU surfaces (DC3: 24/4/124 of 152 imports).
 
 Two active threads:
 
-1. **WHP-M0 spike** (the make-or-break for the pivot): in `exbawks-whp`, add
-   a dynamically-loaded `WhpApi` (all partition/vcpu/memory/register
-   functions via `LoadLibrary`+`GetProcAddress` — never raw-dylib, or the CLI
-   stops launching on non-WHP hosts), RAII `Partition`/`Vcpu`, `map_gpa`, and
-   the 32-bit protected-mode boot register set from `docs/whp-notes.md`
-   (CS `0xC09B` / DS `0xC093`, CR0=PE, EFER=0, RFLAGS=2). First test: map a
-   page holding `HLT`, boot the vCPU at it, expect `WHvRunVpExitReasonX64Halt`.
-   Then the gate-trap: leave `0xFF80_0000+ord*4` unmapped, `call [slot]`,
-   expect a `MemoryAccess` exit whose GPA yields the ordinal. Guard tests
-   with `cfg(all(windows, target_arch="x86_64"))` and a runtime
-   `probe_whp().usable()` skip. Watch the XSAVE-size gotcha and the segment
-   attribute bits.
+1. **WHP-M0 spike: DONE, verified on hardware.** `exbawks-whp` now has the
+   dynamically loaded `WhpApi` (never raw-dylib), the RAII `Machine`
+   (partition + one vCPU, strict bring-up order, vCPU deleted before
+   partition), `HostRegion` + `map_gpa`/`unmap_gpa`, register set/get, the
+   flat 32-bit boot state, and a decoded exit surface. Hardware tests prove:
+   `HLT` → `X64Halt` (RIP reported *past* the halt), an unmapped gate read →
+   `MemoryAccess` with the exact GPA `0xFF80_0008` + `GpaUnmapped`, an
+   unmapped fetch → execute-type fault, and register round-trips. An
+   adversarial review against the installed SDK headers caught
+   mistranscribed register names (`Cr0` was addressing the TPR; `Efer` is
+   `0x2001`), a `map_gpa` lifetime hole (the machine now owns mapped
+   regions), and non-page-granular sizes — all fixed and re-proven on
+   hardware; the hard-won platform findings live in `docs/whp-notes.md`
+   ("Verified on hardware").
+
+   **WHP-M1 (next): drive the real boot through the machine.** Bridge
+   `exbawks-core` to the tier: map the `SoftwareAddressSpace` physical
+   buffer into the partition (needs a stable page-aligned host allocation —
+   the current `Vec<u8>` physical store is NOT page-aligned or address-stable
+   enough; either mint the RAM in a `HostRegion`-like allocation or move to
+   the `exbawks-platform` section machinery), load the XBE as today, set the
+   boot state from `CpuState`, and service `MemoryAccess` exits: gate GPAs
+   dispatch kernel exports (registers sync WHP↔`CpuState` around the call),
+   other unmapped GPAs are faults. SSE/x87 then run natively — the current
+   `movss` wall disappears. Keep the interpreter as the oracle tier.
 
 2. **Kernel HLE burndown** (substrate-independent, needed under either
    engine). Done this session, in order the retail image demanded them:

@@ -105,6 +105,32 @@ a per-partition virtual offset — not deterministic. Goldens run on the
 interpreter tier, so WHP passthrough is acceptable; synthesize the TSC on the
 RDTSC exit only for a title whose pacing needs it.
 
+## Verified on hardware (M0 spike)
+
+- Partition bring-up, `WHvMapGpaRange`, register set/get, the flat 32-bit
+  boot state, the `HLT` → `X64Halt` exit, and the unmapped-gate
+  `MemoryAccess` exit (exact GPA + `GpaUnmapped` + read access) all behave
+  as documented above.
+- **Transcribe `WHV_REGISTER_NAME` values from the SDK header, never from
+  memory.** The control registers are `Cr0=0x1C, Cr2=0x1D, Cr3=0x1E,
+  Cr4=0x1F, Cr8=0x20` (debug registers follow at `0x21+`), and
+  `WHvX64RegisterEfer` is `0x2001` in the MSR block (`Tsc=0x2000`). A wrong
+  name either lands in an adjacent register **silently** (an early Cr0=0x20
+  wrote the TPR and read it back "successfully") or is rejected with
+  `WHV_E_INVALID_VP_REGISTER_NAME` — and a whole set/get batch fails when
+  any name in it is invalid. Passing straight-line tests do not prove the
+  boot state: under unrestricted guest, injected flat segment caches run
+  `HLT`-style code identically even with `CR0.PE` unset.
+- On the `X64Halt` exit the platform reports `Rip` **past** the completed
+  `HLT`, not at it.
+- `WHvMapGpaRange` requires a page-granular `SizeInBytes` (`E_INVALIDARG`
+  otherwise), and concurrent partition bring-up/teardown across threads is
+  flaky — the hardware tests serialize on a mutex.
+- Zeroed GDTR/IDTR pass entry checks, but any guest exception then triple
+  faults into an undiagnosable `UnrecoverableException`; the M1 run loop
+  should intercept exceptions via `ExtendedVmExits.ExceptionExit` +
+  `ExceptionExitBitmap` before real guest code runs.
+
 ## Hazards
 
 - XSAVE state size is host-CPU-dependent (AVX-512 grows it). Query the size

@@ -245,6 +245,21 @@ The project follows Keep a Changelog structure before its first release.
 - The run loop emits an info-level heartbeat (executed blocks, EIP, TSC)
   every 16 Mi blocks, so a long or looping run stays observable.
 
+- The WHP-M0 spike (ADR 0013), verified on hardware: `exbawks-whp` gains a
+  dynamically loaded platform API (`LoadLibraryW`-resolved, so hosts without
+  the optional feature still run the CLI), an RAII `Machine` (partition +
+  one vCPU, strict bring-up order), page-aligned `HostRegion` guest RAM with
+  `map_gpa`, the flat 32-bit protected-mode boot state, and a decoded exit
+  surface. Hardware tests prove the tier's two load-bearing properties: a
+  guest `HLT` produces the `X64Halt` exit, and a read of the unmapped kernel
+  gate region produces a `MemoryAccess` exit carrying the exact gate GPA —
+  the mechanism the HLE dispatch rides on. An adversarial review against the
+  installed SDK headers then caught mistranscribed register names (`Cr0`
+  actually addressed the TPR; `Efer` is `0x2001`, not `0x501`), a `map_gpa`
+  that let safe code free a region the hypervisor still mapped (the machine
+  now takes ownership of mapped regions), and non-page-granular region sizes
+  the platform rejects (now rounded); all fixed and re-proven on hardware.
+
 ### Performance
 
 - Guest writes are no longer O(page table): `bump_physical_generation`

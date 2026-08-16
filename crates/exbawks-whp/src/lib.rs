@@ -9,3 +9,15 @@
 mod doctor;
 
 pub use doctor::{WhpAvailability, probe_whp};
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod api;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod machine;
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub use api::WhpError;
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub use machine::{
+    HostRegion, Machine, MapFlags, MemoryAccess, Register, RegisterValue, VpExitContext, WhpExit,
+};
