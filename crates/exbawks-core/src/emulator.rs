@@ -205,6 +205,7 @@ impl EmulatorBuilder {
             hdd_root: None,
             devices: crate::mmio::DeviceSpace::default(),
             gpu_pusher: exbawks_gpu::PushbufferEngine::default(),
+            gdt_fs_base: std::cell::Cell::new(u32::MAX),
             pending_persist_reservations: Vec::new(),
             last_relaunch_data: None,
         })
@@ -239,6 +240,9 @@ pub struct Emulator {
     /// The NV2A pushbuffer engine consuming submitted command streams
     /// (GPU-M0).
     gpu_pusher: exbawks_gpu::PushbufferEngine,
+    /// The `fs` base the descriptor table currently carries, so the table
+    /// is rewritten on a thread switch rather than on every exit.
+    gdt_fs_base: std::cell::Cell<u32>,
     /// Physical ranges (base, len) the next `load_xbe` must keep the
     /// allocator away from: soft-reboot persisted regions live at fixed
     /// window addresses, so their physical pages are reserved before the
@@ -928,6 +932,17 @@ impl Emulator {
     }
 
     /// Decodes and plans the current entry block.
+    /// The most-submitted graphics methods, as (object handle, method,
+    /// count) triples ordered by count.
+    ///
+    /// The method stream is the only description of what a title draws, so
+    /// this histogram is how its rendering gets read before any of it is
+    /// interpreted.
+    #[must_use]
+    pub fn gpu_method_histogram(&self, limit: usize) -> Vec<(u32, u16, u64)> {
+        self.gpu_pusher.top_methods(limit)
+    }
+
     /// Captures the scanned-out frame as 8-bit RGBA pixels.
     ///
     /// The title programs the encoder with a **physical** frame-buffer
@@ -1497,6 +1512,8 @@ impl Emulator {
     /// thread's KPCR base — so a guest that reloads `fs` from its selector
     /// keeps reaching its own processor block.
     fn write_descriptor_table(&self) {
+        let fs_base = self.cpu.segments[exbawks_cpu::Segment::Fs as usize].base;
+        self.gdt_fs_base.set(fs_base);
         /// A present, 32-bit, page-granular descriptor's high dword for a
         /// base of zero: limit 0xFFFFF with the type in bits 8..12.
         fn descriptor(base: u32, limit: u32, access: u32) -> (u32, u32) {
@@ -1513,7 +1530,6 @@ impl Emulator {
         /// Present, ring 0, data segment: read/write.
         const DATA_ACCESS: u32 = 0x93;
 
-        let fs_base = self.cpu.segments[exbawks_cpu::Segment::Fs as usize].base;
         let entries = [
             (0, 0),
             descriptor(0, 0xF_FFFF, CODE_ACCESS),
@@ -1595,8 +1611,12 @@ impl Emulator {
 
         let fs_base = u64::from(self.cpu.segments[exbawks_cpu::Segment::Fs as usize].base);
         // The descriptor the `fs` selector names must agree with the base
-        // loaded here, or a guest segment reload would lose the KPCR.
-        self.write_descriptor_table();
+        // loaded here, or a guest segment reload would lose the KPCR. Only
+        // a thread switch changes it, so the table is rewritten then — this
+        // runs on every exit.
+        if self.gdt_fs_base.get() != self.cpu.segments[exbawks_cpu::Segment::Fs as usize].base {
+            self.write_descriptor_table();
+        }
         machine
             .set_registers(&[
                 (Register::Rax, RegisterValue::scalar(u64::from(self.cpu.gpr[0]))),
@@ -1663,6 +1683,22 @@ impl Emulator {
             fn write_dword(&self, physical: u32, value: u32) -> bool {
                 physical < 0x2000_0000
                     && self.0.write_u32(GuestVa(0x8000_0000 | physical), value).is_ok()
+            }
+
+            fn fill_dwords(&self, physical: u32, value: u32, count: u32) -> u32 {
+                // A clear covers a whole scanline; one buffered write beats
+                // a call per pixel by orders of magnitude.
+                let Some(bytes) = count.checked_mul(4) else {
+                    return 0;
+                };
+                if physical >= 0x2000_0000 || physical.saturating_add(bytes) > 0x2000_0000 {
+                    return 0;
+                }
+                let filled = value.to_le_bytes().repeat(count as usize);
+                match self.0.write(GuestVa(0x8000_0000 | physical), &filled) {
+                    Ok(()) => count,
+                    Err(_) => 0,
+                }
             }
         }
 

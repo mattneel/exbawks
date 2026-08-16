@@ -260,6 +260,18 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- GPU-M1: render-target state and `CLEAR_SURFACE`. The pushbuffer engine
+  tracks the color surface a channel programs — its context DMA, offset,
+  pitch, and clip — and a color clear fills the clip-intersected rectangle
+  in guest memory with the clear value, through a bulk fill the emulator
+  backs with one write per scanline. `exbawks run --gpu-methods <n>` reports
+  the most-submitted methods, which is how the retail title's stream was
+  read: it binds a Kelvin object, uploads matrices, sets vertex formats, and
+  draws through inline arrays and 16-bit element indices.
+- The semaphore context-DMA method number was corrected from `0x01A4` (the
+  report object) to `0x01A0`, read off the live stream where the title binds
+  exactly one semaphore object.
+
 - Frame capture: `exbawks run --screenshot <file.png>` writes the frame the
   title programmed on the video encoder. `AvSetDisplayMode` now records the
   mode through a kernel service, `Emulator::capture_frame` reads the linear

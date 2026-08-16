@@ -26,6 +26,23 @@ pub trait Nv2aMemory {
 
     /// Writes one little-endian dword at a physical address.
     fn write_dword(&self, physical: u32, value: u32) -> bool;
+
+    /// Fills `count` consecutive dwords with one value, returning how many
+    /// were written.
+    ///
+    /// A clear covers a whole surface, so the per-dword path costs far more
+    /// than the work itself; an implementation backed by real memory should
+    /// override this with a bulk write.
+    fn fill_dwords(&self, physical: u32, value: u32, count: u32) -> u32 {
+        let mut written = 0;
+        for index in 0..count {
+            if !self.write_dword(physical.wrapping_add(index * 4), value) {
+                break;
+            }
+            written += 1;
+        }
+        written
+    }
 }
 
 /// One resolved DMA object from instance memory.
@@ -39,6 +56,32 @@ pub struct DmaObject {
     pub base: u32,
 }
 
+/// The render-target state a channel programs before drawing.
+///
+/// The color surface is the only one modeled: the title's frames land in
+/// it, and it is what a capture reads back.
+#[derive(Debug, Default, Clone, Copy)]
+struct SurfaceState {
+    /// The color surface's context-DMA object, once bound.
+    color_dma: Option<DmaObject>,
+    /// The color surface's byte offset inside that object.
+    color_offset: u32,
+    /// The distance between color scanlines in bytes.
+    color_pitch: u32,
+    /// The surface clip's left edge and width in pixels.
+    clip_x: u32,
+    clip_width: u32,
+    /// The surface clip's top edge and height in pixels.
+    clip_y: u32,
+    clip_height: u32,
+    /// The ARGB value a color clear writes.
+    clear_color: u32,
+    /// The clear rectangle's horizontal bounds (left, right).
+    clear_x: (u32, u32),
+    /// The clear rectangle's vertical bounds (top, bottom).
+    clear_y: (u32, u32),
+}
+
 /// The engine's per-channel decode state.
 #[derive(Debug, Default)]
 struct ChannelState {
@@ -48,6 +91,8 @@ struct ChannelState {
     semaphore: Option<DmaObject>,
     /// The current semaphore byte offset.
     semaphore_offset: u32,
+    /// The render-target state.
+    surface: SurfaceState,
 }
 
 /// Aggregate statistics for diagnostics.
@@ -59,6 +104,10 @@ pub struct PusherStats {
     pub submissions: u64,
     /// Total semaphore releases written to memory.
     pub semaphore_releases: u64,
+    /// Color-surface clears applied to guest memory.
+    pub surface_clears: u64,
+    /// Pixels written by those clears.
+    pub cleared_pixels: u64,
     /// Submissions abandoned mid-walk (bad word or unreadable memory).
     pub aborted: u64,
 }
@@ -106,9 +155,34 @@ const MAX_DWORDS_PER_SUBMIT: u32 = 4 * 1024 * 1024;
 
 /// The `SET_OBJECT` method (binds a handle to a subchannel).
 const METHOD_SET_OBJECT: u16 = 0x0000;
-/// Kelvin `SET_CONTEXT_DMA_SEMAPHORE` (provisional numbering; verified
-/// against the live retail stream, which names its methods by use).
-const METHOD_SET_CONTEXT_DMA_SEMAPHORE: u16 = 0x01A4;
+/// Kelvin `SET_CONTEXT_DMA_COLOR`: names the object the color surface's
+/// offset is relative to.
+const METHOD_SET_CONTEXT_DMA_COLOR: u16 = 0x0190;
+/// Kelvin `SET_CONTEXT_DMA_SEMAPHORE`.
+///
+/// The numbering is read off the retail stream: the context-DMA block runs
+/// `NOTIFIES, A, B, STATE, COLOR, ZETA, VERTEX_A, VERTEX_B, SEMAPHORE,
+/// REPORT` from `0x0180`, and the title binds exactly one semaphore object
+/// here (`0x01A4`, the report object, is never bound).
+const METHOD_SET_CONTEXT_DMA_SEMAPHORE: u16 = 0x01A0;
+/// Kelvin `SET_SURFACE_CLIP_HORIZONTAL`: left edge and width.
+const METHOD_SET_SURFACE_CLIP_HORIZONTAL: u16 = 0x0200;
+/// Kelvin `SET_SURFACE_CLIP_VERTICAL`: top edge and height.
+const METHOD_SET_SURFACE_CLIP_VERTICAL: u16 = 0x0204;
+/// Kelvin `SET_SURFACE_PITCH`: color pitch low, zeta pitch high.
+const METHOD_SET_SURFACE_PITCH: u16 = 0x020C;
+/// Kelvin `SET_SURFACE_COLOR_OFFSET`.
+const METHOD_SET_SURFACE_COLOR_OFFSET: u16 = 0x0210;
+/// Kelvin `SET_COLOR_CLEAR_VALUE`.
+const METHOD_SET_COLOR_CLEAR_VALUE: u16 = 0x1D90;
+/// Kelvin `CLEAR_SURFACE`: the buffers a clear touches.
+const METHOD_CLEAR_SURFACE: u16 = 0x1D94;
+/// Kelvin `SET_CLEAR_RECT_HORIZONTAL`: left and right edges.
+const METHOD_SET_CLEAR_RECT_HORIZONTAL: u16 = 0x1D98;
+/// Kelvin `SET_CLEAR_RECT_VERTICAL`: top and bottom edges.
+const METHOD_SET_CLEAR_RECT_VERTICAL: u16 = 0x1D9C;
+/// The `CLEAR_SURFACE` bits selecting the color channels.
+const CLEAR_COLOR_MASK: u32 = 0xF0;
 /// Kelvin `SET_SEMAPHORE_OFFSET`.
 const METHOD_SET_SEMAPHORE_OFFSET: u16 = 0x1D6C;
 /// Kelvin `BACK_END_WRITE_SEMAPHORE_RELEASE`.
@@ -309,6 +383,51 @@ impl PushbufferEngine {
             METHOD_SET_SEMAPHORE_OFFSET => {
                 state.semaphore_offset = argument;
             }
+            METHOD_SET_CONTEXT_DMA_COLOR => {
+                let resolved = Self::resolve_dma_object(
+                    memory,
+                    context.pramin,
+                    context.ramht_raw,
+                    channel,
+                    argument,
+                );
+                let state = self.channels.entry(channel).or_default();
+                state.surface.color_dma = resolved;
+                tracing::debug!(
+                    handle = format_args!("{argument:#010x}"),
+                    ?resolved,
+                    "nv2a color surface context bound"
+                );
+            }
+            METHOD_SET_SURFACE_CLIP_HORIZONTAL => {
+                state.surface.clip_x = argument & 0xFFFF;
+                state.surface.clip_width = argument >> 16;
+            }
+            METHOD_SET_SURFACE_CLIP_VERTICAL => {
+                state.surface.clip_y = argument & 0xFFFF;
+                state.surface.clip_height = argument >> 16;
+            }
+            METHOD_SET_SURFACE_PITCH => {
+                state.surface.color_pitch = argument & 0xFFFF;
+            }
+            METHOD_SET_SURFACE_COLOR_OFFSET => {
+                state.surface.color_offset = argument;
+            }
+            METHOD_SET_COLOR_CLEAR_VALUE => {
+                state.surface.clear_color = argument;
+            }
+            METHOD_SET_CLEAR_RECT_HORIZONTAL => {
+                state.surface.clear_x = (argument & 0xFFFF, argument >> 16);
+            }
+            METHOD_SET_CLEAR_RECT_VERTICAL => {
+                state.surface.clear_y = (argument & 0xFFFF, argument >> 16);
+            }
+            METHOD_CLEAR_SURFACE => {
+                if argument & CLEAR_COLOR_MASK != 0 {
+                    let surface = self.channels.entry(channel).or_default().surface;
+                    self.clear_color_surface(memory, &surface);
+                }
+            }
             METHOD_BACK_END_WRITE_SEMAPHORE_RELEASE => {
                 let (target, offset) = {
                     let state = self.channels.entry(channel).or_default();
@@ -327,6 +446,54 @@ impl PushbufferEngine {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Fills the clear rectangle of the color surface with its clear value.
+    ///
+    /// The rectangle is intersected with the surface clip, exactly as the
+    /// hardware does, and the surface is assumed to be a 32-bit format:
+    /// those are the SDTV modes a title scans out, and the pitch says as
+    /// much.
+    fn clear_color_surface(&mut self, memory: &dyn Nv2aMemory, surface: &SurfaceState) {
+        let Some(color) = surface.color_dma else {
+            return;
+        };
+        if surface.color_pitch == 0 {
+            return;
+        }
+        let left = surface.clear_x.0.max(surface.clip_x);
+        let right = surface.clear_x.1.min(surface.clip_x.saturating_add(surface.clip_width));
+        let top = surface.clear_y.0.max(surface.clip_y);
+        let bottom = surface.clear_y.1.min(surface.clip_y.saturating_add(surface.clip_height));
+        if left >= right || top >= bottom {
+            return;
+        }
+
+        tracing::debug!(
+            left,
+            right,
+            top,
+            bottom,
+            pitch = surface.color_pitch,
+            base = format_args!("{:#010x}", color.base),
+            offset = format_args!("{:#010x}", surface.color_offset),
+            limit = format_args!("{:#010x}", color.limit),
+            "nv2a color clear"
+        );
+        let base = color.base.wrapping_add(surface.color_offset);
+        let mut written = 0_u64;
+        for row in top..bottom {
+            let scanline = base.wrapping_add(row.wrapping_mul(surface.color_pitch));
+            let start = scanline.wrapping_add(left * 4);
+            if start.wrapping_sub(base) > color.limit {
+                break;
+            }
+            written += u64::from(memory.fill_dwords(start, surface.clear_color, right - left));
+        }
+        if written > 0 {
+            self.stats.surface_clears += 1;
+            self.stats.cleared_pixels += written;
         }
     }
 
@@ -455,6 +622,116 @@ mod tests {
         assert_eq!(end, 0x1018);
         assert_eq!(engine.stats().semaphore_releases, 1);
         assert_eq!(memory.read_word(0x9000 + 0x10), 42, "the release landed in memory");
+    }
+
+    #[test]
+    fn a_color_clear_fills_the_surface_rectangle() {
+        let memory = FakeMemory::new(0x2_0000);
+        let pramin = 0x8000_u32;
+        // A color context-DMA object reachable through RAMHT, framing the
+        // surface at physical 0xC000.
+        let handle = 0x1234_u32;
+        let hash = ramht_hash(handle, 9, 0) % 512;
+        memory.write_words(pramin + hash * 8, &[handle, 0x100]);
+        memory.write_words(pramin + 0x1000, &[0x0000_003D, 0xFFFF, 0xC000]);
+
+        // A 4x4 surface with a 16-byte pitch, cleared over its middle 2x2.
+        memory.write_words(
+            0x1000,
+            &[
+                header(1, 0, METHOD_SET_CONTEXT_DMA_COLOR),
+                handle,
+                header(1, 0, METHOD_SET_SURFACE_CLIP_HORIZONTAL),
+                4 << 16,
+                header(1, 0, METHOD_SET_SURFACE_CLIP_VERTICAL),
+                4 << 16,
+                header(1, 0, METHOD_SET_SURFACE_PITCH),
+                16,
+                header(1, 0, METHOD_SET_SURFACE_COLOR_OFFSET),
+                0,
+                header(1, 0, METHOD_SET_COLOR_CLEAR_VALUE),
+                0xFF20_3040,
+                header(1, 0, METHOD_SET_CLEAR_RECT_HORIZONTAL),
+                1 | (3 << 16),
+                header(1, 0, METHOD_SET_CLEAR_RECT_VERTICAL),
+                1 | (3 << 16),
+                header(1, 0, METHOD_CLEAR_SURFACE),
+                0xF0,
+            ],
+        );
+        let mut engine = PushbufferEngine::default();
+
+        engine.submit(&memory, 0, pramin, 0, 0x1000, 0x1000 + 18 * 4);
+
+        assert_eq!(engine.stats().surface_clears, 1);
+        assert_eq!(engine.stats().cleared_pixels, 4, "a 2x2 rectangle");
+        // Rows 1 and 2, columns 1 and 2 carry the clear value.
+        assert_eq!(memory.read_word(0xC000 + 16 + 4), 0xFF20_3040);
+        assert_eq!(memory.read_word(0xC000 + 16 + 8), 0xFF20_3040);
+        assert_eq!(memory.read_word(0xC000 + 32 + 4), 0xFF20_3040);
+        // Everything outside the rectangle is untouched.
+        assert_eq!(memory.read_word(0xC000), 0, "the first pixel is outside");
+        assert_eq!(memory.read_word(0xC000 + 16), 0, "column 0 is outside");
+        assert_eq!(memory.read_word(0xC000 + 48 + 12), 0, "the last row is outside");
+    }
+
+    #[test]
+    fn a_clear_without_a_color_context_writes_nothing() {
+        let memory = FakeMemory::new(0x1_0000);
+        memory.write_words(
+            0x1000,
+            &[
+                header(1, 0, METHOD_SET_SURFACE_PITCH),
+                16,
+                header(1, 0, METHOD_SET_CLEAR_RECT_HORIZONTAL),
+                4 << 16,
+                header(1, 0, METHOD_CLEAR_SURFACE),
+                0xF0,
+            ],
+        );
+        let mut engine = PushbufferEngine::default();
+
+        engine.submit(&memory, 0, 0x8000, 0, 0x1000, 0x1018);
+
+        assert_eq!(engine.stats().surface_clears, 0, "no surface, no write");
+    }
+
+    #[test]
+    fn a_depth_only_clear_leaves_the_color_surface_alone() {
+        let memory = FakeMemory::new(0x2_0000);
+        let pramin = 0x8000_u32;
+        let handle = 0x1234_u32;
+        let hash = ramht_hash(handle, 9, 0) % 512;
+        memory.write_words(pramin + hash * 8, &[handle, 0x100]);
+        memory.write_words(pramin + 0x1000, &[0x0000_003D, 0xFFFF, 0xC000]);
+        memory.write_words(
+            0x1000,
+            &[
+                header(1, 0, METHOD_SET_CONTEXT_DMA_COLOR),
+                handle,
+                header(1, 0, METHOD_SET_SURFACE_CLIP_HORIZONTAL),
+                4 << 16,
+                header(1, 0, METHOD_SET_SURFACE_CLIP_VERTICAL),
+                4 << 16,
+                header(1, 0, METHOD_SET_SURFACE_PITCH),
+                16,
+                header(1, 0, METHOD_SET_CLEAR_RECT_HORIZONTAL),
+                4 << 16,
+                header(1, 0, METHOD_SET_CLEAR_RECT_VERTICAL),
+                4 << 16,
+                header(1, 0, METHOD_SET_COLOR_CLEAR_VALUE),
+                0xFFFF_FFFF,
+                // Depth and stencil only.
+                header(1, 0, METHOD_CLEAR_SURFACE),
+                0x03,
+            ],
+        );
+        let mut engine = PushbufferEngine::default();
+
+        engine.submit(&memory, 0, pramin, 0, 0x1000, 0x1000 + 16 * 4);
+
+        assert_eq!(engine.stats().surface_clears, 0);
+        assert_eq!(memory.read_word(0xC000), 0, "the color surface is untouched");
     }
 
     #[test]

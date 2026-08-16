@@ -107,6 +107,9 @@ enum Command {
         /// Writes the scanned-out frame to this PNG file after the stop.
         #[arg(long)]
         screenshot: Option<PathBuf>,
+        /// Prints the most-submitted graphics methods after the stop.
+        #[arg(long)]
+        gpu_methods: Option<usize>,
     },
     /// Reports the implementation burndown across emulator surfaces.
     Coverage {
@@ -225,6 +228,7 @@ fn main() -> Result<()> {
             engine,
             peek,
             screenshot,
+            gpu_methods,
         } => {
             let tracing = TraceOptions {
                 path: trace.as_deref(),
@@ -240,6 +244,7 @@ fn main() -> Result<()> {
                     engine,
                     peek: &peek,
                     screenshot: screenshot.as_deref(),
+                    gpu_methods,
                     json: cli.json,
                 },
             )
@@ -545,12 +550,14 @@ struct RunOptions<'a> {
     peek: &'a [u32],
     /// Where the captured frame is written, when asked for.
     screenshot: Option<&'a Path>,
+    /// How many graphics methods to report, when asked for.
+    gpu_methods: Option<usize>,
     /// Whether the report prints as JSON.
     json: bool,
 }
 
 fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Result<()> {
-    let RunOptions { ram_mib, max_blocks, engine, peek, screenshot, json } = *options;
+    let RunOptions { ram_mib, max_blocks, engine, peek, screenshot, gpu_methods, json } = *options;
     let bytes = read_file(path)?;
     let config = EmulatorConfig {
         physical_memory_bytes: mib_to_bytes(ram_mib)?,
@@ -632,6 +639,18 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
     println!("Final EBP:    0x{:08X}", gpr[5]);
     println!("Final ESI:    0x{:08X}", gpr[6]);
     println!("Final EDI:    0x{:08X}", gpr[7]);
+
+    if let Some(limit) = gpu_methods {
+        let histogram = emulator.gpu_method_histogram(limit);
+        println!(
+            "
+Graphics methods (object, method, submissions):"
+        );
+        for (handle, method, count) in histogram {
+            println!("  {handle:#010x}  {method:#06x}  {count}");
+        }
+        println!();
+    }
 
     if let Some(path) = screenshot {
         match emulator.capture_frame() {
