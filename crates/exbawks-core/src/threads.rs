@@ -240,8 +240,7 @@ impl KernelServices for ThreadManager {
             return Err(KernelServiceError::ResourceExhausted);
         }
 
-        let mut cpu = CpuState::default();
-        cpu.eip = request.start_routine.0;
+        let mut cpu = CpuState { eip: request.start_routine.0, ..CpuState::default() };
         cpu.gpr[4] = esp;
         cpu.set_segment(Segment::Fs, SegmentState { base: kpcr.0, ..SegmentState::default() });
 
