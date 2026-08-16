@@ -101,6 +101,11 @@ thunks xbe *flags:
 run xbe ram="64" *flags:
     cargo exbawks run '{{ join(invocation_directory_native(), xbe) }}' --ram-mib '{{ram}}' {{flags}}
 
+# Report the implementation burndown across emulator surfaces.
+[group("emulator")]
+coverage *flags:
+    cargo exbawks coverage {{flags}}
+
 # Create a numbered ADR from the template.
 [windows]
 [group("maintenance")]
