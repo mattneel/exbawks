@@ -125,14 +125,21 @@ Two active threads:
    attribute bits.
 
 2. **Kernel HLE burndown** (substrate-independent, needed under either
-   engine): `KRN-002` (data exports, ADR 0010) is the current DC3 wall. XAPI
-   reads the 19 DATA-export slots, still patched with unmapped gate addresses,
-   and jumps to null (`GuestFault { 0 }`). Build a kernel-variables region
-   (ticking `KeTickCount`, `KeTimeIncrement`, `LaunchDataPage` NULL,
-   `XeImageFileName` ANSI string, zeroed synthetic keys, version/hardware
-   structs, object-type placeholders) and patch DATA slots with pointers into
-   it while function slots keep gates (`kernel_ordinal_info(ordinal).kind`).
-   `KRN-003` (virtual clock) follows.
+   engine): `KRN-002` (data exports, ADR 0010) is **done** — the loader
+   builds a kernel-variables region and points each data-ordinal slot at a
+   live variable, and the boot thread now returns off its stack to a thread
+   exit so the scheduler switches to the game's created thread. The DC3 wall
+   moved from `GuestFault { 0 }` to
+   `MissingKernelExport { 277 } (RtlEnterCriticalSection)` — the game thread's
+   CRT/heap-init path needs the Rtl critical-section family
+   (`RtlEnterCriticalSection` 277, `RtlLeaveCriticalSection` 294,
+   `RtlInitializeCriticalSection` 291). Those want guest-memory-resident
+   `RTL_CRITICAL_SECTION` structs (HLE-007 in the boot plan); a single-thread
+   cooperative model can implement them as recursion-counted no-ops first.
+   After that expect the virtual-memory / heap exports (`NtAllocateVirtualMemory`
+   184) and `KRN-003` (virtual clock, to make the `KeTickCount` cell tick).
+   Use `exbawks coverage --surface kernel --xbe <dc3> --missing` for the live
+   gap list.
 
 The retail image stays outside the repository; automated tests remain
 synthetic.
