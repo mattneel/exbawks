@@ -3,6 +3,7 @@
 
 mod av;
 mod context;
+mod dispatcher;
 mod error;
 mod ex;
 mod export;
@@ -12,6 +13,7 @@ mod io;
 mod irql;
 mod ke;
 mod mm;
+mod mutant;
 mod ordinals;
 mod registry;
 mod rtl;
@@ -25,6 +27,7 @@ pub use av::{
     AvGetSavedDataAddress, AvSendTVEncoderOption, AvSetDisplayMode, AvSetSavedDataAddress,
 };
 pub use context::KernelCallContext;
+pub use dispatcher::{KeSetEvent, KeWaitForSingleObject};
 pub use error::KernelError;
 pub use ex::{
     ExAllocatePool, ExAllocatePoolWithTag, ExFreePool, ExQueryNonVolatileSetting,
@@ -44,6 +47,7 @@ pub use irql::{
 };
 pub use ke::{KeInitializeDpc, KeQuerySystemTime};
 pub use mm::{MmAllocateContiguousMemory, MmGetPhysicalAddress};
+pub use mutant::{NtCreateMutant, NtReleaseMutant};
 pub use ordinals::{
     CallingConvention, ExportKind, KERNEL_ORDINALS, KernelOrdinalInfo, kernel_ordinal_info,
 };
@@ -53,13 +57,14 @@ pub use rtl::{
     RtlLeaveCriticalSection, RtlNtStatusToDosError,
 };
 pub use services::{
-    FileInfo, FileOpenRequest, FileOpened, KernelServiceError, KernelServices, ThreadCreateRequest,
-    ThreadCreated, UnsupportedServices, VirtualAllocRequest, VirtualAllocation, WaitOutcome,
+    DisplayMode, FileInfo, FileOpenRequest, FileOpened, KernelServiceError, KernelServices,
+    ThreadCreateRequest, ThreadCreated, UnsupportedServices, VirtualAllocRequest,
+    VirtualAllocation, WaitOutcome,
 };
 pub use startup::{
-    DbgPrint, HalReturnToFirmware, NtClose, NtCreateEvent, NtSetEvent, NtWaitForSingleObject,
-    NtWaitForSingleObjectEx, PsCreateSystemThreadEx, PsTerminateSystemThread, ordinal,
-    register_startup_exports,
+    DbgPrint, HalReturnToFirmware, NtClose, NtCreateEvent, NtResumeThread, NtSetEvent,
+    NtSuspendThread, NtWaitForMultipleObjectsEx, NtWaitForSingleObject, NtWaitForSingleObjectEx,
+    PsCreateSystemThreadEx, PsTerminateSystemThread, ordinal, register_startup_exports,
 };
 pub use status::KernelStatus;
 pub use vm::NtAllocateVirtualMemory;

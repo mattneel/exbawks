@@ -95,6 +95,20 @@ pub struct FileInfo {
     pub directory: bool,
 }
 
+/// The scanned-out display mode a title programmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayMode {
+    /// The frame buffer's guest **physical** address (what the encoder
+    /// scans out of).
+    pub frame_buffer: u32,
+    /// The Xbox surface format code (`0x12` is linear A8R8G8B8).
+    pub format: u32,
+    /// The distance between scanlines in bytes.
+    pub pitch: u32,
+    /// The mode word the title selected.
+    pub mode: u32,
+}
+
 /// The disposition of a wait request (ADR 0017).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {
@@ -277,6 +291,45 @@ pub trait KernelServices {
     fn wait_for_object(&mut self, _handle: u32) -> Result<WaitOutcome, KernelServiceError> {
         Err(KernelServiceError::Unsupported)
     }
+
+    /// Records the display mode a title programmed on the video encoder.
+    fn set_display_mode(&mut self, _mode: DisplayMode) {}
+
+    /// Resumes a suspended thread, returning its previous suspend count.
+    fn resume_thread(&mut self, _handle: u32) -> Result<u32, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
+    /// Suspends a thread, returning its previous suspend count.
+    fn suspend_thread(&mut self, _handle: u32) -> Result<u32, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
+    /// Creates a mutant object, returning its guest handle.
+    fn create_mutant(&mut self, _initially_owned: bool) -> Result<u32, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
+    /// Releases one level of a mutant's ownership, returning the previous
+    /// recursion count. Reports `AccessDenied` when the calling thread does
+    /// not own it.
+    fn release_mutant(&mut self, _handle: u32) -> Result<u32, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
+    /// Begins a wait on one dispatcher object named by guest address.
+    ///
+    /// The object's signal state lives in guest memory and the export
+    /// checks it first; this only decides how an unsignaled wait resolves.
+    fn wait_for_dispatcher_object(
+        &mut self,
+        _address: u32,
+    ) -> Result<WaitOutcome, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
+    /// Wakes every thread parked on a dispatcher object's guest address.
+    fn signal_dispatcher_object(&mut self, _address: u32) {}
 
     /// Opens a handle to an existing symbolic-link object.
     fn open_symbolic_link(&mut self, _name: &str) -> Result<u32, KernelServiceError> {

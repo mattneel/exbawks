@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use exbawks_cpu::{CpuState, Segment, SegmentState};
 use exbawks_kernel::{
-    FileInfo, FileOpenRequest, FileOpened, KernelServiceError, KernelServices, ThreadCreateRequest,
-    ThreadCreated, VirtualAllocRequest, VirtualAllocation, WaitOutcome,
+    DisplayMode, FileInfo, FileOpenRequest, FileOpened, KernelServiceError, KernelServices,
+    ThreadCreateRequest, ThreadCreated, VirtualAllocRequest, VirtualAllocation, WaitOutcome,
 };
 use exbawks_memory::{GuestMemory, MemoryError, SoftwareAddressSpace};
 use exbawks_types::{GUEST_PAGE_SIZE, GuestRange, GuestVa, MemoryPermissions};
@@ -103,7 +103,6 @@ pub(crate) struct GuestThread {
     #[allow(dead_code)]
     pub id: u32,
     /// The KPCR page address (diagnostics; the fs base mirrors it).
-    #[allow(dead_code)]
     pub kpcr: GuestVa,
     /// True when a return to a null address is this thread's intended exit.
     ///
@@ -164,11 +163,18 @@ pub(crate) struct ThreadManager {
     /// cooperative scheduler (ADR 0011) events never block; the state exists
     /// for the guest's own signal/query bookkeeping.
     events: HashMap<u32, (bool, bool)>,
+    /// Guest mutant objects (handle → owner thread index and recursion
+    /// count, `None` when unowned).
+    mutants: HashMap<u32, Option<(usize, u32)>>,
+    /// The most recent display mode the title programmed, if any.
+    display_mode: Option<DisplayMode>,
 }
 
 /// The first guest handle the event table hands out; disjoint from file
 /// (`0x100`+) and thread (`0xE000`+) handles.
 const EVENT_HANDLE_BASE: u32 = 0x0000_A000;
+/// The first guest handle the mutant table hands out.
+const MUTANT_HANDLE_BASE: u32 = 0x0000_B000;
 
 /// The data-export ordinal of the kernel `LaunchDataPage` pointer variable.
 const LAUNCH_DATA_PAGE_ORDINAL: u16 = 164;
@@ -196,6 +202,8 @@ impl ThreadManager {
             pool_sizes: HashMap::new(),
             gpu_instance: None,
             events: HashMap::new(),
+            mutants: HashMap::new(),
+            display_mode: None,
         }
     }
 
@@ -485,9 +493,21 @@ impl ThreadManager {
             }
         }
         // FIFO by creation order (ADR 0011).
-        let Some(next) = self.threads.iter().position(|thread| thread.state == ThreadState::Ready)
-        else {
-            return false;
+        let next = match self.threads.iter().position(|thread| thread.state == ThreadState::Ready) {
+            Some(next) => next,
+            // Every remaining thread is parked on an object nothing can
+            // signal now that this one is gone. The emulated devices raise
+            // no interrupts and finish their work synchronously, so the
+            // waits are already satisfied in fact: release them rather than
+            // reporting the guest exited (the stance `WaitOutcome::TimedOut`
+            // takes when a wait begins with nothing else runnable).
+            None if self.release_parked_waits() => {
+                match self.threads.iter().position(|thread| thread.state == ThreadState::Ready) {
+                    Some(next) => next,
+                    None => return false,
+                }
+            }
+            None => return false,
         };
         self.threads[next].state = ThreadState::Running;
         // The time-stamp counter is per-core, not per-thread, so it carries
@@ -497,6 +517,36 @@ impl ThreadManager {
         active_cpu.tsc = tsc;
         self.current = next;
         true
+    }
+
+    /// The display mode the title last programmed, if any.
+    pub(crate) fn display_mode(&self) -> Option<DisplayMode> {
+        self.display_mode
+    }
+
+    /// Resolves a thread handle to its index in the table.
+    fn thread_index(&self, handle: u32) -> Option<usize> {
+        if handle < 0x0000_E000 || !self.handles.contains(&handle) {
+            return None;
+        }
+        let index = ((handle - 0x0000_E000) / 4) as usize;
+        (index < self.threads.len()).then_some(index)
+    }
+
+    /// Makes every parked thread ready, reporting whether any was parked.
+    fn release_parked_waits(&mut self) -> bool {
+        let mut released = false;
+        for thread in &mut self.threads {
+            if let ThreadState::Waiting(handle) = thread.state {
+                tracing::debug!(
+                    handle = format_args!("{handle:#010x}"),
+                    "releasing a parked wait: no other thread can signal it"
+                );
+                thread.state = ThreadState::Ready;
+                released = true;
+            }
+        }
+        released
     }
 
     /// Parks the active thread on a handle and resumes the next ready one.
@@ -520,6 +570,20 @@ impl ThreadManager {
         active_cpu.tsc = tsc;
         self.current = next;
         true
+    }
+
+    /// Renders every thread's scheduling state for stop diagnostics.
+    pub(crate) fn describe_threads(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for (index, thread) in self.threads.iter().enumerate() {
+            let _ = write!(
+                out,
+                "[{index}: {:?} eip={:#010x} kpcr={}] ",
+                thread.state, thread.cpu.eip, thread.kpcr
+            );
+        }
+        out
     }
 
     /// Returns the number of live (non-terminated) threads.
@@ -610,6 +674,7 @@ impl KernelServices for ThreadManager {
     }
 
     fn set_event(&mut self, handle: u32) -> Result<bool, KernelServiceError> {
+        tracing::trace!(handle = format_args!("{handle:#x}"), "set_event");
         let Some((manual_reset, signaled)) = self.events.get_mut(&handle) else {
             return Err(KernelServiceError::InvalidHandle);
         };
@@ -637,7 +702,104 @@ impl KernelServices for ThreadManager {
         Ok(previous)
     }
 
+    fn set_display_mode(&mut self, mode: DisplayMode) {
+        self.display_mode = Some(mode);
+    }
+
+    fn resume_thread(&mut self, handle: u32) -> Result<u32, KernelServiceError> {
+        let index = self.thread_index(handle).ok_or(KernelServiceError::InvalidHandle)?;
+        let thread = &mut self.threads[index];
+        // Suspension is a single level here: threads are created suspended
+        // and resumed once, which is the pattern titles use.
+        if thread.state == ThreadState::Suspended {
+            thread.state = ThreadState::Ready;
+            return Ok(1);
+        }
+        Ok(0)
+    }
+
+    fn suspend_thread(&mut self, handle: u32) -> Result<u32, KernelServiceError> {
+        let index = self.thread_index(handle).ok_or(KernelServiceError::InvalidHandle)?;
+        if index == self.current {
+            // Suspending the running thread would need a reschedule the
+            // export cannot perform; no title on this path does it.
+            return Err(KernelServiceError::AccessDenied);
+        }
+        let thread = &mut self.threads[index];
+        if thread.state == ThreadState::Ready {
+            thread.state = ThreadState::Suspended;
+            return Ok(0);
+        }
+        Ok(1)
+    }
+
+    fn create_mutant(&mut self, initially_owned: bool) -> Result<u32, KernelServiceError> {
+        let handle = MUTANT_HANDLE_BASE + self.mutants.len() as u32 * 4;
+        self.mutants.insert(handle, initially_owned.then_some((self.current, 1)));
+        self.handles.insert(handle);
+        Ok(handle)
+    }
+
+    fn release_mutant(&mut self, handle: u32) -> Result<u32, KernelServiceError> {
+        let current = self.current;
+        let Some(owner) = self.mutants.get_mut(&handle) else {
+            return Err(KernelServiceError::InvalidHandle);
+        };
+        let Some((holder, recursion)) = *owner else {
+            return Err(KernelServiceError::AccessDenied);
+        };
+        if holder != current {
+            return Err(KernelServiceError::AccessDenied);
+        }
+        *owner = (recursion > 1).then_some((holder, recursion - 1));
+        if owner.is_none() {
+            // The mutant is free: every thread queued on it may retry.
+            for thread in &mut self.threads {
+                if thread.state == ThreadState::Waiting(handle) {
+                    thread.state = ThreadState::Ready;
+                }
+            }
+        }
+        Ok(recursion - 1)
+    }
+
+    fn wait_for_dispatcher_object(
+        &mut self,
+        address: u32,
+    ) -> Result<WaitOutcome, KernelServiceError> {
+        tracing::debug!(
+            object = format_args!("{address:#010x}"),
+            thread = self.current,
+            "wait_for_dispatcher_object"
+        );
+        // The object's own address keys the park: guest addresses never
+        // collide with the handle values this manager hands out.
+        let another_runnable = self
+            .threads
+            .iter()
+            .enumerate()
+            .any(|(index, thread)| index != self.current && thread.state == ThreadState::Ready);
+        if !another_runnable {
+            return Ok(WaitOutcome::TimedOut);
+        }
+        self.pending = Some(PendingAction::Wait { handle: address });
+        Ok(WaitOutcome::Pending)
+    }
+
+    fn signal_dispatcher_object(&mut self, address: u32) {
+        for thread in &mut self.threads {
+            if thread.state == ThreadState::Waiting(address) {
+                thread.state = ThreadState::Ready;
+            }
+        }
+    }
+
     fn wait_for_object(&mut self, handle: u32) -> Result<WaitOutcome, KernelServiceError> {
+        tracing::debug!(
+            handle = format_args!("{handle:#x}"),
+            thread = self.current,
+            "wait_for_object"
+        );
         let another_runnable = self
             .threads
             .iter()
@@ -656,6 +818,26 @@ impl KernelServices for ThreadManager {
             }
             self.pending = Some(PendingAction::Wait { handle });
             return Ok(WaitOutcome::Pending);
+        }
+        // A mutant: acquiring it is the wait's whole effect. An unowned one
+        // (or one this thread already holds) is taken recursively; another
+        // thread's ownership parks this one until the release.
+        if let Some(owner) = self.mutants.get_mut(&handle) {
+            match *owner {
+                None => {
+                    *owner = Some((self.current, 1));
+                    return Ok(WaitOutcome::Signaled);
+                }
+                Some((holder, recursion)) if holder == self.current => {
+                    *owner = Some((holder, recursion + 1));
+                    return Ok(WaitOutcome::Signaled);
+                }
+                Some(_) if !another_runnable => return Ok(WaitOutcome::TimedOut),
+                Some(_) => {
+                    self.pending = Some(PendingAction::Wait { handle });
+                    return Ok(WaitOutcome::Pending);
+                }
+            }
         }
         // A thread handle: signaled once the thread terminates.
         if handle >= 0x0000_E000 && self.handles.contains(&handle) {
@@ -877,6 +1059,93 @@ mod tests {
         // No other thread is runnable, so a wait cannot park — it times out
         // instead of deadlocking the guest.
         assert_eq!(threads.wait_for_object(event), Ok(WaitOutcome::TimedOut));
+    }
+
+    #[test]
+    fn a_suspended_thread_resumes_once() {
+        let mut threads = manager();
+        threads.create_thread(thread_request(0x1000)).expect("thread 0 creates");
+        let mut request = thread_request(0x2000);
+        request.create_suspended = true;
+        let created = threads.create_thread(request).expect("suspended thread creates");
+        assert_eq!(threads.threads[1].state, ThreadState::Suspended);
+
+        assert_eq!(threads.resume_thread(created.handle), Ok(1), "it was suspended once");
+        assert_eq!(threads.threads[1].state, ThreadState::Ready);
+        assert_eq!(threads.resume_thread(created.handle), Ok(0), "already running");
+        assert_eq!(threads.resume_thread(0xDEAD), Err(KernelServiceError::InvalidHandle));
+    }
+
+    #[test]
+    fn a_mutant_is_acquired_recursively_and_released_in_pairs() {
+        let mut threads = manager();
+        threads.create_thread(thread_request(0x1000)).expect("thread 0 creates");
+        threads.create_thread(thread_request(0x2000)).expect("thread 1 creates");
+        let mutant = threads.create_mutant(false).expect("mutant creates");
+
+        // Thread 0 takes it twice; both takes are immediate.
+        assert_eq!(threads.wait_for_object(mutant), Ok(WaitOutcome::Signaled));
+        assert_eq!(threads.wait_for_object(mutant), Ok(WaitOutcome::Signaled));
+        assert_eq!(threads.release_mutant(mutant), Ok(1), "one level remains held");
+
+        // Thread 1 cannot take it while thread 0 still holds it.
+        let mut cpu = CpuState::default();
+        threads.rotate_active(&mut cpu);
+        assert_eq!(threads.current, 1);
+        assert_eq!(threads.wait_for_object(mutant), Ok(WaitOutcome::Pending));
+        assert!(threads.park_active(mutant, &mut cpu), "the contended wait parks");
+
+        // Thread 0's last release frees it and wakes the queued thread.
+        assert_eq!(threads.current, 0);
+        assert_eq!(threads.release_mutant(mutant), Ok(0));
+        assert_eq!(threads.threads[1].state, ThreadState::Ready);
+        assert_eq!(threads.wait_for_object(mutant), Ok(WaitOutcome::Signaled), "free again");
+    }
+
+    #[test]
+    fn releasing_a_mutant_another_thread_owns_is_denied() {
+        let mut threads = manager();
+        threads.create_thread(thread_request(0x1000)).expect("thread 0 creates");
+        threads.create_thread(thread_request(0x2000)).expect("thread 1 creates");
+        let mutant = threads.create_mutant(true).expect("mutant creates owned");
+        let mut cpu = CpuState::default();
+        threads.rotate_active(&mut cpu);
+
+        assert_eq!(threads.current, 1);
+        assert_eq!(threads.release_mutant(mutant), Err(KernelServiceError::AccessDenied));
+        assert_eq!(threads.release_mutant(0xDEAD), Err(KernelServiceError::InvalidHandle));
+    }
+
+    #[test]
+    fn the_last_ready_thread_exiting_releases_the_parked_ones() {
+        let mut threads = manager();
+        threads.create_thread(thread_request(0x1000)).expect("thread 0 creates");
+        threads.create_thread(thread_request(0x2000)).expect("thread 1 creates");
+        threads.create_thread(thread_request(0x3000)).expect("thread 2 creates");
+        let event = threads.create_event(false, false).expect("event creates");
+        let mut cpu = CpuState::default();
+
+        // Threads 0 and 1 park on an event nothing will signal.
+        assert_eq!(threads.wait_for_object(event), Ok(WaitOutcome::Pending));
+        assert!(threads.park_active(event, &mut cpu));
+        assert_eq!(threads.wait_for_object(event), Ok(WaitOutcome::Pending));
+        assert!(threads.park_active(event, &mut cpu));
+        assert_eq!(threads.current, 2, "the last ready thread runs");
+
+        // It exits: the guest has not finished, the waits have — the parked
+        // threads resume instead of the run reporting an exit.
+        assert!(threads.exit_active(&mut cpu), "a released waiter resumes");
+        assert_eq!(threads.threads[2].state, ThreadState::Terminated);
+        assert_eq!(threads.threads[0].state, ThreadState::Running);
+        assert_eq!(threads.threads[1].state, ThreadState::Ready);
+    }
+
+    #[test]
+    fn the_last_thread_exiting_ends_the_run() {
+        let mut threads = manager();
+        threads.create_thread(thread_request(0x2000)).expect("the sole thread creates");
+        let mut cpu = CpuState::default();
+        assert!(!threads.exit_active(&mut cpu), "nothing remains to run");
     }
 
     #[test]

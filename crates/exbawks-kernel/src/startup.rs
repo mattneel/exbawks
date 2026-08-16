@@ -57,8 +57,12 @@ pub mod ordinal {
     pub const KE_QUERY_SYSTEM_TIME: u16 = 128;
     /// `KeRaiseIrqlToDpcLevel`.
     pub const KE_RAISE_IRQL_TO_DPC_LEVEL: u16 = 129;
+    /// `KeSetEvent`.
+    pub const KE_SET_EVENT: u16 = 145;
     /// `KeStallExecutionProcessor`.
     pub const KE_STALL_EXECUTION_PROCESSOR: u16 = 151;
+    /// `KeWaitForSingleObject`.
+    pub const KE_WAIT_FOR_SINGLE_OBJECT: u16 = 159;
     /// `KfRaiseIrql`.
     pub const KF_RAISE_IRQL: u16 = 160;
     /// `KfLowerIrql`.
@@ -91,6 +95,8 @@ pub mod ordinal {
     pub const NT_CREATE_EVENT: u16 = 189;
     /// `NtCreateFile`.
     pub const NT_CREATE_FILE: u16 = 190;
+    /// `NtCreateMutant`.
+    pub const NT_CREATE_MUTANT: u16 = 192;
     /// `NtDeviceIoControlFile`.
     pub const NT_DEVICE_IO_CONTROL_FILE: u16 = 196;
     /// `NtFreeVirtualMemory`.
@@ -107,14 +113,22 @@ pub mod ordinal {
     pub const NT_QUERY_VOLUME_INFORMATION_FILE: u16 = 218;
     /// `NtReadFile`.
     pub const NT_READ_FILE: u16 = 219;
+    /// `NtReleaseMutant`.
+    pub const NT_RELEASE_MUTANT: u16 = 221;
+    /// `NtResumeThread`.
+    pub const NT_RESUME_THREAD: u16 = 224;
     /// `NtSetEvent`.
     pub const NT_SET_EVENT: u16 = 225;
     /// `NtSetInformationFile`.
     pub const NT_SET_INFORMATION_FILE: u16 = 226;
+    /// `NtSuspendThread`.
+    pub const NT_SUSPEND_THREAD: u16 = 231;
     /// `NtWaitForSingleObject`.
     pub const NT_WAIT_FOR_SINGLE_OBJECT: u16 = 233;
     /// `NtWaitForSingleObjectEx`.
     pub const NT_WAIT_FOR_SINGLE_OBJECT_EX: u16 = 234;
+    /// `NtWaitForMultipleObjectsEx`.
+    pub const NT_WAIT_FOR_MULTIPLE_OBJECTS_EX: u16 = 235;
     /// `NtWriteFile`.
     pub const NT_WRITE_FILE: u16 = 236;
     /// `PsCreateSystemThreadEx`.
@@ -162,8 +176,11 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     registry.register(NtClose)?;
     registry.register(NtCreateEvent)?;
     registry.register(NtSetEvent)?;
+    registry.register(NtResumeThread)?;
+    registry.register(NtSuspendThread)?;
     registry.register(NtWaitForSingleObject)?;
     registry.register(NtWaitForSingleObjectEx)?;
+    registry.register(NtWaitForMultipleObjectsEx)?;
     crate::rtl::register_rtl_exports(registry)?;
     crate::ke::register_ke_exports(registry)?;
     crate::ex::register_ex_exports(registry)?;
@@ -174,6 +191,8 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     crate::xe::register_xe_exports(registry)?;
     crate::irql::register_irql_exports(registry)?;
     crate::av::register_av_exports(registry)?;
+    crate::dispatcher::register_dispatcher_exports(registry)?;
+    crate::mutant::register_mutant_exports(registry)?;
     for (ordinal, name, stack_bytes) in BENIGN_SUCCESS {
         registry.register(SuccessExport::new(ordinal, name, stack_bytes))?;
     }
@@ -344,6 +363,76 @@ impl KernelExport for PsTerminateSystemThread {
     }
 }
 
+/// Resumes a suspended thread, reporting its previous suspend count.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NtResumeThread;
+
+impl KernelExport for NtResumeThread {
+    fn ordinal(&self) -> u16 {
+        ordinal::NT_RESUME_THREAD
+    }
+
+    fn name(&self) -> &'static str {
+        "NtResumeThread"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        8
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // NtResumeThread(ThreadHandle, PreviousSuspendCount).
+        let Some(handle) = stack_argument(context, 0) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        let previous_out = stack_argument(context, 1).unwrap_or(0);
+        match context.services.resume_thread(handle) {
+            Ok(previous) => {
+                if previous_out != 0 {
+                    let _ = context.memory.write_u32(GuestVa(previous_out), previous);
+                }
+                KernelStatus::SUCCESS
+            }
+            Err(_) => KernelStatus::INVALID_HANDLE,
+        }
+    }
+}
+
+/// Suspends a thread, reporting its previous suspend count.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NtSuspendThread;
+
+impl KernelExport for NtSuspendThread {
+    fn ordinal(&self) -> u16 {
+        ordinal::NT_SUSPEND_THREAD
+    }
+
+    fn name(&self) -> &'static str {
+        "NtSuspendThread"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        8
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // NtSuspendThread(ThreadHandle, PreviousSuspendCount).
+        let Some(handle) = stack_argument(context, 0) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        let previous_out = stack_argument(context, 1).unwrap_or(0);
+        match context.services.suspend_thread(handle) {
+            Ok(previous) => {
+                if previous_out != 0 {
+                    let _ = context.memory.write_u32(GuestVa(previous_out), previous);
+                }
+                KernelStatus::SUCCESS
+            }
+            Err(_) => KernelStatus::INVALID_HANDLE,
+        }
+    }
+}
+
 /// Closes one guest handle (minimal object-manager surface).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NtClose;
@@ -509,6 +598,76 @@ impl KernelExport for NtWaitForSingleObjectEx {
     }
 }
 
+/// Waits for one of several objects named by handle.
+///
+/// Only the wait-any form has a faithful cheap implementation: the handles
+/// are tried in order and the first satisfied one is consumed, exactly as
+/// the kernel's own scan does. A wait-all whose objects are not all ready,
+/// and a wait-any with none ready, park the thread on the first unsatisfied
+/// handle; ADR 0017's tri-state resolves the rest.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NtWaitForMultipleObjectsEx;
+
+impl KernelExport for NtWaitForMultipleObjectsEx {
+    fn ordinal(&self) -> u16 {
+        ordinal::NT_WAIT_FOR_MULTIPLE_OBJECTS_EX
+    }
+
+    fn name(&self) -> &'static str {
+        "NtWaitForMultipleObjectsEx"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        24
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // NtWaitForMultipleObjectsEx(Count, Handles, WaitType, WaitMode,
+        //                            Alertable, Timeout); WaitType 0 waits
+        //                            for all, 1 for any.
+        const MAXIMUM_WAIT_OBJECTS: u32 = 64;
+        let (Some(count), Some(handles), Some(wait_type)) =
+            (stack_argument(context, 0), stack_argument(context, 1), stack_argument(context, 2))
+        else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        if count == 0 || count > MAXIMUM_WAIT_OBJECTS || handles == 0 {
+            return KernelStatus::INVALID_PARAMETER;
+        }
+
+        let wait_all = wait_type == 0;
+        let mut pending = None;
+        for index in 0..count {
+            let Ok(handle) = context.memory.read_u32(GuestVa(handles + index * 4)) else {
+                return KernelStatus::ACCESS_VIOLATION;
+            };
+            match context.services.wait_for_object(handle) {
+                Ok(crate::WaitOutcome::Signaled) if !wait_all => {
+                    // STATUS_WAIT_0 + index names the satisfied object.
+                    return KernelStatus(index);
+                }
+                Ok(crate::WaitOutcome::Signaled) => {}
+                // Nothing can signal this one; treat it as satisfied rather
+                // than deadlocking (the single-object waits do the same).
+                Ok(crate::WaitOutcome::TimedOut) => {
+                    if !wait_all {
+                        return KernelStatus(index);
+                    }
+                }
+                Ok(crate::WaitOutcome::Pending) => {
+                    pending = Some(index);
+                    if wait_all {
+                        break;
+                    }
+                }
+                Err(_) => return KernelStatus::INVALID_HANDLE,
+            }
+        }
+        // A parked wait resumes with success already in EAX.
+        KernelStatus(pending.unwrap_or(0))
+    }
+}
+
 /// Reads one 32-bit stack argument above the return-address slot.
 pub(crate) fn stack_argument(context: &KernelCallContext<'_>, index: u32) -> Option<u32> {
     let esp = context.cpu.gpr[4];
@@ -563,7 +722,7 @@ mod tests {
         // four Av video exports, one Nt virtual-memory export, seven Nt
         // file exports, six Mm exports, four symbolic-link exports, two Xe
         // section exports, one benign success export, and two startup stubs.
-        assert_eq!(registry.len(), 65);
+        assert_eq!(registry.len(), 72);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,
