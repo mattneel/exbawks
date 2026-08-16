@@ -126,16 +126,29 @@ Two active threads:
    hardware; the hard-won platform findings live in `docs/whp-notes.md`
    ("Verified on hardware").
 
-   **WHP-M1 (next): drive the real boot through the machine.** Bridge
-   `exbawks-core` to the tier: map the `SoftwareAddressSpace` physical
-   buffer into the partition (needs a stable page-aligned host allocation —
-   the current `Vec<u8>` physical store is NOT page-aligned or address-stable
-   enough; either mint the RAM in a `HostRegion`-like allocation or move to
-   the `exbawks-platform` section machinery), load the XBE as today, set the
-   boot state from `CpuState`, and service `MemoryAccess` exits: gate GPAs
-   dispatch kernel exports (registers sync WHP↔`CpuState` around the call),
-   other unmapped GPAs are faults. SSE/x87 then run natively — the current
-   `movss` wall disappears. Keep the interpreter as the oracle tier.
+   **WHP-M1: DONE — the retail image runs natively.** Guest RAM lives in a
+   page-aligned stable `AlignedBuffer` (exbawks-platform) that the partition
+   maps directly; `Emulator::run_whp` mirrors the software page table into
+   GPA space (epoch-triggered resync), boots from `CpuState` (CR4
+   OSFXSR/OSXMMEXCPT so SSE executes), dispatches kernel gates off
+   fetch-fault exits via the existing gate-by-EIP path (register sync incl.
+   the per-thread `fs` base keeps the cooperative scheduler working
+   unchanged), honors null/sentinel thread exits and the ADR 0015 relaunch,
+   maps exception exits to typed stops, and ticks the virtual clock from a
+   cancel pump. `exbawks run --engine whp`. Hardware-verified findings: an
+   execute fault's GPA is page-aligned — take the exact gate address from
+   the exit RIP; SSE requires CR4 bits or every SSE op is #UD.
+
+   **Current DC3 wall (WHP tier): audio MMIO.** DC3 runs natively through
+   its whole boot, its SSE game code, and D3D/CRT init, and stops touching
+   `0xFE80_0200` from the DSOUND section — the APU register block. **Next
+   (M2): MMIO dispatch.** Route non-gate `MemoryAccess` exits by GPA region
+   (APU `0xFE80_0000`, NV2A GPU `0xFD00_0000`) to device stubs: decode the
+   faulting instruction (the exit carries instruction bytes; the interpreter
+   can execute the access against a device model), start with a
+   read-zero/write-ignore APU stub to see how far DSOUND init tolerates it,
+   then the GPU frontier (graphics HLE feeds the screenshot goal). The
+   interpreter tier remains the deterministic oracle.
 
 2. **Kernel HLE burndown** (substrate-independent, needed under either
    engine). Done this session, in order the retail image demanded them:

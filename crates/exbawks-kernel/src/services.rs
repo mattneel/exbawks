@@ -197,6 +197,11 @@ pub trait KernelServices {
         Err(KernelServiceError::Unsupported)
     }
 
+    /// Returns the byte size of one pool/contiguous allocation.
+    fn pool_block_size(&mut self, _address: u32) -> Result<u32, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
     /// Records that a guest region should survive a soft reboot (ADR 0015).
     ///
     /// `MmPersistContiguousMemory` marks the launch-data page persistent

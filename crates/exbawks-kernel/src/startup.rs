@@ -9,6 +9,14 @@ use crate::{
 pub mod ordinal {
     /// `DbgPrint`.
     pub const DBG_PRINT: u16 = 8;
+    /// `ExAllocatePool`.
+    pub const EX_ALLOCATE_POOL: u16 = 14;
+    /// `ExAllocatePoolWithTag`.
+    pub const EX_ALLOCATE_POOL_WITH_TAG: u16 = 15;
+    /// `ExFreePool`.
+    pub const EX_FREE_POOL: u16 = 17;
+    /// `ExQueryPoolBlockSize`.
+    pub const EX_QUERY_POOL_BLOCK_SIZE: u16 = 23;
     /// `ExQueryNonVolatileSetting`.
     pub const EX_QUERY_NON_VOLATILE_SETTING: u16 = 24;
     /// `HalRegisterShutdownNotification`.
@@ -25,8 +33,16 @@ pub mod ordinal {
     pub const KE_INITIALIZE_DPC: u16 = 107;
     /// `KeInitializeTimerEx`.
     pub const KE_INITIALIZE_TIMER_EX: u16 = 113;
+    /// `KeGetCurrentIrql`.
+    pub const KE_GET_CURRENT_IRQL: u16 = 103;
     /// `KeQuerySystemTime`.
     pub const KE_QUERY_SYSTEM_TIME: u16 = 128;
+    /// `KeRaiseIrqlToDpcLevel`.
+    pub const KE_RAISE_IRQL_TO_DPC_LEVEL: u16 = 129;
+    /// `KfRaiseIrql`.
+    pub const KF_RAISE_IRQL: u16 = 160;
+    /// `KfLowerIrql`.
+    pub const KF_LOWER_IRQL: u16 = 161;
     /// `KeSetTimer`.
     pub const KE_SET_TIMER: u16 = 149;
     /// `MmAllocateContiguousMemory`.
@@ -119,6 +135,7 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     crate::mm::register_mm_exports(registry)?;
     crate::io::register_io_exports(registry)?;
     crate::xe::register_xe_exports(registry)?;
+    crate::irql::register_irql_exports(registry)?;
     for (ordinal, name, stack_bytes) in BENIGN_SUCCESS {
         registry.register(SuccessExport::new(ordinal, name, stack_bytes))?;
     }
@@ -443,10 +460,10 @@ mod tests {
         register_startup_exports(&registry).expect("registration succeeds");
 
         // Seven thread/handle/event exports, six Rtl and four Ke exports,
-        // one Ex executive export, one Nt virtual-memory export, seven Nt
+        // five Ex executive exports, four IRQL exports, one Nt virtual-memory export, seven Nt
         // file exports, six Mm exports, four symbolic-link exports, two Xe
         // section exports, one benign success export, and two startup stubs.
-        assert_eq!(registry.len(), 41);
+        assert_eq!(registry.len(), 49);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,

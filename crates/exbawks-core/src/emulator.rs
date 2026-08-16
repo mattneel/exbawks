@@ -830,6 +830,315 @@ impl Emulator {
 
     /// Removes the active image and resets session state.
     pub fn reset(&mut self) -> Result<(), CoreError> {
+        self.reset_inner()
+    }
+}
+
+/// The Windows Hypervisor Platform execution tier (ADR 0013, WHP-M1).
+///
+/// The guest runs natively on one WHP virtual processor. The partition's
+/// guest-physical mappings mirror the software page table (GPA = guest VA,
+/// backed by the same physical buffer the HLE reads and writes, so the two
+/// tiers stay coherent by construction). Kernel gates stay unmapped: a
+/// `call [slot]` jumps to the gate address, the fetch exits with the gate
+/// GPA, and the existing gate-by-EIP dispatch services it. A cancel pump
+/// interrupts the processor every millisecond to advance the virtual clock.
+#[cfg(all(windows, target_arch = "x86_64"))]
+impl Emulator {
+    /// Runs the guest on the WHP tier until a controlled stop reason.
+    ///
+    /// `max_exits` bounds serviced exits (cancellations excluded), the
+    /// hypervisor-tier analogue of the interpreter's block budget.
+    pub fn run_whp(&mut self, max_exits: usize) -> Result<StopReason, CoreError> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const MAX_RELAUNCHES: u32 = 8;
+
+        if self.loaded.is_none() {
+            return Err(CoreError::NoImageLoaded);
+        }
+        if !exbawks_whp::probe_whp().usable() {
+            return Err(CoreError::Hypervisor(
+                "the Windows Hypervisor Platform is not usable on this host".to_owned(),
+            ));
+        }
+
+        let mut machine = self.whp_build_machine()?;
+        let mut mapped_epoch = self.memory.mapping_epoch();
+
+        // The cancel pump: kicks the processor out of `run` every
+        // millisecond so the virtual clock advances even while the guest
+        // spins without exiting. The guard stops and joins the pump before
+        // the machine drops.
+        struct PumpGuard {
+            stop: Arc<AtomicBool>,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for PumpGuard {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Release);
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let canceller = machine.canceller();
+        let pump_stop = stop_flag.clone();
+        let handle = std::thread::spawn(move || {
+            while !pump_stop.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                canceller.cancel();
+            }
+        });
+        let _pump = PumpGuard { stop: stop_flag, handle: Some(handle) };
+
+        let tick_cell = self.threads.as_ref().and_then(ThreadManager::tick_count_cell);
+        let mut last_tick = std::time::Instant::now();
+        let mut advance_clock = |memory: &SoftwareAddressSpace| {
+            let elapsed = last_tick.elapsed();
+            let ticks = u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX);
+            if ticks > 0
+                && let Some(cell) = tick_cell
+                && let Ok(current) = memory.read_u32(cell)
+            {
+                let _ = memory.write_u32(cell, current.wrapping_add(ticks));
+                last_tick += std::time::Duration::from_millis(u64::from(ticks));
+            }
+        };
+
+        let mut relaunches = 0_u32;
+        let mut serviced = 0_usize;
+        while serviced < max_exits {
+            let exit = machine.run().map_err(|error| CoreError::Hypervisor(error.to_string()))?;
+            let exit_rip = machine.exit_context().rip;
+            match exit {
+                exbawks_whp::WhpExit::Canceled => {
+                    advance_clock(&self.memory);
+                    continue;
+                }
+                exbawks_whp::WhpExit::MemoryAccess(access) => {
+                    serviced += 1;
+                    let gpa = u32::try_from(access.gpa).unwrap_or(u32::MAX);
+                    // An execute fault's GPA is page-aligned, losing the
+                    // slot offset; the exit RIP carries the exact gate
+                    // address the call jumped to.
+                    let fault_va = if access.access_type == 2 {
+                        u32::try_from(exit_rip).unwrap_or(u32::MAX)
+                    } else {
+                        gpa
+                    };
+                    // A thread's start routine returned (ADR 0011): created
+                    // threads return to the exit sentinel; the boot thread
+                    // returns to null. Either exits the thread and switches.
+                    if access.access_type == 2 {
+                        let null_exit = fault_va == 0
+                            && self
+                                .threads
+                                .as_ref()
+                                .is_some_and(ThreadManager::active_exits_on_null_return);
+                        if fault_va == THREAD_EXIT_SENTINEL.0 || null_exit {
+                            self.whp_read_cpu(&mut machine)?;
+                            if let Some(stop) = self.exit_current_thread(self.cpu.gpr[0]) {
+                                return Ok(stop);
+                            }
+                            self.whp_write_cpu(&mut machine)?;
+                            continue;
+                        }
+                    }
+
+                    let gate = gate_ordinal(GuestVa(fault_va)).filter(|_| access.access_type == 2);
+                    let Some(ordinal) = gate else {
+                        self.whp_read_cpu(&mut machine)?;
+                        return Ok(StopReason::GuestFault { address: GuestVa(fault_va) });
+                    };
+
+                    // The call already pushed its return address and jumped;
+                    // the fetch at the gate faulted, exactly the gate-by-EIP
+                    // shape (CORE-004).
+                    self.whp_read_cpu(&mut machine)?;
+                    self.cpu.eip = fault_va;
+                    advance_clock(&self.memory);
+                    if let Some(stop) = self.dispatch_gate_by_eip(ordinal, GuestVa(fault_va))? {
+                        if let StopReason::Reboot { .. } = stop
+                            && relaunches < MAX_RELAUNCHES
+                            && self.relaunch_title()?
+                        {
+                            relaunches += 1;
+                            tracing::info!(relaunches, "whp: soft reboot, relaunching title");
+                            machine = self.whp_build_machine()?;
+                            mapped_epoch = self.memory.mapping_epoch();
+                            continue;
+                        }
+                        return Ok(stop);
+                    }
+                    if self.memory.mapping_epoch() != mapped_epoch {
+                        self.whp_sync_mappings(&mut machine)?;
+                        mapped_epoch = self.memory.mapping_epoch();
+                    }
+                    self.whp_write_cpu(&mut machine)?;
+                }
+                exbawks_whp::WhpExit::Exception(exception) => {
+                    self.whp_read_cpu(&mut machine)?;
+                    let rip = u32::try_from(exit_rip).unwrap_or(u32::MAX);
+                    return Ok(match exception.vector {
+                        // #UD: the instruction itself is the story.
+                        6 => StopReason::UnsupportedInstruction { address: GuestVa(rip) },
+                        // #PF: the faulting address is in the parameter.
+                        14 => StopReason::GuestFault {
+                            address: GuestVa(
+                                u32::try_from(exception.parameter).unwrap_or(u32::MAX),
+                            ),
+                        },
+                        _ => StopReason::GuestFault { address: GuestVa(rip) },
+                    });
+                }
+                exbawks_whp::WhpExit::Halt => {
+                    self.whp_read_cpu(&mut machine)?;
+                    return Ok(StopReason::GuestExit { code: self.cpu.gpr[0] });
+                }
+                exbawks_whp::WhpExit::InvalidRegisterValue => {
+                    return Err(CoreError::Hypervisor(format!(
+                        "the processor rejected the register state at rip {exit_rip:#x}"
+                    )));
+                }
+                exbawks_whp::WhpExit::UnrecoverableException => {
+                    self.whp_read_cpu(&mut machine)?;
+                    return Ok(StopReason::GuestFault {
+                        address: GuestVa(u32::try_from(exit_rip).unwrap_or(u32::MAX)),
+                    });
+                }
+                exbawks_whp::WhpExit::Other(reason) => {
+                    return Err(CoreError::Hypervisor(format!(
+                        "unhandled exit reason {reason:#x} at rip {exit_rip:#x}"
+                    )));
+                }
+            }
+        }
+        Ok(StopReason::BudgetExhausted)
+    }
+
+    /// Creates a partition mirroring the current guest state.
+    fn whp_build_machine(&mut self) -> Result<exbawks_whp::Machine, CoreError> {
+        let mut machine = exbawks_whp::Machine::new()
+            .map_err(|error| CoreError::Hypervisor(error.to_string()))?;
+        self.whp_sync_mappings(&mut machine)?;
+        machine
+            .set_boot_state_32(self.cpu.eip, self.cpu.gpr[4])
+            .map_err(|error| CoreError::Hypervisor(error.to_string()))?;
+        self.whp_write_cpu(&mut machine)?;
+        Ok(machine)
+    }
+
+    /// Mirrors the software page table into the partition's GPA space.
+    ///
+    /// Guest-linear equals guest-physical in the partition (unpaged flat
+    /// mode), so each mapped virtual page's GPA maps to its backing
+    /// physical page's host bytes; contiguous same-permission runs merge
+    /// into one platform call. Gate and unmapped pages stay unmapped, which
+    /// is what makes them exit.
+    fn whp_sync_mappings(&self, machine: &mut exbawks_whp::Machine) -> Result<(), CoreError> {
+        use exbawks_types::{GUEST_PAGE_COUNT, GuestPage};
+
+        let table = self.memory.page_table();
+        let page_size = u64::from(GUEST_PAGE_SIZE);
+        let mut page = 0_usize;
+        while page < GUEST_PAGE_COUNT {
+            let descriptor = table.get(GuestPage(page as u32));
+            if descriptor.kind() != PageKind::Ram {
+                page += 1;
+                continue;
+            }
+            let run_va = page as u64;
+            let run_pa = u64::from(descriptor.physical_page().0);
+            let permissions = descriptor.permissions();
+            let mut length = 1_u64;
+            while page + (length as usize) < GUEST_PAGE_COUNT {
+                let next = table.get(GuestPage((run_va + length) as u32));
+                if next.kind() != PageKind::Ram
+                    || u64::from(next.physical_page().0) != run_pa + length
+                    || next.permissions() != permissions
+                {
+                    break;
+                }
+                length += 1;
+            }
+
+            let mut flags = 1_u32; // Mapped pages are always readable.
+            if permissions.contains(MemoryPermissions::WRITE) {
+                flags |= 2;
+            }
+            if permissions.contains(MemoryPermissions::EXECUTE) {
+                flags |= 4;
+            }
+            machine
+                .map_address_space(
+                    &self.memory,
+                    run_pa * page_size,
+                    run_va * page_size,
+                    length * page_size,
+                    exbawks_whp::MapFlags(flags),
+                )
+                .map_err(|error| CoreError::Hypervisor(error.to_string()))?;
+            page += length as usize;
+        }
+        Ok(())
+    }
+
+    /// Writes the guest CPU state into the virtual processor.
+    fn whp_write_cpu(&self, machine: &mut exbawks_whp::Machine) -> Result<(), CoreError> {
+        use exbawks_whp::{Register, RegisterValue};
+
+        let fs_base = u64::from(self.cpu.segments[exbawks_cpu::Segment::Fs as usize].base);
+        machine
+            .set_registers(&[
+                (Register::Rax, RegisterValue::scalar(u64::from(self.cpu.gpr[0]))),
+                (Register::Rcx, RegisterValue::scalar(u64::from(self.cpu.gpr[1]))),
+                (Register::Rdx, RegisterValue::scalar(u64::from(self.cpu.gpr[2]))),
+                (Register::Rbx, RegisterValue::scalar(u64::from(self.cpu.gpr[3]))),
+                (Register::Rsp, RegisterValue::scalar(u64::from(self.cpu.gpr[4]))),
+                (Register::Rbp, RegisterValue::scalar(u64::from(self.cpu.gpr[5]))),
+                (Register::Rsi, RegisterValue::scalar(u64::from(self.cpu.gpr[6]))),
+                (Register::Rdi, RegisterValue::scalar(u64::from(self.cpu.gpr[7]))),
+                (Register::Rip, RegisterValue::scalar(u64::from(self.cpu.eip))),
+                (Register::Rflags, RegisterValue::scalar(u64::from(self.cpu.eflags | 0x2))),
+                // The flat data segment with the thread's KPCR base.
+                (Register::Fs, RegisterValue::segment(fs_base, 0xFFFF_FFFF, 0x10, 0xC093)),
+            ])
+            .map_err(|error| CoreError::Hypervisor(error.to_string()))
+    }
+
+    /// Reads the virtual processor's state back into the guest CPU state.
+    fn whp_read_cpu(&mut self, machine: &mut exbawks_whp::Machine) -> Result<(), CoreError> {
+        use exbawks_whp::Register;
+
+        const NAMES: [Register; 10] = [
+            Register::Rax,
+            Register::Rcx,
+            Register::Rdx,
+            Register::Rbx,
+            Register::Rsp,
+            Register::Rbp,
+            Register::Rsi,
+            Register::Rdi,
+            Register::Rip,
+            Register::Rflags,
+        ];
+        let values = machine
+            .get_registers(&NAMES)
+            .map_err(|error| CoreError::Hypervisor(error.to_string()))?;
+        for (index, value) in values.iter().take(8).enumerate() {
+            self.cpu.gpr[index] = value.low as u32;
+        }
+        self.cpu.eip = values[8].low as u32;
+        self.cpu.eflags = values[9].low as u32;
+        Ok(())
+    }
+}
+
+impl Emulator {
+    fn reset_inner(&mut self) -> Result<(), CoreError> {
         self.memory = Arc::new(SoftwareAddressSpace::new(self.config.physical_memory_bytes)?);
         self.cpu = CpuState::default();
         self.loaded = None;
@@ -1850,6 +2159,33 @@ mod tests {
 
         /// The NTSTATUS DbgPrint returns for a null format pointer.
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+
+        /// The first-milestone boot title runs natively on the WHP tier:
+        /// guest code executes on the virtual processor, both kernel calls
+        /// dispatch through gate-fetch exits, and the exit status lands in
+        /// EAX — end to end through real hardware virtualization.
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        #[test]
+        fn synthetic_title_boots_on_the_whp_tier() {
+            if !exbawks_whp::probe_whp().usable() {
+                eprintln!("skipping: WHP is not usable on this host");
+                return;
+            }
+            let mut emulator = Emulator::new().expect("emulator must initialize");
+            emulator
+                .load_xbe(synthetic_xbe_with(&BOOT_CODE, &BOOT_THUNKS))
+                .expect("synthetic XBE must load");
+
+            let stop = emulator.run_whp(64).expect("the boot flow must run");
+
+            assert_eq!(stop, StopReason::GuestExit { code: 0 });
+            assert_eq!(emulator.cpu().gpr[6], 42, "esi survived the kernel call unchanged");
+            assert_eq!(
+                emulator.cpu().gpr[7],
+                STATUS_INVALID_PARAMETER,
+                "the export status reached guest eax across the gate exit"
+            );
+        }
 
         #[cfg(windows)]
         #[test]

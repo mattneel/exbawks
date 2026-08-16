@@ -98,6 +98,9 @@ enum Command {
         /// The maximum executed block count.
         #[arg(long, default_value_t = 1 << 20)]
         max_blocks: usize,
+        /// The execution engine.
+        #[arg(long, value_enum, default_value_t = EngineArg::Interpreter)]
+        engine: EngineArg,
     },
     /// Reports the implementation burndown across emulator surfaces.
     Coverage {
@@ -128,6 +131,14 @@ impl From<SurfaceArg> for exbawks_debug::Surface {
             SurfaceArg::Gpu => Self::Gpu,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum EngineArg {
+    /// The deterministic interpreter tier (the golden oracle).
+    Interpreter,
+    /// The Windows Hypervisor Platform tier (ADR 0013; native speed).
+    Whp,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -198,15 +209,22 @@ fn main() -> Result<()> {
         Command::Thunks { path, limit, check_registry } => {
             thunks(&path, limit, check_registry, cli.json)
         }
-        Command::Run { path, ram_mib, trace, trace_host_paths, trace_filter, max_blocks } => run(
-            &path,
+        Command::Run {
+            path,
             ram_mib,
-            trace.as_deref(),
+            trace,
             trace_host_paths,
-            &trace_filter,
+            trace_filter,
             max_blocks,
-            cli.json,
-        ),
+            engine,
+        } => {
+            let tracing = TraceOptions {
+                path: trace.as_deref(),
+                host_paths: trace_host_paths,
+                filter: &trace_filter,
+            };
+            run(&path, ram_mib, &tracing, max_blocks, engine, cli.json)
+        }
         Command::Coverage { surface, xbe, missing } => {
             coverage(surface.map(Into::into), xbe.as_deref(), missing, cli.json)
         }
@@ -486,13 +504,22 @@ fn print_thunk_registry(report: &ThunkRegistryReport) {
     }
 }
 
+/// Trace-output options for one run.
+struct TraceOptions<'a> {
+    /// The JSON Lines output path, when tracing is on.
+    path: Option<&'a Path>,
+    /// Whether records may carry private host paths.
+    host_paths: bool,
+    /// The event-kind filter; empty records everything.
+    filter: &'a [TraceFilterArg],
+}
+
 fn run(
     path: &Path,
     ram_mib: usize,
-    trace: Option<&Path>,
-    trace_host_paths: bool,
-    trace_filter: &[TraceFilterArg],
+    tracing: &TraceOptions<'_>,
     max_blocks: usize,
+    engine: EngineArg,
     json: bool,
 ) -> Result<()> {
     let bytes = read_file(path)?;
@@ -501,15 +528,15 @@ fn run(
         ..EmulatorConfig::default()
     };
     let mut builder = EmulatorBuilder::new().config(config);
-    if let Some(trace_path) = trace {
+    if let Some(trace_path) = tracing.path {
         let file = fs::File::create(trace_path)
             .with_context(|| format!("failed to create {}", trace_path.display()))?;
         let mut sink = JsonLinesTrace::new(std::io::BufWriter::new(file));
-        if trace_host_paths {
+        if tracing.host_paths {
             sink = sink.with_host_path(path.display().to_string());
         }
-        if !trace_filter.is_empty() {
-            sink = sink.with_event_filter(trace_filter.iter().copied().map(TraceEventKind::from));
+        if !tracing.filter.is_empty() {
+            sink = sink.with_event_filter(tracing.filter.iter().copied().map(TraceEventKind::from));
         }
         builder = builder.trace(std::sync::Arc::new(sink));
     }
@@ -526,7 +553,13 @@ fn run(
         Err(error) => eprintln!("warning: no writable hard-disk mount: {error:#}"),
     }
     emulator.load_xbe(bytes).with_context(|| format!("failed to load {}", path.display()))?;
-    let stop = emulator.run(max_blocks)?;
+    let stop = match engine {
+        EngineArg::Interpreter => emulator.run(max_blocks)?,
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        EngineArg::Whp => emulator.run_whp(max_blocks)?,
+        #[cfg(not(all(windows, target_arch = "x86_64")))]
+        EngineArg::Whp => bail!("the WHP engine requires Windows x86-64"),
+    };
 
     if json {
         #[derive(Serialize)]

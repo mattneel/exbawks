@@ -23,7 +23,116 @@ const GAME_REGION_NA: u32 = 0x0000_0001;
 /// Registers the Ex* executive exports.
 pub(crate) fn register_ex_exports(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register(ExQueryNonVolatileSetting)?;
+    registry.register(ExAllocatePool)?;
+    registry.register(ExAllocatePoolWithTag)?;
+    registry.register(ExFreePool)?;
+    registry.register(ExQueryPoolBlockSize)?;
     Ok(())
+}
+
+/// Reports the usable byte size of one pool block in EAX.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ExQueryPoolBlockSize;
+
+impl KernelExport for ExQueryPoolBlockSize {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::EX_QUERY_POOL_BLOCK_SIZE
+    }
+
+    fn name(&self) -> &'static str {
+        "ExQueryPoolBlockSize"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        4
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        let block = stack_argument(context, 0).unwrap_or(0);
+        match context.services.pool_block_size(block) {
+            Ok(size) => KernelStatus(size),
+            Err(_) => KernelStatus(0),
+        }
+    }
+}
+
+/// Serves one pool allocation from the kernel region, returning the pointer
+/// (or NULL) in EAX.
+fn allocate_pool(context: &mut KernelCallContext<'_>) -> KernelStatus {
+    let bytes = stack_argument(context, 0).unwrap_or(0);
+    match context.services.allocate_contiguous(bytes) {
+        Ok(address) => KernelStatus(address.0),
+        Err(_) => KernelStatus(0),
+    }
+}
+
+/// Allocates kernel pool memory.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ExAllocatePool;
+
+impl KernelExport for ExAllocatePool {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::EX_ALLOCATE_POOL
+    }
+
+    fn name(&self) -> &'static str {
+        "ExAllocatePool"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        4
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        allocate_pool(context)
+    }
+}
+
+/// Allocates tagged kernel pool memory (the tag is bookkeeping only).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ExAllocatePoolWithTag;
+
+impl KernelExport for ExAllocatePoolWithTag {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::EX_ALLOCATE_POOL_WITH_TAG
+    }
+
+    fn name(&self) -> &'static str {
+        "ExAllocatePoolWithTag"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        8
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        allocate_pool(context)
+    }
+}
+
+/// Frees pool memory.
+///
+/// The bump allocator cannot reclaim pages yet (MEM-006), so the block
+/// leaks; boot-path pool churn is small.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ExFreePool;
+
+impl KernelExport for ExFreePool {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::EX_FREE_POOL
+    }
+
+    fn name(&self) -> &'static str {
+        "ExFreePool"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        4
+    }
+
+    fn call(&self, _context: &mut KernelCallContext<'_>) -> KernelStatus {
+        KernelStatus::SUCCESS
+    }
 }
 
 /// Returns the canned DWORD value for one EEPROM setting index.

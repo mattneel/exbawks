@@ -260,6 +260,30 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- WHP-M1: the retail image runs natively on the hypervisor tier (ADR 0013).
+  Guest physical RAM moved into a page-aligned, address-stable allocation
+  (`exbawks-platform::AlignedBuffer`) that the partition maps directly — the
+  software MMU and the hypervisor read and write the same bytes, so the two
+  tiers stay coherent by construction. `Emulator::run_whp` mirrors the
+  software page table into guest-physical space (mapping epochs trigger
+  resyncs), boots the vCPU from `CpuState` (SSE enabled via
+  `CR4.OSFXSR/OSXMMEXCPT`), services kernel gates through fetch-fault exits
+  with the existing gate-by-EIP dispatch (registers sync around each call,
+  including the per-thread `fs` base, so the cooperative scheduler works
+  unchanged), honors thread null/sentinel exits and the soft-reboot
+  relaunch, maps intercepted guest exceptions to typed stops, and advances
+  the virtual clock from a cross-thread cancel pump. `exbawks run --engine
+  whp` selects the tier; an end-to-end test boots the synthetic title
+  natively through two gate dispatches to a clean exit. New exports the
+  deeper run demanded: the `Ex*` pool family (`ExAllocatePool`,
+  `ExAllocatePoolWithTag`, `ExFreePool`, `ExQueryPoolBlockSize` over
+  size-tracked pool blocks) and the IRQL family (`KfRaiseIrql`,
+  `KfLowerIrql`, `KeGetCurrentIrql`, `KeRaiseIrqlToDpcLevel` maintaining
+  `KPCR.Irql`). The retail image now runs natively past its SSE game code
+  and D3D/DSOUND initialization and stops at its first audio-hardware MMIO
+  touch (`0xFE80_0200`) — the device-emulation frontier for the next
+  milestone.
+
 ### Performance
 
 - Guest writes are no longer O(page table): `bump_physical_generation`

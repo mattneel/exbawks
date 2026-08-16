@@ -154,6 +154,8 @@ pub(crate) struct ThreadManager {
     /// The image's TLS directory, when it has one; each thread gets a block
     /// built from this template.
     tls_template: Option<TlsTemplate>,
+    /// Byte sizes of contiguous/pool allocations (base → page-rounded size).
+    pool_sizes: HashMap<u32, u32>,
     /// Guest event objects (handle → (manual-reset, signaled)). Under the
     /// cooperative scheduler (ADR 0011) events never block; the state exists
     /// for the guest's own signal/query bookkeeping.
@@ -194,6 +196,7 @@ impl ThreadManager {
             launch_data_page_cell: None,
             tick_count_cell: None,
             tls_template: None,
+            pool_sizes: HashMap::new(),
             events: HashMap::new(),
         }
     }
@@ -617,9 +620,14 @@ impl KernelServices for ThreadManager {
         // A fresh kernel block is contiguous in physical RAM (the bump
         // allocator hands out consecutive pages) and lives in the kernel
         // window, which is what the Mm contiguous family promises.
-        self.allocate_kernel_block(bytes)
-            .map(|range| range.start())
-            .map_err(|_| KernelServiceError::ResourceExhausted)
+        let range =
+            self.allocate_kernel_block(bytes).map_err(|_| KernelServiceError::ResourceExhausted)?;
+        self.pool_sizes.insert(range.start().0, range.len() as u32);
+        Ok(range.start())
+    }
+
+    fn pool_block_size(&mut self, address: u32) -> Result<u32, KernelServiceError> {
+        self.pool_sizes.get(&address).copied().ok_or(KernelServiceError::NotFound)
     }
 
     fn allocate_virtual_memory(

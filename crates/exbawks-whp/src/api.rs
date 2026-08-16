@@ -47,6 +47,8 @@ pub(crate) type WhvGetVirtualProcessorRegisters =
     unsafe extern "system" fn(*mut c_void, u32, *const u32, u32, *mut c_void) -> i32;
 pub(crate) type WhvRunVirtualProcessor =
     unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32) -> i32;
+pub(crate) type WhvCancelRunVirtualProcessor =
+    unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
 
 /// The resolved platform entry points, loaded once per process.
 pub(crate) struct WhpApi {
@@ -61,6 +63,7 @@ pub(crate) struct WhpApi {
     pub set_virtual_processor_registers: WhvSetVirtualProcessorRegisters,
     pub get_virtual_processor_registers: WhvGetVirtualProcessorRegisters,
     pub run_virtual_processor: WhvRunVirtualProcessor,
+    pub cancel_run_virtual_processor: WhvCancelRunVirtualProcessor,
 }
 
 // SAFETY: the struct holds only immutable code pointers into a library that
@@ -131,5 +134,8 @@ fn load_uncached() -> Option<WhpApi> {
             c"WHvGetVirtualProcessorRegisters" as WhvGetVirtualProcessorRegisters
         ),
         run_virtual_processor: resolve!(c"WHvRunVirtualProcessor" as WhvRunVirtualProcessor),
+        cancel_run_virtual_processor: resolve!(
+            c"WHvCancelRunVirtualProcessor" as WhvCancelRunVirtualProcessor
+        ),
     })
 }

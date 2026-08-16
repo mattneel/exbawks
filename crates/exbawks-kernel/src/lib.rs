@@ -8,6 +8,7 @@ mod export;
 mod file;
 mod gate;
 mod io;
+mod irql;
 mod ke;
 mod mm;
 mod ordinals;
@@ -21,13 +22,17 @@ mod xe;
 
 pub use context::KernelCallContext;
 pub use error::KernelError;
-pub use ex::ExQueryNonVolatileSetting;
+pub use ex::{
+    ExAllocatePool, ExAllocatePoolWithTag, ExFreePool, ExQueryNonVolatileSetting,
+    ExQueryPoolBlockSize,
+};
 pub use export::{KernelExport, StubExport, SuccessExport};
 pub use file::{NtCreateFile, NtOpenFile, NtQueryInformationFile, NtReadFile, NtWriteFile};
 pub use gate::{KERNEL_GATE_BASE, KERNEL_GATE_END, gate_address, gate_ordinal};
 pub use io::{
     IoCreateSymbolicLink, IoDeleteSymbolicLink, NtOpenSymbolicLinkObject, NtQuerySymbolicLinkObject,
 };
+pub use irql::{KeGetCurrentIrql, KfLowerIrql, KfRaiseIrql};
 pub use ke::{KeInitializeDpc, KeQuerySystemTime};
 pub use mm::{MmAllocateContiguousMemory, MmGetPhysicalAddress};
 pub use ordinals::{

@@ -29,6 +29,9 @@ pub enum CoreError {
     /// An operation requires an active image.
     #[error("no XBE image is loaded")]
     NoImageLoaded,
+    /// The hypervisor execution tier failed (ADR 0013).
+    #[error("hypervisor tier failure: {0}")]
+    Hypervisor(String),
     /// A section contains more raw bytes than virtual bytes.
     #[error(
         "XBE section {section_index} has raw size {raw_size} \

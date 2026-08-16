@@ -1,11 +1,13 @@
 #![doc = "Host platform services for Exbawks."]
 
+mod aligned;
 mod capabilities;
 mod code_memory;
 mod error;
 mod system_memory;
 pub mod virtual_memory;
 
+pub use aligned::AlignedBuffer;
 pub use capabilities::{HostCapabilities, probe_host_capabilities};
 pub use code_memory::{ExecutableCodeBuffer, WritableCodeBuffer};
 pub use error::PlatformError;

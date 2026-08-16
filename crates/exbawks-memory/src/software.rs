@@ -35,9 +35,16 @@ pub trait GuestMemory: Send + Sync {
 /// A deterministic software implementation of the guest address space.
 #[derive(Debug)]
 pub struct SoftwareAddressSpace {
-    physical: RwLock<Box<[u8]>>,
+    /// Guest physical RAM in a page-aligned, address-stable allocation so a
+    /// hypervisor tier can map the same bytes the software MMU serves
+    /// (ADR 0013).
+    physical: RwLock<exbawks_platform::AlignedBuffer>,
     table: PageTable,
     allocator: Mutex<PhysicalAllocator>,
+    /// Bumped by every mapping mutation (`map_anonymous`, `map_alias`,
+    /// `protect`); a hypervisor tier resynchronizes its guest mappings when
+    /// the epoch changes.
+    mapping_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl SoftwareAddressSpace {
@@ -58,11 +65,35 @@ impl SoftwareAddressSpace {
         let page_count =
             u32::try_from(physical_bytes / page_size).map_err(|_| MemoryError::HostSizeOverflow)?;
 
+        let physical = exbawks_platform::AlignedBuffer::new_zeroed(physical_bytes)
+            .ok_or(MemoryError::InvalidPhysicalSize { bytes: physical_bytes as u64 })?;
         Ok(Self {
-            physical: RwLock::new(vec![0_u8; physical_bytes].into_boxed_slice()),
+            physical: RwLock::new(physical),
             table: PageTable::new(),
             allocator: Mutex::new(PhysicalAllocator::new(page_count)),
+            mapping_epoch: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// The stable base address of guest physical RAM.
+    ///
+    /// The allocation is 4 KiB-aligned and never moves for the lifetime of
+    /// this address space, so a hypervisor tier can map it into a partition;
+    /// interior bytes stay coherent because both tiers address the same
+    /// memory. The pointer must not outlive `self`.
+    #[must_use]
+    pub fn physical_base_ptr(&self) -> *const u8 {
+        self.physical.read().base_ptr()
+    }
+
+    /// The current mapping epoch; changes whenever guest mappings mutate.
+    #[must_use]
+    pub fn mapping_epoch(&self) -> u64 {
+        self.mapping_epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn bump_mapping_epoch(&self) {
+        self.mapping_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Maps zeroed contiguous physical pages into a virtual range.
@@ -80,6 +111,7 @@ impl SoftwareAddressSpace {
             allocator.rollback_last(physical_page, page_count);
             return Err(error);
         }
+        self.bump_mapping_epoch();
         Ok(physical_page.start_pa())
     }
 
@@ -102,7 +134,9 @@ impl SoftwareAddressSpace {
             return Err(MemoryError::PhysicalOutOfRange { address: physical_start });
         }
 
-        self.table.map_ram(range, physical_start.page(), permissions)
+        self.table.map_ram(range, physical_start.page(), permissions)?;
+        self.bump_mapping_epoch();
+        Ok(())
     }
 
     /// Maps a virtual region and copies initial bytes into it.
@@ -135,7 +169,9 @@ impl SoftwareAddressSpace {
         // The exclusive physical lock keeps permission changes out of the
         // window between access validation and the byte copies.
         let _physical = self.physical.write();
-        self.table.protect(range, permissions)
+        self.table.protect(range, permissions)?;
+        self.bump_mapping_epoch();
+        Ok(())
     }
 
     /// Returns the physical RAM size.
@@ -161,12 +197,12 @@ impl SoftwareAddressSpace {
             AccessBuffer::Read(output) => {
                 let physical = self.physical.read();
                 validate_access(&self.table, physical.len(), access, address, output.len())?;
-                copy_from_guest(&self.table, physical.as_ref(), access, address, output)
+                copy_from_guest(&self.table, &physical, access, address, output)
             }
             AccessBuffer::Write(input) => {
                 let mut physical = self.physical.write();
                 validate_access(&self.table, physical.len(), access, address, input.len())?;
-                copy_to_guest(&self.table, physical.as_mut(), access, address, input)?;
+                copy_to_guest(&self.table, &mut physical, access, address, input)?;
                 crate::access::bump_written_generations(&self.table, address, input.len());
                 Ok(())
             }
