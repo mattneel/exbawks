@@ -50,11 +50,12 @@ pub use rtl::{
 };
 pub use services::{
     FileInfo, FileOpenRequest, FileOpened, KernelServiceError, KernelServices, ThreadCreateRequest,
-    ThreadCreated, UnsupportedServices, VirtualAllocRequest, VirtualAllocation,
+    ThreadCreated, UnsupportedServices, VirtualAllocRequest, VirtualAllocation, WaitOutcome,
 };
 pub use startup::{
-    DbgPrint, HalReturnToFirmware, NtClose, NtCreateEvent, NtSetEvent, PsCreateSystemThreadEx,
-    PsTerminateSystemThread, ordinal, register_startup_exports,
+    DbgPrint, HalReturnToFirmware, NtClose, NtCreateEvent, NtSetEvent, NtWaitForSingleObject,
+    NtWaitForSingleObjectEx, PsCreateSystemThreadEx, PsTerminateSystemThread, ordinal,
+    register_startup_exports,
 };
 pub use status::KernelStatus;
 pub use vm::NtAllocateVirtualMemory;

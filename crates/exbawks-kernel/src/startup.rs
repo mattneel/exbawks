@@ -21,6 +21,8 @@ pub mod ordinal {
     pub const EX_QUERY_NON_VOLATILE_SETTING: u16 = 24;
     /// `HalGetInterruptVector`.
     pub const HAL_GET_INTERRUPT_VECTOR: u16 = 44;
+    /// `HalReadWritePCISpace`.
+    pub const HAL_READ_WRITE_PCI_SPACE: u16 = 46;
     /// `HalRegisterShutdownNotification`.
     pub const HAL_REGISTER_SHUTDOWN_NOTIFICATION: u16 = 47;
     /// `HalReturnToFirmware`.
@@ -99,6 +101,10 @@ pub mod ordinal {
     pub const NT_SET_EVENT: u16 = 225;
     /// `NtSetInformationFile`.
     pub const NT_SET_INFORMATION_FILE: u16 = 226;
+    /// `NtWaitForSingleObject`.
+    pub const NT_WAIT_FOR_SINGLE_OBJECT: u16 = 233;
+    /// `NtWaitForSingleObjectEx`.
+    pub const NT_WAIT_FOR_SINGLE_OBJECT_EX: u16 = 234;
     /// `NtWriteFile`.
     pub const NT_WRITE_FILE: u16 = 236;
     /// `PsCreateSystemThreadEx`.
@@ -148,6 +154,8 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     registry.register(NtClose)?;
     registry.register(NtCreateEvent)?;
     registry.register(NtSetEvent)?;
+    registry.register(NtWaitForSingleObject)?;
+    registry.register(NtWaitForSingleObjectEx)?;
     crate::rtl::register_rtl_exports(registry)?;
     crate::ke::register_ke_exports(registry)?;
     crate::ex::register_ex_exports(registry)?;
@@ -431,6 +439,67 @@ impl KernelExport for NtSetEvent {
     }
 }
 
+/// `STATUS_TIMEOUT`.
+const STATUS_TIMEOUT: u32 = 0x0000_0102;
+
+/// Waits on one handle (event or thread), shared by both forms.
+fn wait_for_single(context: &mut KernelCallContext<'_>) -> KernelStatus {
+    let Some(handle) = stack_argument(context, 0) else {
+        return KernelStatus::INVALID_PARAMETER;
+    };
+    match context.services.wait_for_object(handle) {
+        // A pending wait parks this thread after the export returns; the
+        // saved EAX must already read success for when it wakes.
+        Ok(crate::WaitOutcome::Signaled | crate::WaitOutcome::Pending) => KernelStatus::SUCCESS,
+        Ok(crate::WaitOutcome::TimedOut) => KernelStatus(STATUS_TIMEOUT),
+        Err(_) => KernelStatus::INVALID_HANDLE,
+    }
+}
+
+/// Waits for one dispatcher object to signal.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NtWaitForSingleObject;
+
+impl KernelExport for NtWaitForSingleObject {
+    fn ordinal(&self) -> u16 {
+        ordinal::NT_WAIT_FOR_SINGLE_OBJECT
+    }
+
+    fn name(&self) -> &'static str {
+        "NtWaitForSingleObject"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        12
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        wait_for_single(context)
+    }
+}
+
+/// Waits for one dispatcher object to signal (the alertable form).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NtWaitForSingleObjectEx;
+
+impl KernelExport for NtWaitForSingleObjectEx {
+    fn ordinal(&self) -> u16 {
+        ordinal::NT_WAIT_FOR_SINGLE_OBJECT_EX
+    }
+
+    fn name(&self) -> &'static str {
+        "NtWaitForSingleObjectEx"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        16
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        wait_for_single(context)
+    }
+}
+
 /// Reads one 32-bit stack argument above the return-address slot.
 pub(crate) fn stack_argument(context: &KernelCallContext<'_>, index: u32) -> Option<u32> {
     let esp = context.cpu.gpr[4];
@@ -480,11 +549,11 @@ mod tests {
         let registry = KernelRegistry::new();
         register_startup_exports(&registry).expect("registration succeeds");
 
-        // Seven thread/handle/event exports, six Rtl and four Ke exports,
-        // five Ex executive exports, seven IRQL/interrupt exports, one Nt virtual-memory export, seven Nt
+        // Nine thread/handle/event/wait exports, six Rtl and four Ke exports,
+        // five Ex executive exports, eight IRQL/interrupt/PCI exports, one Nt virtual-memory export, seven Nt
         // file exports, six Mm exports, four symbolic-link exports, two Xe
         // section exports, one benign success export, and two startup stubs.
-        assert_eq!(registry.len(), 57);
+        assert_eq!(registry.len(), 60);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,

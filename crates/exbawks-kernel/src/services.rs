@@ -95,6 +95,18 @@ pub struct FileInfo {
     pub directory: bool,
 }
 
+/// The disposition of a wait request (ADR 0017).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// The object is already signaled (an auto-reset event is consumed).
+    Signaled,
+    /// The wait parks the calling thread until the object signals.
+    Pending,
+    /// No other thread is runnable to ever signal the object; the wait
+    /// reports a timeout instead of deadlocking the guest.
+    TimedOut,
+}
+
 /// A kernel service failure.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum KernelServiceError {
@@ -207,6 +219,15 @@ pub trait KernelServices {
         Err(KernelServiceError::Unsupported)
     }
 
+    /// Claims the GPU instance-memory region (ADR 0013 exit economics).
+    ///
+    /// Like [`KernelServices::allocate_contiguous`], but the emulator also
+    /// records the region so the hypervisor tier can alias it at the NV2A
+    /// `PRAMIN` window instead of trapping every access.
+    fn claim_gpu_instance(&mut self, bytes: u32) -> Result<GuestVa, KernelServiceError> {
+        self.allocate_contiguous(bytes)
+    }
+
     /// Returns the byte size of one pool/contiguous allocation.
     fn pool_block_size(&mut self, _address: u32) -> Result<u32, KernelServiceError> {
         Err(KernelServiceError::Unsupported)
@@ -249,6 +270,11 @@ pub trait KernelServices {
 
     /// Signals an event, returning its previous signaled state.
     fn set_event(&mut self, _handle: u32) -> Result<bool, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
+    /// Begins a wait on one handle (event or thread).
+    fn wait_for_object(&mut self, _handle: u32) -> Result<WaitOutcome, KernelServiceError> {
         Err(KernelServiceError::Unsupported)
     }
 

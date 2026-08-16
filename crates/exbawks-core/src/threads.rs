@@ -7,7 +7,7 @@ use std::sync::Arc;
 use exbawks_cpu::{CpuState, Segment, SegmentState};
 use exbawks_kernel::{
     FileInfo, FileOpenRequest, FileOpened, KernelServiceError, KernelServices, ThreadCreateRequest,
-    ThreadCreated, VirtualAllocRequest, VirtualAllocation,
+    ThreadCreated, VirtualAllocRequest, VirtualAllocation, WaitOutcome,
 };
 use exbawks_memory::{GuestMemory, MemoryError, SoftwareAddressSpace};
 use exbawks_types::{GUEST_PAGE_SIZE, GuestRange, GuestVa, MemoryPermissions};
@@ -86,6 +86,8 @@ pub(crate) enum ThreadState {
     Running,
     /// Created suspended; a resume makes it ready.
     Suspended,
+    /// Parked until the named handle signals (ADR 0017).
+    Waiting(u32),
     /// Finished; never scheduled again.
     Terminated,
 }
@@ -122,6 +124,11 @@ pub(crate) enum PendingAction {
         /// The guest exit status.
         status: u32,
     },
+    /// The calling thread parks until the handle signals (ADR 0017).
+    Wait {
+        /// The awaited guest handle.
+        handle: u32,
+    },
 }
 
 /// The guest thread table, kernel-object allocator, and service surface.
@@ -156,6 +163,8 @@ pub(crate) struct ThreadManager {
     tls_template: Option<TlsTemplate>,
     /// Byte sizes of contiguous/pool allocations (base → page-rounded size).
     pool_sizes: HashMap<u32, u32>,
+    /// The claimed GPU instance-memory region (base, page-rounded size).
+    gpu_instance: Option<(GuestVa, u32)>,
     /// Guest event objects (handle → (manual-reset, signaled)). Under the
     /// cooperative scheduler (ADR 0011) events never block; the state exists
     /// for the guest's own signal/query bookkeeping.
@@ -197,8 +206,41 @@ impl ThreadManager {
             tick_count_cell: None,
             tls_template: None,
             pool_sizes: HashMap::new(),
+            gpu_instance: None,
             events: HashMap::new(),
         }
+    }
+
+    /// The claimed GPU instance-memory region, when one exists.
+    pub(crate) fn gpu_instance(&self) -> Option<(GuestVa, u32)> {
+        self.gpu_instance
+    }
+
+    /// Rotates to the next ready thread, round-robin (ADR 0017).
+    ///
+    /// Saves the active thread's context from `cpu` and loads the next
+    /// ready thread's context into it. Returns `false` (leaving `cpu`
+    /// untouched) when no other thread is ready to run.
+    pub(crate) fn rotate_active(&mut self, cpu: &mut CpuState) -> bool {
+        let count = self.threads.len();
+        if count < 2 {
+            return false;
+        }
+        let next = (1..count)
+            .map(|offset| (self.current + offset) % count)
+            .find(|index| self.threads[*index].state == ThreadState::Ready);
+        let Some(next) = next else {
+            return false;
+        };
+
+        self.threads[self.current].cpu = cpu.clone();
+        if self.threads[self.current].state == ThreadState::Running {
+            self.threads[self.current].state = ThreadState::Ready;
+        }
+        self.threads[next].state = ThreadState::Running;
+        *cpu = self.threads[next].cpu.clone();
+        self.current = next;
+        true
     }
 
     /// Returns the guest address of the `KeTickCount` cell, when imported.
@@ -447,6 +489,13 @@ impl ThreadManager {
         if let Some(thread) = self.threads.get_mut(self.current) {
             thread.state = ThreadState::Terminated;
         }
+        // Joiners of this thread's handle wake (ADR 0017).
+        let exited_handle = 0x0000_E000 + (self.current as u32) * 4;
+        for thread in &mut self.threads {
+            if thread.state == ThreadState::Waiting(exited_handle) {
+                thread.state = ThreadState::Ready;
+            }
+        }
         // FIFO by creation order (ADR 0011).
         let Some(next) = self.threads.iter().position(|thread| thread.state == ThreadState::Ready)
         else {
@@ -455,6 +504,29 @@ impl ThreadManager {
         self.threads[next].state = ThreadState::Running;
         // The time-stamp counter is per-core, not per-thread, so it carries
         // across the switch instead of resetting to the child's default.
+        let tsc = active_cpu.tsc;
+        *active_cpu = self.threads[next].cpu.clone();
+        active_cpu.tsc = tsc;
+        self.current = next;
+        true
+    }
+
+    /// Parks the active thread on a handle and resumes the next ready one.
+    ///
+    /// Returns `false` when no other thread is runnable (the wait service
+    /// reports a timeout instead of parking in that case, so this is a
+    /// should-not-happen guard).
+    pub(crate) fn park_active(&mut self, handle: u32, active_cpu: &mut CpuState) -> bool {
+        let Some(next) = self.threads.iter().enumerate().position(|(index, thread)| {
+            index != self.current && thread.state == ThreadState::Ready
+        }) else {
+            return false;
+        };
+        if let Some(thread) = self.threads.get_mut(self.current) {
+            thread.cpu = active_cpu.clone();
+            thread.state = ThreadState::Waiting(handle);
+        }
+        self.threads[next].state = ThreadState::Running;
         let tsc = active_cpu.tsc;
         *active_cpu = self.threads[next].cpu.clone();
         active_cpu.tsc = tsc;
@@ -550,12 +622,66 @@ impl KernelServices for ThreadManager {
     }
 
     fn set_event(&mut self, handle: u32) -> Result<bool, KernelServiceError> {
-        let Some((_, signaled)) = self.events.get_mut(&handle) else {
+        let Some((manual_reset, signaled)) = self.events.get_mut(&handle) else {
             return Err(KernelServiceError::InvalidHandle);
         };
         let previous = *signaled;
         *signaled = true;
+        let manual = *manual_reset;
+        // Wake the parked waiters: all of them for a manual-reset event,
+        // one (consuming the signal) for an auto-reset event.
+        let mut woke = false;
+        for thread in &mut self.threads {
+            if thread.state == ThreadState::Waiting(handle) {
+                thread.state = ThreadState::Ready;
+                woke = true;
+                if !manual {
+                    break;
+                }
+            }
+        }
+        if woke
+            && !manual
+            && let Some((_, signaled)) = self.events.get_mut(&handle)
+        {
+            *signaled = false;
+        }
         Ok(previous)
+    }
+
+    fn wait_for_object(&mut self, handle: u32) -> Result<WaitOutcome, KernelServiceError> {
+        let another_runnable = self
+            .threads
+            .iter()
+            .enumerate()
+            .any(|(index, thread)| index != self.current && thread.state == ThreadState::Ready);
+        // An event: signaled means no wait (auto-reset consumes the signal).
+        if let Some((manual_reset, signaled)) = self.events.get_mut(&handle) {
+            if *signaled {
+                if !*manual_reset {
+                    *signaled = false;
+                }
+                return Ok(WaitOutcome::Signaled);
+            }
+            if !another_runnable {
+                return Ok(WaitOutcome::TimedOut);
+            }
+            self.pending = Some(PendingAction::Wait { handle });
+            return Ok(WaitOutcome::Pending);
+        }
+        // A thread handle: signaled once the thread terminates.
+        if handle >= 0x0000_E000 && self.handles.contains(&handle) {
+            let index = ((handle - 0x0000_E000) / 4) as usize;
+            if self.threads.get(index).is_some_and(|t| t.state == ThreadState::Terminated) {
+                return Ok(WaitOutcome::Signaled);
+            }
+            if !another_runnable {
+                return Ok(WaitOutcome::TimedOut);
+            }
+            self.pending = Some(PendingAction::Wait { handle });
+            return Ok(WaitOutcome::Pending);
+        }
+        Err(KernelServiceError::InvalidHandle)
     }
 
     fn open_file(&mut self, request: FileOpenRequest) -> Result<FileOpened, KernelServiceError> {
@@ -638,6 +764,13 @@ impl KernelServices for ThreadManager {
         self.pool_sizes.get(&address).copied().ok_or(KernelServiceError::NotFound)
     }
 
+    fn claim_gpu_instance(&mut self, bytes: u32) -> Result<GuestVa, KernelServiceError> {
+        let base = self.allocate_contiguous(bytes)?;
+        let size = self.pool_sizes.get(&base.0).copied().unwrap_or(bytes);
+        self.gpu_instance = Some((base, size));
+        Ok(base)
+    }
+
     fn allocate_virtual_memory(
         &mut self,
         request: VirtualAllocRequest,
@@ -710,6 +843,68 @@ mod tests {
     fn manager() -> ThreadManager {
         let memory = Arc::new(SoftwareAddressSpace::new(4 * 1024 * 1024).expect("memory is valid"));
         ThreadManager::new(memory, None, None)
+    }
+
+    /// Builds a request for a child thread starting at `entry`.
+    fn thread_request(entry: u32) -> ThreadCreateRequest {
+        ThreadCreateRequest {
+            thread_extension_size: 0,
+            kernel_stack_size: 0x4000,
+            tls_data_size: 0,
+            start_routine: GuestVa(entry),
+            start_context1: 0,
+            start_context2: 0,
+            create_suspended: false,
+        }
+    }
+
+    #[test]
+    fn a_wait_parks_the_thread_and_a_signal_wakes_it() {
+        let mut threads = manager();
+        // The active thread is index 0; a second thread makes the wait park.
+        threads.create_thread(thread_request(0x2000)).expect("worker A creates");
+        threads.create_thread(thread_request(0x3000)).expect("worker B creates");
+        let event = threads.create_event(false, false).expect("event creates");
+
+        // Thread 0 waits on the unsignaled event; another thread is
+        // runnable, so the wait parks.
+        assert_eq!(threads.wait_for_object(event), Ok(WaitOutcome::Pending));
+        let mut cpu = CpuState::default();
+        assert!(threads.park_active(event, &mut cpu), "the wait parks and switches");
+        assert_eq!(threads.current, 1, "a ready thread now runs");
+        assert_eq!(threads.threads[0].state, ThreadState::Waiting(event));
+
+        // Signalling the auto-reset event wakes exactly the parked waiter.
+        assert_eq!(threads.set_event(event), Ok(false));
+        assert_eq!(threads.threads[0].state, ThreadState::Ready);
+    }
+
+    #[test]
+    fn a_wait_with_no_other_thread_times_out() {
+        let mut threads = manager();
+        threads.create_thread(thread_request(0x2000)).expect("the sole thread creates");
+        let event = threads.create_event(false, false).expect("event creates");
+        // No other thread is runnable, so a wait cannot park — it times out
+        // instead of deadlocking the guest.
+        assert_eq!(threads.wait_for_object(event), Ok(WaitOutcome::TimedOut));
+    }
+
+    #[test]
+    fn rotate_round_robins_ready_threads() {
+        let mut threads = manager();
+        threads.create_thread(thread_request(0x1000)).expect("thread 0 creates");
+        threads.create_thread(thread_request(0x2000)).expect("thread 1 creates");
+        threads.create_thread(thread_request(0x3000)).expect("thread 2 creates");
+        let mut cpu = CpuState { eip: 0x1000, ..CpuState::default() };
+
+        assert_eq!(threads.current, 0);
+        assert!(threads.rotate_active(&mut cpu));
+        assert_eq!(threads.current, 1);
+        assert!(threads.rotate_active(&mut cpu));
+        assert_eq!(threads.current, 2);
+        assert!(threads.rotate_active(&mut cpu), "wraps back to thread 0");
+        assert_eq!(threads.current, 0);
+        assert_eq!(cpu.eip, 0x1000, "thread 0's saved context returns intact");
     }
 
     #[test]
