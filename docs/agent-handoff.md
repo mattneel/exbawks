@@ -186,20 +186,32 @@ Two active threads:
    correct and stays (it is how a *real* settings-style relaunch will work);
    it simply no longer triggers on DC3's boot.
 
-   **Current DC3 wall: `IoCreateSymbolicLink` (ordinal 67).** DC3 is mounting
-   its drive letters (`D:` → `\Device\CdRom0`, `T:`/`U:` → title/user data on
-   the HDD) through the object namespace. Next: implement
-   `IoCreateSymbolicLink`/`IoDeleteSymbolicLink` (HLE-005 slice) — record the
-   link name → target string in a table the host file device consults during
-   path resolution, so guest opens through `\??\D:` etc. resolve through the
-   game's own links rather than the hard-coded prefix list in `hostfs.rs`.
-   T:/U: (save/title data) need a writable mount decision (ADR 0014 is
-   read-only; likely a git-ignored scratch directory per title). After that
-   the game should `NtReadFile` real assets, then the long pole is graphics
-   HLE (only `NullGraphicsBackend` exists), which the screenshot/frame-dump
-   command hangs off. Debug recipe that cracked this wall, for reuse: dump
-   the `LAUNCH_DATA_PAGE` **data area** (+`0x400`), not just the header — the
-   dashboard reason code names the failing subsystem precisely.
+   After the geometry fix, landed in wall order: `IoCreateSymbolicLink` /
+   `IoDeleteSymbolicLink` (drive-letter mounting through a link table the
+   file device consults during resolution); the **writable hard-disk mount**
+   (ADR 0016: partition1 → `%LOCALAPPDATA%\exbawks\hdd\<title-id>\`, with
+   directory/file creation and `NtWriteFile` — DC3 creates its `TDATA` dir
+   instead of reading the disk as full); and `RtlInitAnsiString` /
+   `RtlEqualString`. Debug recipe that cracked the reboot wall, for reuse:
+   dump the `LAUNCH_DATA_PAGE` **data area** (+`0x400`), not just the header
+   — the dashboard reason code names the failing subsystem precisely (it is
+   now a permanent `tracing::debug` in `relaunch_title`).
+
+   **Current DC3 wall: the CRT TLS accessor.** At guest `0x1A8F92`:
+   `mov ecx, fs:[4]; mov eax, ds:[0x61E828]; mov eax, [ecx+eax*4];
+   mov [eax+4], ecx` — the compiler's thread-local-storage pattern. On the
+   Xbox the TIB field at `fs:[4]` holds the thread's **TLS-pointer array**
+   (desktop MSVC uses `fs:[0x2C]`; the XDK CRT repurposes TIB+4), and
+   `ds:[0x61E828]` is `_tls_index`. Our KPCR writes `NtTib.StackBase` there,
+   so the game indexes stack garbage and faults at address 4. Fix (CORE-003
+   extension, in `threads.rs::build_thread_pages`): allocate a small
+   per-thread TLS array page, point `fs:[4]` at it, and make slot
+   `[_tls_index]` point to the thread's TLS block (the XBE header names the
+   TLS template: raw data start/end, zero-fill size — copy the template per
+   thread; the boot thread and created threads both need it). After TLS the
+   game should read real assets (`NtReadFile` works), then the long pole is
+   graphics HLE (only `NullGraphicsBackend` exists), which the
+   screenshot/frame-dump command hangs off.
 
 The retail image stays outside the repository; automated tests remain
 synthetic.

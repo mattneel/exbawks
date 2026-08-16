@@ -15,6 +15,10 @@ pub mod ordinal {
     pub const HAL_REGISTER_SHUTDOWN_NOTIFICATION: u16 = 47;
     /// `HalReturnToFirmware`.
     pub const HAL_RETURN_TO_FIRMWARE: u16 = 49;
+    /// `IoCreateSymbolicLink`.
+    pub const IO_CREATE_SYMBOLIC_LINK: u16 = 67;
+    /// `IoDeleteSymbolicLink`.
+    pub const IO_DELETE_SYMBOLIC_LINK: u16 = 69;
     /// `KeDelayExecutionThread`.
     pub const KE_DELAY_EXECUTION_THREAD: u16 = 99;
     /// `KeInitializeDpc`.
@@ -55,12 +59,18 @@ pub mod ordinal {
     pub const NT_READ_FILE: u16 = 219;
     /// `NtSetEvent`.
     pub const NT_SET_EVENT: u16 = 225;
+    /// `NtWriteFile`.
+    pub const NT_WRITE_FILE: u16 = 236;
     /// `PsCreateSystemThreadEx`.
     pub const PS_CREATE_SYSTEM_THREAD_EX: u16 = 255;
     /// `PsTerminateSystemThread`.
     pub const PS_TERMINATE_SYSTEM_THREAD: u16 = 258;
     /// `RtlEnterCriticalSection`.
     pub const RTL_ENTER_CRITICAL_SECTION: u16 = 277;
+    /// `RtlEqualString`.
+    pub const RTL_EQUAL_STRING: u16 = 279;
+    /// `RtlInitAnsiString`.
+    pub const RTL_INIT_ANSI_STRING: u16 = 289;
     /// `RtlInitializeCriticalSection`.
     pub const RTL_INITIALIZE_CRITICAL_SECTION: u16 = 291;
     /// `RtlLeaveCriticalSection`.
@@ -95,6 +105,7 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     crate::vm::register_vm_exports(registry)?;
     crate::file::register_file_exports(registry)?;
     crate::mm::register_mm_exports(registry)?;
+    crate::io::register_io_exports(registry)?;
     for (ordinal, name, stack_bytes) in BENIGN_SUCCESS {
         registry.register(SuccessExport::new(ordinal, name, stack_bytes))?;
     }
@@ -343,11 +354,12 @@ mod tests {
         let registry = KernelRegistry::new();
         register_startup_exports(&registry).expect("registration succeeds");
 
-        // Five thread/handle exports, four Rtl and three Ke dispatcher
-        // exports, one Ex executive export, one Nt virtual-memory export, six
-        // Nt file exports, five Mm contiguous exports, one benign success
-        // export, and four startup stubs.
-        assert_eq!(registry.len(), 30);
+        // Five thread/handle exports, six Rtl and three Ke dispatcher
+        // exports, one Ex executive export, one Nt virtual-memory export,
+        // seven Nt file exports, five Mm contiguous exports, two Io
+        // symbolic-link exports, one benign success export, and four startup
+        // stubs.
+        assert_eq!(registry.len(), 35);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,

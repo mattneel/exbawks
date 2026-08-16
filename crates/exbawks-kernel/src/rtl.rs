@@ -30,6 +30,8 @@ pub(crate) fn register_rtl_exports(registry: &KernelRegistry) -> Result<(), Kern
     registry.register(RtlEnterCriticalSection)?;
     registry.register(RtlLeaveCriticalSection)?;
     registry.register(RtlNtStatusToDosError)?;
+    registry.register(RtlInitAnsiString)?;
+    registry.register(RtlEqualString)?;
     Ok(())
 }
 
@@ -164,6 +166,100 @@ impl KernelExport for RtlLeaveCriticalSection {
         if recursion == 0 {
             set_field(context, base, OWNING_THREAD, 0);
         }
+        KernelStatus::SUCCESS
+    }
+}
+
+/// Reads one guest `ANSI_STRING`'s bytes (`Length`@0, `Buffer`@4).
+fn ansi_string_bytes(context: &KernelCallContext<'_>, pointer: u32) -> Option<Vec<u8>> {
+    let length = (context.memory.read_u32(GuestVa(pointer)).ok()? & 0xFFFF) as usize;
+    let buffer = context.memory.read_u32(GuestVa(pointer.wrapping_add(4))).ok()?;
+    let mut bytes = vec![0_u8; length];
+    if length > 0 {
+        context.memory.read(GuestVa(buffer), &mut bytes).ok()?;
+    }
+    Some(bytes)
+}
+
+/// Compares two guest `ANSI_STRING`s for equality, returned as a BOOLEAN.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RtlEqualString;
+
+impl KernelExport for RtlEqualString {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::RTL_EQUAL_STRING
+    }
+
+    fn name(&self) -> &'static str {
+        "RtlEqualString"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        12
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // RtlEqualString(String1, String2, CaseInSensitive) -> BOOLEAN in EAX.
+        let (Some(first), Some(second)) = (stack_argument(context, 0), stack_argument(context, 1))
+        else {
+            return KernelStatus(0);
+        };
+        let case_insensitive = stack_argument(context, 2).unwrap_or(0) & 0xFF != 0;
+        let (Some(a), Some(b)) =
+            (ansi_string_bytes(context, first), ansi_string_bytes(context, second))
+        else {
+            return KernelStatus(0);
+        };
+        let equal = if case_insensitive { a.eq_ignore_ascii_case(&b) } else { a == b };
+        KernelStatus(u32::from(equal))
+    }
+}
+
+/// Initializes a guest `ANSI_STRING` from a zero-terminated source string.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RtlInitAnsiString;
+
+impl KernelExport for RtlInitAnsiString {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::RTL_INIT_ANSI_STRING
+    }
+
+    fn name(&self) -> &'static str {
+        "RtlInitAnsiString"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        8
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // RtlInitAnsiString(DestinationString, SourceString). The destination
+        // aliases the source buffer; Length is the source's strlen (capped to
+        // the u16 field) and MaximumLength includes the terminator.
+        let (Some(dest), Some(source)) = (stack_argument(context, 0), stack_argument(context, 1))
+        else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        if dest == 0 {
+            return KernelStatus::INVALID_PARAMETER;
+        }
+
+        let mut length = 0_u32;
+        if source != 0 {
+            const LIMIT: u32 = 0xFFFE;
+            while length < LIMIT {
+                let mut byte = [0_u8];
+                match context.memory.read(GuestVa(source.wrapping_add(length)), &mut byte) {
+                    Ok(()) if byte[0] != 0 => length += 1,
+                    _ => break,
+                }
+            }
+        }
+        let maximum = if source == 0 { 0 } else { length + 1 };
+        let packed = (length & 0xFFFF) | ((maximum & 0xFFFF) << 16);
+        set_field(context, dest, 0, packed);
+        set_field(context, dest, 4, source);
+        // The export returns VOID; the status value is unobserved.
         KernelStatus::SUCCESS
     }
 }

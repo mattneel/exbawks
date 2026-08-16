@@ -7,6 +7,7 @@ mod ex;
 mod export;
 mod file;
 mod gate;
+mod io;
 mod ke;
 mod mm;
 mod ordinals;
@@ -21,8 +22,9 @@ pub use context::KernelCallContext;
 pub use error::KernelError;
 pub use ex::ExQueryNonVolatileSetting;
 pub use export::{KernelExport, StubExport, SuccessExport};
-pub use file::{NtCreateFile, NtOpenFile, NtQueryInformationFile, NtReadFile};
+pub use file::{NtCreateFile, NtOpenFile, NtQueryInformationFile, NtReadFile, NtWriteFile};
 pub use gate::{KERNEL_GATE_BASE, KERNEL_GATE_END, gate_address, gate_ordinal};
+pub use io::{IoCreateSymbolicLink, IoDeleteSymbolicLink};
 pub use ke::KeInitializeDpc;
 pub use mm::{MmAllocateContiguousMemory, MmGetPhysicalAddress};
 pub use ordinals::{
@@ -30,8 +32,8 @@ pub use ordinals::{
 };
 pub use registry::KernelRegistry;
 pub use rtl::{
-    RtlEnterCriticalSection, RtlInitializeCriticalSection, RtlLeaveCriticalSection,
-    RtlNtStatusToDosError,
+    RtlEnterCriticalSection, RtlEqualString, RtlInitAnsiString, RtlInitializeCriticalSection,
+    RtlLeaveCriticalSection, RtlNtStatusToDosError,
 };
 pub use services::{
     FileInfo, FileOpenRequest, FileOpened, KernelServiceError, KernelServices, ThreadCreateRequest,
