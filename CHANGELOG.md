@@ -37,6 +37,9 @@ The project follows Keep a Changelog structure before its first release.
 - A JSON Lines trace writer with sequence numbers and opt-in private host
   paths; `exbawks run --trace <file>` records block entries, kernel calls,
   and the stop reason (`DBG-001`).
+- `exbawks plan` now reports `translated_instructions` and `static_exit`, so
+  an `Executable` artifact that translates only a prefix of the block is
+  visible instead of reading as full coverage (`CORE-001`).
 
 ### Fixed
 

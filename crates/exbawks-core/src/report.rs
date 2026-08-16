@@ -39,6 +39,10 @@ pub struct BootPlanReport {
     pub block_stop: String,
     /// The current compilation artifact state.
     pub compilation_state: String,
+    /// Guest instructions translated into the executable artifact, when one exists.
+    pub translated_instructions: Option<usize>,
+    /// The static exit the artifact epilogue reports, when one exists.
+    pub static_exit: Option<String>,
     /// Per-instruction translation actions.
     pub actions: Vec<TranslationActionReport>,
 }
@@ -46,6 +50,7 @@ pub struct BootPlanReport {
 impl BootPlanReport {
     pub(crate) fn from_plan(plan: &EntryBlockPlan) -> Self {
         let image = plan.image.image();
+        let executable = plan.compiled.executable.as_ref();
         let actions = plan
             .compiled
             .plan
@@ -70,6 +75,8 @@ impl BootPlanReport {
             decoded_instructions: plan.decoded.instructions.len(),
             block_stop: format!("{:?}", plan.decoded.stop),
             compilation_state: format!("{:?}", plan.compiled.state),
+            translated_instructions: executable.map(|block| block.translated_instructions()),
+            static_exit: executable.map(|block| format!("{:?}", block.static_exit())),
             actions,
         }
     }

@@ -277,6 +277,15 @@ fn print_plan(report: &BootPlanReport, json: bool) -> Result<()> {
         "Decoded block:       {} byte(s), {} instruction(s)",
         report.decoded_bytes, report.decoded_instructions
     );
+    if let Some(translated) = report.translated_instructions {
+        println!(
+            "Translated:          {translated} of {} instruction(s)",
+            report.decoded_instructions
+        );
+    }
+    if let Some(static_exit) = &report.static_exit {
+        println!("Static exit:         {static_exit}");
+    }
     println!("Block stop:          {}", report.block_stop);
 
     for action in &report.actions {

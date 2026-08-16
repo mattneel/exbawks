@@ -788,6 +788,48 @@ mod tests {
     }
 
     #[test]
+    fn plan_report_reveals_zero_coverage_for_memory_first_blocks() {
+        // Entry starts with `mov ecx, ds:[0x10118]`, which the register-only
+        // subset rejects, so the artifact translates zero instructions even
+        // though emission succeeds.
+        let memory_first = [0x8B, 0x0D, 0x18, 0x01, 0x01, 0x00, 0xC3];
+        let mut emulator = Emulator::new().expect("emulator must initialize");
+        emulator.load_xbe(synthetic_xbe_with(&memory_first, &[])).expect("image must load");
+        let report = emulator.plan_entry_block().expect("entry block must plan").report();
+
+        #[cfg(windows)]
+        {
+            assert_eq!(report.compilation_state, "Executable");
+            assert_eq!(report.translated_instructions, Some(0));
+            assert_eq!(report.static_exit.as_deref(), Some("UnsupportedInstruction"));
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(report.compilation_state, "Planned");
+            assert_eq!(report.translated_instructions, None);
+            assert_eq!(report.static_exit, None);
+        }
+    }
+
+    #[test]
+    fn plan_report_counts_the_translated_prefix() {
+        // `nop` translates; the terminating `ret` does not, so coverage is
+        // one of two decoded instructions.
+        let mut emulator = Emulator::new().expect("emulator must initialize");
+        emulator.load_xbe(synthetic_xbe()).expect("image must load");
+        let report = emulator.plan_entry_block().expect("entry block must plan").report();
+
+        assert_eq!(report.decoded_instructions, 2);
+        #[cfg(windows)]
+        {
+            assert_eq!(report.translated_instructions, Some(1));
+            assert_eq!(report.static_exit.as_deref(), Some("UnsupportedInstruction"));
+        }
+        #[cfg(not(windows))]
+        assert_eq!(report.translated_instructions, None);
+    }
+
+    #[test]
     fn reset_allows_another_image() {
         let mut emulator = Emulator::new().expect("emulator must initialize");
         emulator.load_xbe(synthetic_xbe()).expect("first image must load");
