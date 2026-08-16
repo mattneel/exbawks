@@ -73,15 +73,28 @@ Windows 11 x86-64.
 
 Active program: boot a retail Dino Crisis 3 image to its title screen with a
 deterministic screenshot command. Read [the boot plan](dc3-boot-plan.md).
-Milestone M0 is complete: `CORE-001`, `KRN-001`, `CLI-001`, `CLI-002`, and
-`DBG-002` landed, ADR 0008 accepted the interpreter execution tier, and the
-M0 checkpoint passes (`plan` reports 0 of 6 translated on the retail entry
-block; `thunks --check-registry` reports 2 implemented, 10 stubs, 140
-missing, all named). Select the next milestone-M1 task: `CPU-001` (interpreter
-memory operands and ALU with the differential harness), then `CPU-002`,
-`CPU-003`, `CORE-002`, `CORE-003`. The `nonleaf-block-abi` and
-`kernel-guest-map` ADRs are still unwritten M1 work. The retail image stays
-outside the repository; automated tests remain synthetic.
+
+Milestone M0 is complete (`CORE-001`, `KRN-001`, `CLI-001`, `CLI-002`,
+`DBG-002`; ADR 0008 accepted). Milestone M1 is complete except `CORE-003`:
+ADRs 0009 and 0010 are accepted, `CPU-001` through `CPU-003` landed the
+tier-0 interpreter (memory operands, ALU, control flow, stack, strings,
+CPUID, RDTSC), and `CORE-002` wired the run-loop fallback plus shared SMC
+generation bumps. The M1 checkpoint is exceeded: the retail image executes
+its complete XAPI entry path and stops at
+`UnimplementedKernelExport { 255 } (PsCreateSystemThreadEx)`.
+
+Evidence update for planning: XDK 5558's XAPI startup calls
+`PsCreateSystemThreadEx` as its FIRST kernel call — before heap init — so
+the main guest thread is kernel-created. Thread-creation HLE (M4's `KRN-005`
+scope) moves ahead of the M3 heap work in boot order; the minimal viable
+form is creating the main thread's context inline and running it, deferring
+the full scheduler. `CORE-003` (KPCR/TIB page, XBE-declared stack size)
+naturally pairs with it.
+
+Next tasks in boot order: `CORE-003`, then a minimal `KRN-005` main-thread
+form (write the `cooperative-scheduler` ADR first), then M2's data exports
+(`KRN-002`) and clock (`KRN-003`). The retail image stays outside the
+repository; automated tests remain synthetic.
 
 Do not start runtime graphics work before memory operands translate. The
 portable pure-logic graphics subset (`GPU-001` command vocabulary, `GPU-002`
