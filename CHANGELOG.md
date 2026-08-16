@@ -171,6 +171,19 @@ The project follows Keep a Changelog structure before its first release.
 
 ### Added
 
+- Soft-reboot title relaunch (ADR 0015): a guest that self-relaunches through
+  `HalReturnToFirmware(quick reboot)` carrying a persisted `LAUNCH_DATA_PAGE`
+  no longer ends the run. `HalReturnToFirmware` reboot routines raise the new
+  `StopReason::Reboot`; `MmPersistContiguousMemory` records the persisted
+  region through a new `KernelServices::persist_memory`; and `Emulator::run`
+  preserves the persisted regions and the `LaunchDataPage` pointer across a
+  machine reset, reloads the same image, and continues — so the relaunched
+  title reads its launch data. A relaunch that persists byte-identical launch
+  data is detected as a reboot loop and stops with `Reboot` rather than
+  spinning. The retail image now relaunches itself and the second boot reuses
+  the preserved launch data (skipping its `MmAllocateContiguousMemory`); it
+  still reboots for an upstream reason the emulator does not yet model, which
+  the loop detector reports.
 - Disc device metadata exports (`HLE-004`): `NtDeviceIoControlFile` answers a
   title's disc IOCTLs (media detection) with a benign success, and
   `NtQueryVolumeInformationFile` reports a read-only 2 KiB-sector DVD's

@@ -147,33 +147,41 @@ Two active threads:
    CD-ROM characteristics), so the game completes its disc and HDD-partition
    probe.
 
-   **Current DC3 wall: an intended startup self-relaunch.** After the disc/HDD
-   probe the game calls a launch helper at guest `0x1A6381` (via `0x1A64F9`)
-   that `MmAllocateContiguousMemory` → `MmPersistContiguousMemory` →
-   `HalReturnToFirmware(2)` (quick-reboot). Disassembly confirms this is an
-   *unconditional* relaunch, not a validation failure: the helper never
-   returns (it reboots), and the `jl 0x1A6521` after the call site is dead
-   code. This is `XLaunchNewImage`-style: the title reboots to relaunch a
-   target XBE, carrying a persisted `LAUNCH_DATA_PAGE`. (A probe at
-   `MmPersistContiguousMemory` time saw the launch header still zeroed — the
-   game fills `szLaunchPath` *after* the persist, so read it at
-   `HalReturnToFirmware` time, not persist time.)
+   **Soft-reboot relaunch implemented (ADR 0015).** After the disc/HDD probe
+   the game self-relaunches: a launch helper at guest `0x1A6381` (called via
+   `0x1A64F9`) does `MmAllocateContiguousMemory` → `MmPersistContiguousMemory`
+   → `HalReturnToFirmware(2)`, setting the `LaunchDataPage` global (ordinal
+   164 cell at `0x8010_0080`) to the persisted page at `0x8022_5000`; the page
+   holds `dwLaunchDataType=1`, `dwTitleId=0x43430003` (DC3 itself),
+   `szLaunchPath=""` — an `XLaunchNewImage(NULL, …)` self-relaunch. `Emulator::
+   run` now preserves the persisted regions and the `LaunchDataPage` pointer
+   across a reset, reloads the same image, and continues (`relaunch_title`).
 
-   **Next milestone: implement the quick-reboot relaunch (core-level).** On
-   `HalReturnToFirmware` with a reboot routine, capture the `LAUNCH_DATA_PAGE`
-   (the persisted contiguous buffer and/or the `LaunchDataPage` kernel global,
-   ordinal 164), read `LAUNCH_DATA_HEADER.szLaunchPath`, `Emulator::reset()`
-   (already exists, emulator.rs), re-load the target XBE (resolve the launch
-   path through the disc mount — likely the same `default.xbe`), restore the
-   launch data so the relaunched title reads it, and re-run. On the second
-   boot the title should find launch data present and proceed to the game
-   proper instead of relaunching again. After that the game should
-   `NtReadFile` real assets (the read path already works), then the long pole
-   is graphics HLE (only `NullGraphicsBackend` exists), which the requested
-   screenshot/frame-dump command hangs off. `KRN-003` (virtual clock) is
-   independent. Use `exbawks coverage --surface kernel --xbe <dc3> --missing`
-   for the live gap list; disassemble with `decode --hex <bytes> --ip <va>`
-   after slicing `.text` at file offset `0x1000 + (va - 0x11000)`.
+   **Current DC3 wall: the game reboots on every boot.** The relaunch works —
+   boot 2 correctly reuses the preserved page (its kernel-call sequence is
+   identical to boot 1 *except* it skips `MmAllocateContiguousMemory` 165,
+   proving the page survived) — but it re-persists the same data and reboots
+   again. Boots differ only in that 165, so the relaunch decision is not
+   kernel-call-driven; it turns on register/memory state our environment does
+   not satisfy. DC3 is video/vblank-sensitive (Cxbx evidence, and the memory
+   note), so the prime suspect is the **display/video-mode setup** — the title
+   sets a mode and relaunches to apply it, and the mode never "takes" without
+   real display HLE. The loop detector (identical persisted data → stop) ends
+   the run at `Reboot { routine: 2 }` after one relaunch instead of spinning.
+
+   **Next: find the upstream relaunch condition.** Disassemble the caller of
+   the launch helper (the function above `0x1A64F9`) to see what it tests
+   before deciding to relaunch — likely an `Av*`/`XVideo*` display-mode or
+   AV-pack value, or an `ExQueryNonVolatileSetting` video field the title
+   compares against the running mode. If it is display-mode, this converges
+   with the graphics HLE long pole (only `NullGraphicsBackend` exists), which
+   the requested screenshot/frame-dump command also hangs off; a minimal
+   Av/video-mode HLE may be enough to clear the relaunch even before full
+   rendering. Once past it the game should `NtReadFile` real assets (the read
+   path already works). `KRN-003` (virtual clock) is independent. Disassemble
+   with `decode --hex <bytes> --ip <va>` after slicing `.text` at file offset
+   `0x1000 + (va - 0x11000)`; trace boots with `run --trace <f> --trace-filter
+   kernel,stop` and split at each `HalReturnToFirmware` (ordinal 49).
 
 The retail image stays outside the repository; automated tests remain
 synthetic.

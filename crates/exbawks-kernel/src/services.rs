@@ -176,6 +176,13 @@ pub trait KernelServices {
     fn allocate_contiguous(&mut self, _bytes: u32) -> Result<GuestVa, KernelServiceError> {
         Err(KernelServiceError::Unsupported)
     }
+
+    /// Records that a guest region should survive a soft reboot (ADR 0015).
+    ///
+    /// `MmPersistContiguousMemory` marks the launch-data page persistent
+    /// before a title relaunches itself; the emulator preserves the recorded
+    /// regions across the reset. The default is a no-op.
+    fn persist_memory(&mut self, _base: u32, _size: u32) {}
 }
 
 /// A services implementation for contexts without an emulator.

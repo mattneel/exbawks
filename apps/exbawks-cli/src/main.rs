@@ -627,6 +627,9 @@ fn stop_reason_note(stop: &StopReason) -> String {
                 .map(|info| format!(" ({})", info.name))
                 .unwrap_or_default()
         }
+        StopReason::Reboot { .. } => {
+            " (the title rebooted; a self-relaunch loop or a dashboard return)".to_owned()
+        }
         _ => String::new(),
     }
 }

@@ -147,6 +147,7 @@ impl EmulatorBuilder {
             loaded: None,
             threads: None,
             disc_root: None,
+            last_relaunch_data: None,
         })
     }
 }
@@ -172,6 +173,10 @@ pub struct Emulator {
     threads: Option<ThreadManager>,
     /// The host directory mounted as the read-only game disc (ADR 0014).
     disc_root: Option<PathBuf>,
+    /// The persisted launch data of the previous relaunch (ADR 0015). A
+    /// relaunch that persists identical data is a reboot loop, not progress,
+    /// so the run stops instead of spinning.
+    last_relaunch_data: Option<Vec<u8>>,
 }
 
 impl Emulator {
@@ -390,11 +395,119 @@ impl Emulator {
     /// Runs translated blocks from the current guest EIP.
     ///
     /// Execution continues until a controlled stop reason occurs or the
-    /// block budget expires.
+    /// block budget expires. A guest soft reboot that carries launch data
+    /// relaunches the title in place (ADR 0015) rather than ending the run;
+    /// `max_blocks` bounds each boot, not the whole relaunch chain.
     pub fn run(&mut self, max_blocks: usize) -> Result<StopReason, CoreError> {
-        let stop = self.run_blocks(max_blocks)?;
-        self.trace.record(TraceEvent::Stop { reason: format!("{stop:?}") });
-        Ok(stop)
+        /// The most self-relaunches one run tolerates before ending, so a
+        /// title whose launch data keeps changing still stops eventually.
+        /// A stuck loop (identical launch data) is caught sooner, by content.
+        const MAX_RELAUNCHES: u32 = 8;
+
+        let mut relaunches = 0;
+        loop {
+            let stop = self.run_blocks(max_blocks)?;
+            if let StopReason::Reboot { routine } = stop {
+                if relaunches < MAX_RELAUNCHES && self.relaunch_title()? {
+                    relaunches += 1;
+                    tracing::info!(routine, relaunches, "soft reboot: relaunching title");
+                    continue;
+                }
+                tracing::info!(routine, relaunches, "soft reboot: ending run (no relaunch)");
+            }
+            self.trace.record(TraceEvent::Stop { reason: format!("{stop:?}") });
+            return Ok(stop);
+        }
+    }
+
+    /// Relaunches the current title across a soft reboot (ADR 0015).
+    ///
+    /// Returns `true` when the title was relaunched (the guest set a
+    /// `LaunchDataPage`), `false` when the reboot has no relaunch target and
+    /// the run should end. The persisted regions and the `LaunchDataPage`
+    /// pointer survive the machine reset; the same image reloads (only the
+    /// self-relaunch, empty-launch-path form is handled).
+    fn relaunch_title(&mut self) -> Result<bool, CoreError> {
+        let Some(cell) = self.threads.as_ref().and_then(ThreadManager::launch_data_page_cell)
+        else {
+            return Ok(false);
+        };
+        let launch_pointer = self.memory.read_u32(cell)?;
+        if launch_pointer == 0 {
+            // A reboot with no launch data is a dashboard return, not a
+            // self-relaunch.
+            return Ok(false);
+        }
+
+        // The most launch data one soft reboot preserves. The size is a raw
+        // guest argument, so bounding it keeps a hostile persist from forcing
+        // a huge host allocation (a launch-data page is one or two pages).
+        const MAX_PERSIST_BYTES: u32 = 16 * 1024 * 1024;
+
+        // Snapshot each persisted region's current bytes before the reset.
+        // Skip a misaligned base — a real contiguous allocation is page
+        // aligned — and cap the guest-controlled size.
+        let regions =
+            self.threads.as_ref().map(|t| t.persisted_regions().to_vec()).unwrap_or_default();
+        let mut snapshots: Vec<(u32, Vec<u8>)> = Vec::new();
+        for (base, size) in regions {
+            if !base.is_multiple_of(GUEST_PAGE_SIZE) {
+                continue;
+            }
+            let rounded = round_up_page(size).min(MAX_PERSIST_BYTES);
+            let mut bytes = vec![0_u8; rounded as usize];
+            if self.memory.read(GuestVa(base), &mut bytes).is_ok() {
+                snapshots.push((base, bytes));
+            }
+        }
+
+        // A relaunch that persists byte-identical launch data to the previous
+        // one is a reboot loop (the title cannot satisfy some condition our
+        // environment does not model, e.g. a display mode). Stop rather than
+        // spin. The fingerprint is content only (region lengths and bytes),
+        // not the base, which drifts as the kernel cursor advances each boot.
+        let mut fingerprint = Vec::new();
+        for (_, bytes) in &snapshots {
+            fingerprint.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            fingerprint.extend_from_slice(bytes);
+        }
+        if !fingerprint.is_empty() && self.last_relaunch_data.as_ref() == Some(&fingerprint) {
+            return Ok(false);
+        }
+
+        // Reload the same image (the empty launch path is a self-relaunch).
+        // `reset` clears the loop-detection state, so it is set after restore.
+        let bytes = self.loaded.as_ref().ok_or(CoreError::NoImageLoaded)?.bytes().to_vec();
+        self.reset()?;
+        self.load_xbe(bytes)?;
+
+        // Restore the persisted regions at their original (page-aligned)
+        // addresses and keep the new boot's kernel allocator clear of them. A
+        // region that fails to map is skipped, not fatal to the run.
+        for (base, bytes) in &snapshots {
+            let Ok(range) = GuestRange::page_aligned(GuestVa(*base), bytes.len() as u64) else {
+                continue;
+            };
+            if self
+                .memory
+                .map_anonymous(range, MemoryPermissions::READ | MemoryPermissions::WRITE)
+                .is_ok()
+            {
+                let _ = self.memory.write(GuestVa(*base), bytes);
+                if let Some(threads) = self.threads.as_mut() {
+                    threads.reserve_cursor_through(base.saturating_add(bytes.len() as u32));
+                }
+            }
+        }
+
+        // Point the freshly rebuilt LaunchDataPage cell back at the page, so
+        // the relaunched title reads its launch data.
+        if let Some(new_cell) = self.threads.as_ref().and_then(ThreadManager::launch_data_page_cell)
+        {
+            let _ = self.memory.write_u32(new_cell, launch_pointer);
+        }
+        self.last_relaunch_data = Some(fingerprint);
+        Ok(true)
     }
 
     /// Fetches executable bytes across contiguous mapped pages.
@@ -647,8 +760,16 @@ impl Emulator {
         self.threads = None;
         self.code_cache.clear();
         self.address_space_epoch = self.address_space_epoch.wrapping_add(1);
+        // The soft-reboot loop detector is per image; a fresh load starts
+        // clean. `relaunch_title` re-sets it after its own reset (ADR 0015).
+        self.last_relaunch_data = None;
         Ok(())
     }
+}
+
+/// Rounds a byte count up to a whole number of guest pages (at least one).
+fn round_up_page(size: u32) -> u32 {
+    size.max(1).div_ceil(GUEST_PAGE_SIZE).saturating_mul(GUEST_PAGE_SIZE)
 }
 
 fn validate_config(config: &EmulatorConfig) -> Result<(), CoreError> {
@@ -1169,6 +1290,101 @@ mod tests {
         emulator.load_xbe(synthetic_xbe_with(&[0xC3], &[])).expect("image must load");
         let stop = emulator.run(64).expect("run must complete");
         assert_eq!(stop, StopReason::GuestExit { code: 0 });
+    }
+
+    /// A title that self-relaunches (ADR 0015) sets its `LaunchDataPage`,
+    /// persists it, and reboots; the second boot must find the launch data
+    /// preserved and take a different path. Here the second boot exits
+    /// cleanly instead of rebooting again, proving the relaunch preserved the
+    /// launch data across the machine reset.
+    ///
+    /// ```text
+    /// mov ecx, [0x11200]   ; ecx = &LaunchDataPage (data-export cell)
+    /// mov eax, [ecx]       ; eax = LaunchDataPage
+    /// test eax, eax
+    /// jnz already          ; boot 2: launch data present
+    /// push 0x1000          ; boot 1: allocate, publish, persist, reboot
+    /// call [0x11204]       ; MmAllocateContiguousMemory -> eax
+    /// mov [ecx], eax       ; LaunchDataPage = buffer
+    /// push 1; push 0x1000; push eax
+    /// call [0x11208]       ; MmPersistContiguousMemory
+    /// push 2
+    /// call [0x1120C]       ; HalReturnToFirmware(quick reboot)
+    /// already: push 0
+    /// call [0x1120C]       ; HalReturnToFirmware(halt) -> GuestExit { 0 }
+    /// ```
+    #[test]
+    fn self_relaunch_preserves_launch_data() {
+        const RELAUNCH_CODE: [u8; 55] = [
+            0x8B, 0x0D, 0x00, 0x12, 0x01, 0x00, // mov ecx, [0x00011200]
+            0x8B, 0x01, // mov eax, [ecx]
+            0x85, 0xC0, // test eax, eax
+            0x75, 0x23, // jnz already (+0x23)
+            0x68, 0x00, 0x10, 0x00, 0x00, // push 0x1000
+            0xFF, 0x15, 0x04, 0x12, 0x01, 0x00, // call [0x00011204]
+            0x89, 0x01, // mov [ecx], eax
+            0x6A, 0x01, // push 1
+            0x68, 0x00, 0x10, 0x00, 0x00, // push 0x1000
+            0x50, // push eax
+            0xFF, 0x15, 0x08, 0x12, 0x01, 0x00, // call [0x00011208]
+            0x6A, 0x02, // push 2
+            0xFF, 0x15, 0x0C, 0x12, 0x01, 0x00, // call [0x0001120C]
+            0x6A, 0x00, // already: push 0
+            0xFF, 0x15, 0x0C, 0x12, 0x01, 0x00, // call [0x0001120C]
+        ];
+        // Imports: LaunchDataPage (164, data), MmAllocateContiguousMemory
+        // (165), MmPersistContiguousMemory (178), HalReturnToFirmware (49).
+        let thunks = [0x8000_0000 | 164, 0x8000_0000 | 165, 0x8000_0000 | 178, 0x8000_0000 | 49];
+        let mut emulator = Emulator::new().expect("emulator must initialize");
+        emulator.load_xbe(synthetic_xbe_with(&RELAUNCH_CODE, &thunks)).expect("image must load");
+
+        let stop = emulator.run(4096).expect("run must complete");
+
+        // The only path to GuestExit { 0 } is the second boot's
+        // already-launched branch, reached only when LaunchDataPage survived
+        // the reboot.
+        assert_eq!(stop, StopReason::GuestExit { code: 0 });
+    }
+
+    /// A title stuck rebooting with identical launch data is a reboot loop,
+    /// not progress; the run detects the repeated launch data and stops with
+    /// `Reboot` instead of relaunching to the backstop limit. The guest here
+    /// reuses its `LaunchDataPage` and reboots every boot.
+    ///
+    /// ```text
+    /// mov ecx, [0x11200]; mov eax, [ecx]; test eax, eax
+    /// jnz have_buffer      ; reuse an existing page
+    /// push 0x1000; call [0x11204]; mov [ecx], eax
+    /// have_buffer: push 1; push 0x1000; push eax
+    /// call [0x11208]       ; persist
+    /// push 2; call [0x1120C] ; reboot — always
+    /// ```
+    #[test]
+    fn identical_relaunch_data_stops_the_loop() {
+        const LOOP_CODE: [u8; 47] = [
+            0x8B, 0x0D, 0x00, 0x12, 0x01, 0x00, // mov ecx, [0x00011200]
+            0x8B, 0x01, // mov eax, [ecx]
+            0x85, 0xC0, // test eax, eax
+            0x75, 0x0D, // jnz have_buffer (+0x0D)
+            0x68, 0x00, 0x10, 0x00, 0x00, // push 0x1000
+            0xFF, 0x15, 0x04, 0x12, 0x01, 0x00, // call [0x00011204]
+            0x89, 0x01, // mov [ecx], eax
+            0x6A, 0x01, // have_buffer: push 1
+            0x68, 0x00, 0x10, 0x00, 0x00, // push 0x1000
+            0x50, // push eax
+            0xFF, 0x15, 0x08, 0x12, 0x01, 0x00, // call [0x00011208]
+            0x6A, 0x02, // push 2
+            0xFF, 0x15, 0x0C, 0x12, 0x01, 0x00, // call [0x0001120C]
+        ];
+        let thunks = [0x8000_0000 | 164, 0x8000_0000 | 165, 0x8000_0000 | 178, 0x8000_0000 | 49];
+        let mut emulator = Emulator::new().expect("emulator must initialize");
+        emulator.load_xbe(synthetic_xbe_with(&LOOP_CODE, &thunks)).expect("image must load");
+
+        let stop = emulator.run(4096).expect("run must complete");
+
+        // The first reboot relaunches; the second persists identical data, so
+        // the loop is detected and the run stops rather than spinning.
+        assert_eq!(stop, StopReason::Reboot { routine: 2 });
     }
 
     /// A created thread reaching a null address is a genuine fault, not an

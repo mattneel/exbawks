@@ -66,6 +66,10 @@ pub enum BuildFlavor {
 pub enum StopReason {
     /// The guest requested a normal termination.
     GuestExit { code: u32 },
+    /// The guest asked the firmware to reboot (`HalReturnToFirmware`). The
+    /// routine is the requested `ReturnFirmware*` code; the composition root
+    /// decides whether it relaunches the title or ends the run (ADR 0015).
+    Reboot { routine: u32 },
     /// The emulator reached an unsupported instruction.
     UnsupportedInstruction { address: GuestVa },
     /// The emulator reached a missing HLE export.

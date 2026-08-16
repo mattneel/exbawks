@@ -120,7 +120,17 @@ pub(crate) struct ThreadManager {
     handles: HashSet<u32>,
     /// The host-backed file device (ADR 0014).
     files: HostFileSystem,
+    /// Regions the guest marked to survive a soft reboot (ADR 0015):
+    /// `(base, size)` pairs from `MmPersistContiguousMemory`.
+    persisted: Vec<(u32, u32)>,
+    /// The guest address of the `LaunchDataPage` variable cell (data ordinal
+    /// 164), captured when the kernel variables are built, or `None` when the
+    /// image does not import it.
+    launch_data_page_cell: Option<GuestVa>,
 }
+
+/// The data-export ordinal of the kernel `LaunchDataPage` pointer variable.
+const LAUNCH_DATA_PAGE_ORDINAL: u16 = 164;
 
 impl ThreadManager {
     pub(crate) fn new(memory: Arc<SoftwareAddressSpace>, disc_root: Option<PathBuf>) -> Self {
@@ -139,7 +149,26 @@ impl ThreadManager {
             user_cursor: USER_ALLOC_BASE,
             handles: HashSet::new(),
             files: HostFileSystem::new(disc_root),
+            persisted: Vec::new(),
+            launch_data_page_cell: None,
         }
+    }
+
+    /// Returns the guest address of the `LaunchDataPage` variable cell, when
+    /// the image imports it (ADR 0015).
+    pub(crate) fn launch_data_page_cell(&self) -> Option<GuestVa> {
+        self.launch_data_page_cell
+    }
+
+    /// Returns the regions the guest marked to survive a soft reboot.
+    pub(crate) fn persisted_regions(&self) -> &[(u32, u32)] {
+        &self.persisted
+    }
+
+    /// Advances the kernel bump cursor to at least `end`, so a restored
+    /// persisted region is never re-allocated over on the next boot.
+    pub(crate) fn reserve_cursor_through(&mut self, end: u32) {
+        self.kernel_cursor = self.kernel_cursor.max(end);
     }
 
     /// Builds the boot thread's KPCR/KTHREAD pages and registers thread one.
@@ -215,6 +244,9 @@ impl ThreadManager {
         for (index, &ordinal) in data_ordinals.iter().enumerate() {
             let cell = GuestVa(base.wrapping_add(index as u32 * CELL));
             self.initialize_kernel_variable(ordinal, cell, name_addr, name_len as u16)?;
+            if ordinal == LAUNCH_DATA_PAGE_ORDINAL {
+                self.launch_data_page_cell = Some(cell);
+            }
             variables.insert(ordinal, cell);
         }
         Ok(variables)
@@ -404,6 +436,17 @@ impl KernelServices for ThreadManager {
 
     fn file_info(&mut self, handle: u32) -> Result<FileInfo, KernelServiceError> {
         self.files.info(handle)
+    }
+
+    fn persist_memory(&mut self, base: u32, size: u32) {
+        // A title may persist the same page more than once; keep one entry per
+        // base and grow it to the largest size seen so a later, larger persist
+        // is not restored truncated.
+        if let Some(entry) = self.persisted.iter_mut().find(|(existing, _)| *existing == base) {
+            entry.1 = entry.1.max(size);
+        } else {
+            self.persisted.push((base, size));
+        }
     }
 
     fn allocate_contiguous(&mut self, bytes: u32) -> Result<GuestVa, KernelServiceError> {

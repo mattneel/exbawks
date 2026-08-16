@@ -20,6 +20,7 @@ pub(crate) fn register_mm_exports(registry: &KernelRegistry) -> Result<(), Kerne
     registry.register(MmAllocateContiguousMemoryEx)?;
     registry.register(MmFreeContiguousMemory)?;
     registry.register(MmGetPhysicalAddress)?;
+    registry.register(MmPersistContiguousMemory)?;
     Ok(())
 }
 
@@ -109,6 +110,39 @@ impl KernelExport for MmFreeContiguousMemory {
 
     fn call(&self, _context: &mut KernelCallContext<'_>) -> KernelStatus {
         // Returns VOID; the value in EAX is irrelevant to the caller.
+        KernelStatus::SUCCESS
+    }
+}
+
+/// Marks a contiguous region to survive a soft reboot (ADR 0015).
+///
+/// A title persists its launch-data page before relaunching itself; the
+/// emulator preserves the recorded region across the reset. Records the
+/// region through the memory service and reports success.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MmPersistContiguousMemory;
+
+impl KernelExport for MmPersistContiguousMemory {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::MM_PERSIST_CONTIGUOUS_MEMORY
+    }
+
+    fn name(&self) -> &'static str {
+        "MmPersistContiguousMemory"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        12
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // MmPersistContiguousMemory(BaseAddress, NumberOfBytes, Persist).
+        let base = stack_argument(context, 0).unwrap_or(0);
+        let size = stack_argument(context, 1).unwrap_or(0);
+        let persist = stack_argument(context, 2).unwrap_or(0);
+        if base != 0 && persist != 0 {
+            context.services.persist_memory(base, size);
+        }
         KernelStatus::SUCCESS
     }
 }

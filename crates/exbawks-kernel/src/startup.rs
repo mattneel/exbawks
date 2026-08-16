@@ -79,11 +79,8 @@ const STARTUP_STUBS: [(u16, &str); 4] = [
 
 /// Benign exports that succeed as no-ops on the boot path:
 /// (ordinal, name, stdcall argument bytes).
-const BENIGN_SUCCESS: [(u16, &str, u16); 2] = [
-    (ordinal::HAL_REGISTER_SHUTDOWN_NOTIFICATION, "HalRegisterShutdownNotification", 8),
-    // Persistence across reboots is not modeled; the allocation stays live.
-    (ordinal::MM_PERSIST_CONTIGUOUS_MEMORY, "MmPersistContiguousMemory", 12),
-];
+const BENIGN_SUCCESS: [(u16, &str, u16); 1] =
+    [(ordinal::HAL_REGISTER_SHUTDOWN_NOTIFICATION, "HalRegisterShutdownNotification", 8)];
 
 /// Registers the startup export set for one synthetic guest thread.
 pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelError> {
@@ -155,7 +152,14 @@ impl KernelExport for HalReturnToFirmware {
 
     fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
         let routine = stack_argument(context, 0).unwrap_or(0);
-        context.stop_request = Some(StopReason::GuestExit { code: routine });
+        // ReturnFirmwareReboot (1) and ReturnFirmwareQuickReboot (2) ask for a
+        // machine restart, which a title uses to relaunch itself (ADR 0015);
+        // halt and fatal end the run.
+        let stop = match routine {
+            1 | 2 => StopReason::Reboot { routine },
+            code => StopReason::GuestExit { code },
+        };
+        context.stop_request = Some(stop);
         KernelStatus::SUCCESS
     }
 }
@@ -341,8 +345,8 @@ mod tests {
 
         // Five thread/handle exports, four Rtl and three Ke dispatcher
         // exports, one Ex executive export, one Nt virtual-memory export, six
-        // Nt file exports, four Mm contiguous exports, two benign success
-        // exports, and four startup stubs.
+        // Nt file exports, five Mm contiguous exports, one benign success
+        // export, and four startup stubs.
         assert_eq!(registry.len(), 30);
         for ordinal in [
             ordinal::DBG_PRINT,
@@ -355,6 +359,30 @@ mod tests {
             ordinal::EX_QUERY_NON_VOLATILE_SETTING,
         ] {
             assert!(registry.get(ordinal).is_some(), "ordinal {ordinal} must register");
+        }
+    }
+
+    #[test]
+    fn return_to_firmware_maps_the_routine_to_a_stop() {
+        for (routine, expected) in [
+            (0u32, StopReason::GuestExit { code: 0 }),
+            (1, StopReason::Reboot { routine: 1 }),
+            (2, StopReason::Reboot { routine: 2 }),
+            (4, StopReason::GuestExit { code: 4 }),
+        ] {
+            let memory = memory_with_stack();
+            memory.write_u32(GuestVa(0x2004), routine).expect("write");
+            let mut cpu = CpuState::default();
+            cpu.gpr[4] = 0x2000;
+            let mut services = crate::UnsupportedServices;
+            let mut context = KernelCallContext {
+                cpu: &mut cpu,
+                memory: &memory,
+                services: &mut services,
+                stop_request: None,
+            };
+            assert_eq!(HalReturnToFirmware.call(&mut context), KernelStatus::SUCCESS);
+            assert_eq!(context.stop_request, Some(expected), "routine {routine}");
         }
     }
 
@@ -493,23 +521,5 @@ mod tests {
             stop_request: None,
         };
         assert_eq!(NtClose.call(&mut context), KernelStatus::INVALID_HANDLE);
-    }
-
-    #[test]
-    fn hal_return_to_firmware_requests_a_guest_exit() {
-        let memory = memory_with_stack();
-        memory.write_u32(GuestVa(0x2004), 2).expect("write succeeds");
-
-        let mut cpu = CpuState::default();
-        cpu.gpr[4] = 0x2000;
-        let mut services = crate::UnsupportedServices;
-        let mut context = KernelCallContext {
-            cpu: &mut cpu,
-            memory: &memory,
-            services: &mut services,
-            stop_request: None,
-        };
-        assert_eq!(HalReturnToFirmware.call(&mut context), KernelStatus::SUCCESS);
-        assert_eq!(context.stop_request, Some(StopReason::GuestExit { code: 2 }));
     }
 }
