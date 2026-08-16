@@ -9,6 +9,8 @@ use crate::{
 pub mod ordinal {
     /// `DbgPrint`.
     pub const DBG_PRINT: u16 = 8;
+    /// `ExQueryNonVolatileSetting`.
+    pub const EX_QUERY_NON_VOLATILE_SETTING: u16 = 24;
     /// `HalRegisterShutdownNotification`.
     pub const HAL_REGISTER_SHUTDOWN_NOTIFICATION: u16 = 47;
     /// `HalReturnToFirmware`.
@@ -70,6 +72,7 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     registry.register(NtClose)?;
     crate::rtl::register_rtl_exports(registry)?;
     crate::ke::register_ke_exports(registry)?;
+    crate::ex::register_ex_exports(registry)?;
     for (ordinal, name, stack_bytes) in BENIGN_SUCCESS {
         registry.register(SuccessExport::new(ordinal, name, stack_bytes))?;
     }
@@ -312,8 +315,9 @@ mod tests {
         register_startup_exports(&registry).expect("registration succeeds");
 
         // Five thread/handle exports, three Rtl and two Ke dispatcher
-        // exports, one benign success export, and seven startup stubs.
-        assert_eq!(registry.len(), 18);
+        // exports, one Ex executive export, one benign success export, and
+        // seven startup stubs.
+        assert_eq!(registry.len(), 19);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,
@@ -322,6 +326,7 @@ mod tests {
             ordinal::NT_CREATE_EVENT,
             ordinal::KE_SET_TIMER,
             ordinal::NT_CREATE_FILE,
+            ordinal::EX_QUERY_NON_VOLATILE_SETTING,
         ] {
             assert!(registry.get(ordinal).is_some(), "ordinal {ordinal} must register");
         }

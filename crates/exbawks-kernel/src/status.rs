@@ -16,6 +16,8 @@ impl KernelStatus {
     pub const INSUFFICIENT_RESOURCES: Self = Self(0xC000_009A);
     /// A handle value does not name an open object.
     pub const INVALID_HANDLE: Self = Self(0xC000_0008);
+    /// The caller's buffer is too small for the returned data.
+    pub const BUFFER_TOO_SMALL: Self = Self(0xC000_0023);
 
     /// Returns true when the status represents success.
     #[must_use]

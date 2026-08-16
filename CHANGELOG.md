@@ -108,6 +108,12 @@ The project follows Keep a Changelog structure before its first release.
   the gate region; a gate address with no registered export reports a named
   missing export. The retail image advances to `ExQueryNonVolatileSetting`
   (`CORE-004`).
+- `ExQueryNonVolatileSetting` returns a synthetic NTSC-U console profile for
+  the EEPROM settings a title reads at startup (language, video/audio flags,
+  region), writing the value type and length and honoring the caller's
+  buffer size; there is no real EEPROM, so guest-visible identifiers stay
+  zeroed (ADR 0010). The retail image advances past its EEPROM probe to
+  `RtlNtStatusToDosError` (`HLE-011`).
 - Implementation-burndown diagnostics: `exbawks coverage` reports
   implemented/stub/missing counts across the CPU, kernel, and GPU surfaces
   (with `--xbe` to scope the kernel surface to one image's imports), and a
