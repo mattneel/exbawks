@@ -101,6 +101,13 @@ The project follows Keep a Changelog structure before its first release.
   timer dispatcher objects; the objects do not fire yet (the DPC/timer
   machinery is later work) but their structs are consistent so boot proceeds
   (`HLE-007`).
+- The run loop dispatches a kernel export when the guest's EIP enters the
+  gate region, not only when it decodes `call [slot]` at the caller. Titles
+  that call through a register (`mov reg,[slot]; call reg`) or tail-jump
+  (`jmp [slot]`) now resolve to the right ordinal instead of faulting inside
+  the gate region; a gate address with no registered export reports a named
+  missing export. The retail image advances to `ExQueryNonVolatileSetting`
+  (`CORE-004`).
 - Implementation-burndown diagnostics: `exbawks coverage` reports
   implemented/stub/missing counts across the CPU, kernel, and GPU surfaces
   (with `--xbe` to scope the kernel surface to one image's imports), and a

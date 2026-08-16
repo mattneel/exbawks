@@ -320,19 +320,33 @@ impl Emulator {
         let resume = address
             .checked_add(u32::try_from(instruction.len()).unwrap_or(u32::MAX))
             .ok_or(CoreError::KernelThunkAddressOverflow { address })?;
+        // Push the return address so the export sees the stdcall frame with
+        // arguments above the return slot, then dispatch and return.
+        let pushed_esp = self.cpu.gpr[4].wrapping_sub(4);
+        self.memory.write_u32(GuestVa(pushed_esp), resume.0)?;
+        self.cpu.gpr[4] = pushed_esp;
+        self.dispatch_registered_export(ordinal, export, address)
+    }
+
+    /// Runs one registered export whose return address is already on the
+    /// guest stack, then pops the stdcall frame and resumes at the return.
+    ///
+    /// The `call [slot]` fast path pushes the return address itself; a gate
+    /// reached by EIP (`mov reg,[slot]; call reg`, or a tail `jmp [slot]`)
+    /// already has it on the stack.
+    fn dispatch_registered_export(
+        &mut self,
+        ordinal: u16,
+        export: Arc<dyn exbawks_kernel::KernelExport>,
+        caller: GuestVa,
+    ) -> Result<GateAssist, CoreError> {
         tracing::trace!(ordinal, name = export.name(), "dispatching kernel gate call");
         self.trace.record(TraceEvent::KernelCall {
             ordinal,
             name: exbawks_kernel::kernel_ordinal_info(ordinal).map(|info| info.name.to_owned()),
-            caller: address,
+            caller,
         });
         let memory = self.memory.clone();
-
-        // Perform the call: push the return address so exports see the real
-        // stdcall frame layout with arguments above the return slot.
-        let pushed_esp = self.cpu.gpr[4].wrapping_sub(4);
-        memory.write_u32(GuestVa(pushed_esp), resume.0)?;
-        self.cpu.gpr[4] = pushed_esp;
 
         let mut fallback = exbawks_kernel::UnsupportedServices;
         let services: &mut dyn exbawks_kernel::KernelServices = match self.threads.as_mut() {
@@ -348,8 +362,8 @@ impl Emulator {
         let status = export.call(&mut context);
         let stop = context.stop_request;
 
-        // Perform the return: pop the return address and the stdcall
-        // argument bytes the export declares.
+        // Pop the return address and the stdcall argument bytes the export
+        // declares.
         let return_address = memory.read_u32(GuestVa(self.cpu.gpr[4]))?;
         self.cpu.gpr[4] =
             self.cpu.gpr[4].wrapping_add(4).wrapping_add(u32::from(export.stack_bytes()));
@@ -411,6 +425,18 @@ impl Emulator {
                 && self.threads.as_ref().is_some_and(ThreadManager::active_exits_on_null_return);
             if start == THREAD_EXIT_SENTINEL || null_exit {
                 if let Some(stop) = self.exit_current_thread(self.cpu.gpr[0]) {
+                    return Ok(stop);
+                }
+                continue;
+            }
+            // The guest jumped into the kernel gate region, so its EIP now
+            // sits at a gate address. This is the `mov reg,[slot]; call reg`
+            // (or tail `jmp [slot]`) form, where the transfer already ran and
+            // the return address is on the stack — unlike the `call [slot]`
+            // fast path, which `assist_at_current_eip` intercepts before the
+            // call executes. Dispatch the ordinal from the EIP (CORE-004).
+            if let Some(ordinal) = gate_ordinal(start) {
+                if let Some(stop) = self.dispatch_gate_by_eip(ordinal, start)? {
                     return Ok(stop);
                 }
                 continue;
@@ -498,6 +524,36 @@ impl Emulator {
                 Ok(Some(StopReason::MissingKernelExport { ordinal }))
             }
             GateAssist::NotAGateCall => self.interpret_step(),
+        }
+    }
+
+    /// Dispatches an export the guest reached by jumping into the gate region.
+    ///
+    /// The caller already pushed the return address (the transfer executed),
+    /// so this runs the export against the existing stdcall frame rather than
+    /// synthesizing one. A gate address with no registered ordinal is a
+    /// missing export, not a fault, so the burn-down tooling names it.
+    fn dispatch_gate_by_eip(
+        &mut self,
+        ordinal: u16,
+        gate: GuestVa,
+    ) -> Result<Option<StopReason>, CoreError> {
+        let Some(export) = self.kernel.get(ordinal) else {
+            return Ok(Some(StopReason::MissingKernelExport { ordinal }));
+        };
+        match self.dispatch_registered_export(ordinal, export, gate)? {
+            GateAssist::Dispatched { stop: Some(stop), .. } => Ok(Some(stop)),
+            GateAssist::Dispatched { ordinal, status, .. }
+                if status == KernelStatus::NOT_IMPLEMENTED =>
+            {
+                Ok(Some(StopReason::UnimplementedKernelExport { ordinal }))
+            }
+            GateAssist::Dispatched { .. } => Ok(self.apply_pending_scheduling()),
+            // `dispatch_registered_export` only ever reports `Dispatched`.
+            GateAssist::MissingExport { ordinal } => {
+                Ok(Some(StopReason::MissingKernelExport { ordinal }))
+            }
+            GateAssist::NotAGateCall => Ok(None),
         }
     }
 
@@ -1382,6 +1438,36 @@ mod tests {
             // The runtime places the returned status in guest EAX.
             assert_eq!(emulator.cpu().gpr[0], 0xFEED_F00D);
             assert_eq!(emulator.cpu().gpr[4], stack_before, "the call and return balance");
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn gate_reached_by_register_call_dispatches() {
+            // `mov eax, [0x11200]; call eax; ret` — the guest loads the
+            // patched gate address into a register and calls it, so EIP lands
+            // in the gate region with the return address already pushed.
+            // CORE-004 dispatches the ordinal from the EIP rather than from a
+            // decoded `call [slot]` at the caller.
+            let code = [0x8B, 0x05, 0x00, 0x12, 0x01, 0x00, 0xFF, 0xD0, 0xC3];
+            let mut emulator = Emulator::new().expect("emulator must initialize");
+            let calls = Arc::new(AtomicU32::new(0));
+            emulator
+                .kernel()
+                .register(CountingExport { calls: calls.clone() })
+                .expect("registration must succeed");
+            emulator
+                .load_xbe(synthetic_xbe_with(&code, &[0x8000_0007]))
+                .expect("synthetic XBE must load");
+
+            let stop = emulator.run(16).expect("the run must complete");
+
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                1,
+                "the register-indirect gate call dispatched the export"
+            );
+            assert_eq!(emulator.cpu().gpr[0], 0xFEED_F00D, "the export status reached guest eax");
+            assert_eq!(stop, StopReason::GuestExit { code: 0xFEED_F00D });
         }
 
         #[test]
