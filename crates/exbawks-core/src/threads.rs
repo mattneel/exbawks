@@ -406,6 +406,15 @@ impl KernelServices for ThreadManager {
         self.files.info(handle)
     }
 
+    fn allocate_contiguous(&mut self, bytes: u32) -> Result<GuestVa, KernelServiceError> {
+        // A fresh kernel block is contiguous in physical RAM (the bump
+        // allocator hands out consecutive pages) and lives in the kernel
+        // window, which is what the Mm contiguous family promises.
+        self.allocate_kernel_block(bytes)
+            .map(|range| range.start())
+            .map_err(|_| KernelServiceError::ResourceExhausted)
+    }
+
     fn allocate_virtual_memory(
         &mut self,
         request: VirtualAllocRequest,

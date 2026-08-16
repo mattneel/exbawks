@@ -23,6 +23,16 @@ pub mod ordinal {
     pub const KE_INITIALIZE_TIMER_EX: u16 = 113;
     /// `KeSetTimer`.
     pub const KE_SET_TIMER: u16 = 149;
+    /// `MmAllocateContiguousMemory`.
+    pub const MM_ALLOCATE_CONTIGUOUS_MEMORY: u16 = 165;
+    /// `MmAllocateContiguousMemoryEx`.
+    pub const MM_ALLOCATE_CONTIGUOUS_MEMORY_EX: u16 = 166;
+    /// `MmFreeContiguousMemory`.
+    pub const MM_FREE_CONTIGUOUS_MEMORY: u16 = 171;
+    /// `MmGetPhysicalAddress`.
+    pub const MM_GET_PHYSICAL_ADDRESS: u16 = 173;
+    /// `MmPersistContiguousMemory`.
+    pub const MM_PERSIST_CONTIGUOUS_MEMORY: u16 = 178;
     /// `NtAllocateVirtualMemory`.
     pub const NT_ALLOCATE_VIRTUAL_MEMORY: u16 = 184;
     /// `NtClose`.
@@ -65,8 +75,11 @@ const STARTUP_STUBS: [(u16, &str); 4] = [
 
 /// Benign exports that succeed as no-ops on the boot path:
 /// (ordinal, name, stdcall argument bytes).
-const BENIGN_SUCCESS: [(u16, &str, u16); 1] =
-    [(ordinal::HAL_REGISTER_SHUTDOWN_NOTIFICATION, "HalRegisterShutdownNotification", 8)];
+const BENIGN_SUCCESS: [(u16, &str, u16); 2] = [
+    (ordinal::HAL_REGISTER_SHUTDOWN_NOTIFICATION, "HalRegisterShutdownNotification", 8),
+    // Persistence across reboots is not modeled; the allocation stays live.
+    (ordinal::MM_PERSIST_CONTIGUOUS_MEMORY, "MmPersistContiguousMemory", 12),
+];
 
 /// Registers the startup export set for one synthetic guest thread.
 pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelError> {
@@ -80,6 +93,7 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     crate::ex::register_ex_exports(registry)?;
     crate::vm::register_vm_exports(registry)?;
     crate::file::register_file_exports(registry)?;
+    crate::mm::register_mm_exports(registry)?;
     for (ordinal, name, stack_bytes) in BENIGN_SUCCESS {
         registry.register(SuccessExport::new(ordinal, name, stack_bytes))?;
     }
@@ -323,8 +337,9 @@ mod tests {
 
         // Five thread/handle exports, four Rtl and three Ke dispatcher
         // exports, one Ex executive export, one Nt virtual-memory export, four
-        // Nt file exports, one benign success export, and four startup stubs.
-        assert_eq!(registry.len(), 23);
+        // Nt file exports, four Mm contiguous exports, two benign success
+        // exports, and four startup stubs.
+        assert_eq!(registry.len(), 28);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,

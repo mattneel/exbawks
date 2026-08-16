@@ -140,6 +140,16 @@ The project follows Keep a Changelog structure before its first release.
   repository (the mount is a runtime path; tests use synthetic files). The
   retail image opens the disc device and advances to
   `MmAllocateContiguousMemory` (`HLE-004`).
+- The `Mm*` contiguous-memory family (`HLE-009`): `MmAllocateContiguousMemory`
+  and `MmAllocateContiguousMemoryEx` serve physically contiguous GPU/DMA
+  buffers from the kernel window through a new
+  `KernelServices::allocate_contiguous` seam, `MmGetPhysicalAddress` masks a
+  window address to its physical address (ADR 0010), `MmFreeContiguousMemory`
+  is a no-op until page reclamation lands (MEM-006), and
+  `MmPersistContiguousMemory` is a benign no-op. The retail image allocates
+  and persists its launch-data page and reaches its startup relaunch
+  (`HalReturnToFirmware` quick-reboot), so `exbawks run` now drives the retail
+  image through its entire early initialization to a controlled exit.
 - Implementation-burndown diagnostics: `exbawks coverage` reports
   implemented/stub/missing counts across the CPU, kernel, and GPU surfaces
   (with `--xbe` to scope the kernel surface to one image's imports), and a

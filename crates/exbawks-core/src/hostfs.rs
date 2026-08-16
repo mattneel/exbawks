@@ -169,9 +169,8 @@ fn sandbox_components(remainder: &str) -> Option<Vec<String>> {
             continue;
         }
         if raw == ".." {
-            if components.pop().is_none() {
-                return None;
-            }
+            // Pop the parent; a pop on an empty stack escapes the mount root.
+            components.pop()?;
             continue;
         }
         if raw.contains('\0') {

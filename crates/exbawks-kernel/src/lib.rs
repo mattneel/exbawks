@@ -8,6 +8,7 @@ mod export;
 mod file;
 mod gate;
 mod ke;
+mod mm;
 mod ordinals;
 mod registry;
 mod rtl;
@@ -23,6 +24,7 @@ pub use export::{KernelExport, StubExport, SuccessExport};
 pub use file::{NtCreateFile, NtOpenFile, NtQueryInformationFile, NtReadFile};
 pub use gate::{KERNEL_GATE_BASE, KERNEL_GATE_END, gate_address, gate_ordinal};
 pub use ke::KeInitializeDpc;
+pub use mm::{MmAllocateContiguousMemory, MmGetPhysicalAddress};
 pub use ordinals::{
     CallingConvention, ExportKind, KERNEL_ORDINALS, KernelOrdinalInfo, kernel_ordinal_info,
 };

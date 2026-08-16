@@ -168,6 +168,14 @@ pub trait KernelServices {
     fn file_info(&mut self, _handle: u32) -> Result<FileInfo, KernelServiceError> {
         Err(KernelServiceError::Unsupported)
     }
+
+    /// Allocates a physically contiguous, page-rounded guest buffer.
+    ///
+    /// Returns the guest address of the buffer in the kernel window (ADR
+    /// 0010). Used by the `Mm*` contiguous family for GPU and DMA buffers.
+    fn allocate_contiguous(&mut self, _bytes: u32) -> Result<GuestVa, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
 }
 
 /// A services implementation for contexts without an emulator.
