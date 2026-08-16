@@ -15,6 +15,10 @@ pub mod ordinal {
     pub const HAL_RETURN_TO_FIRMWARE: u16 = 49;
     /// `KeDelayExecutionThread`.
     pub const KE_DELAY_EXECUTION_THREAD: u16 = 99;
+    /// `KeInitializeDpc`.
+    pub const KE_INITIALIZE_DPC: u16 = 107;
+    /// `KeInitializeTimerEx`.
+    pub const KE_INITIALIZE_TIMER_EX: u16 = 113;
     /// `KeSetTimer`.
     pub const KE_SET_TIMER: u16 = 149;
     /// `NtAllocateVirtualMemory`.
@@ -65,6 +69,7 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     registry.register(PsTerminateSystemThread)?;
     registry.register(NtClose)?;
     crate::rtl::register_rtl_exports(registry)?;
+    crate::ke::register_ke_exports(registry)?;
     for (ordinal, name, stack_bytes) in BENIGN_SUCCESS {
         registry.register(SuccessExport::new(ordinal, name, stack_bytes))?;
     }
@@ -306,9 +311,9 @@ mod tests {
         let registry = KernelRegistry::new();
         register_startup_exports(&registry).expect("registration succeeds");
 
-        // Five thread/handle exports, three Rtl critical-section exports, one
-        // benign success export, and the seven remaining startup stubs.
-        assert_eq!(registry.len(), 16);
+        // Five thread/handle exports, three Rtl and two Ke dispatcher
+        // exports, one benign success export, and seven startup stubs.
+        assert_eq!(registry.len(), 18);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,

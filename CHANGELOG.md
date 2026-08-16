@@ -97,6 +97,10 @@ The project follows Keep a Changelog structure before its first release.
 - A reusable `SuccessExport` backs benign kernel exports that are safe no-ops
   on the boot path; `HalRegisterShutdownNotification` uses it, so the retail
   image advances past its shutdown-notification registration (`HLE-010`).
+- `KeInitializeDpc` and `KeInitializeTimerEx` initialize the guest DPC and
+  timer dispatcher objects; the objects do not fire yet (the DPC/timer
+  machinery is later work) but their structs are consistent so boot proceeds
+  (`HLE-007`).
 - Implementation-burndown diagnostics: `exbawks coverage` reports
   implemented/stub/missing counts across the CPU, kernel, and GPU surfaces
   (with `--xbe` to scope the kernel surface to one image's imports), and a

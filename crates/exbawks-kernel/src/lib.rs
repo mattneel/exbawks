@@ -5,6 +5,7 @@ mod context;
 mod error;
 mod export;
 mod gate;
+mod ke;
 mod ordinals;
 mod registry;
 mod rtl;
@@ -16,6 +17,7 @@ pub use context::KernelCallContext;
 pub use error::KernelError;
 pub use export::{KernelExport, StubExport, SuccessExport};
 pub use gate::{KERNEL_GATE_BASE, KERNEL_GATE_END, gate_address, gate_ordinal};
+pub use ke::KeInitializeDpc;
 pub use ordinals::{
     CallingConvention, ExportKind, KERNEL_ORDINALS, KernelOrdinalInfo, kernel_ordinal_info,
 };
