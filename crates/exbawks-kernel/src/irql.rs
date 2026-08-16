@@ -23,6 +23,7 @@ pub(crate) fn register_irql_exports(registry: &KernelRegistry) -> Result<(), Ker
     registry.register(HalGetInterruptVector)?;
     registry.register(KeInitializeInterrupt)?;
     registry.register(KeConnectInterrupt)?;
+    registry.register(KeDisconnectInterrupt)?;
     registry.register(HalReadWritePCISpace)?;
     Ok(())
 }
@@ -135,6 +136,29 @@ impl KernelExport for KeConnectInterrupt {
 
     fn call(&self, _context: &mut KernelCallContext<'_>) -> KernelStatus {
         // BOOLEAN TRUE in AL: the interrupt is "connected" (never fired).
+        KernelStatus(1)
+    }
+}
+
+/// Disconnects a guest interrupt object, reporting success (BOOLEAN TRUE).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KeDisconnectInterrupt;
+
+impl KernelExport for KeDisconnectInterrupt {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::KE_DISCONNECT_INTERRUPT
+    }
+
+    fn name(&self) -> &'static str {
+        "KeDisconnectInterrupt"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        4
+    }
+
+    fn call(&self, _context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // BOOLEAN TRUE: the interrupt was "disconnected" (it never fired).
         KernelStatus(1)
     }
 }

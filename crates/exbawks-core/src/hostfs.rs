@@ -140,6 +140,18 @@ impl HostFileSystem {
             let root = self.disc_root.as_deref()?;
             return Some((root, rest.to_owned(), false));
         }
+        // The cache drive letters (utility partitions): writable per-title
+        // scratch space, kept under distinct subdirectories of the HDD
+        // mount so cached files never collide with TDATA/UDATA.
+        for letter in ["X:", "Y:", "Z:", "\\??\\X:", "\\??\\Y:", "\\??\\Z:"] {
+            if let Some(rest) = strip_prefix_ci(path, letter)
+                && (rest.is_empty() || rest.starts_with('\\') || rest.starts_with('/'))
+                && let Some(root) = self.hdd_root.as_deref()
+            {
+                let drive = letter.chars().rev().nth(1).unwrap_or('Z');
+                return Some((root, format!("\\{drive}{rest}"), true));
+            }
+        }
         let root = self.disc_root.as_deref()?;
         for prefix in DISC_PREFIXES {
             if let Some(rest) = strip_prefix_ci(path, prefix) {

@@ -19,7 +19,50 @@ use crate::{
 /// Registers the Nt* virtual-memory exports.
 pub(crate) fn register_vm_exports(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register(NtAllocateVirtualMemory)?;
+    registry.register(NtFreeVirtualMemory)?;
     Ok(())
+}
+
+/// Releases a virtual-memory region.
+///
+/// The bump allocator cannot reclaim pages yet (MEM-006), so the region
+/// leaks; the request is validated and acknowledged so titles that free
+/// scratch buffers during loading proceed.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NtFreeVirtualMemory;
+
+impl KernelExport for NtFreeVirtualMemory {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::NT_FREE_VIRTUAL_MEMORY
+    }
+
+    fn name(&self) -> &'static str {
+        "NtFreeVirtualMemory"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        12
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // NtFreeVirtualMemory(BaseAddress, RegionSize, FreeType).
+        let (Some(base_pointer), Some(size_pointer)) =
+            (stack_argument(context, 0), stack_argument(context, 1))
+        else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        if base_pointer == 0 {
+            return KernelStatus::INVALID_PARAMETER;
+        }
+        let base = context.memory.read_u32(GuestVa(base_pointer)).unwrap_or(0);
+        tracing::debug!(base = format_args!("{base:#010x}"), "NtFreeVirtualMemory (leaked)");
+        if size_pointer != 0 {
+            // The freed size reads back as the caller's requested size.
+            let size = context.memory.read_u32(GuestVa(size_pointer)).unwrap_or(0);
+            let _ = context.memory.write_u32(GuestVa(size_pointer), size);
+        }
+        KernelStatus::SUCCESS
+    }
 }
 
 /// Reserves and/or commits guest virtual memory.

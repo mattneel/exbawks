@@ -7,6 +7,14 @@ use crate::{
 
 /// Xbox kernel export ordinals from the public XboxDev export table.
 pub mod ordinal {
+    /// `AvGetSavedDataAddress`.
+    pub const AV_GET_SAVED_DATA_ADDRESS: u16 = 1;
+    /// `AvSendTVEncoderOption`.
+    pub const AV_SEND_TV_ENCODER_OPTION: u16 = 2;
+    /// `AvSetDisplayMode`.
+    pub const AV_SET_DISPLAY_MODE: u16 = 3;
+    /// `AvSetSavedDataAddress`.
+    pub const AV_SET_SAVED_DATA_ADDRESS: u16 = 4;
     /// `DbgPrint`.
     pub const DBG_PRINT: u16 = 8;
     /// `ExAllocatePool`.
@@ -39,6 +47,8 @@ pub mod ordinal {
     pub const KE_INITIALIZE_TIMER_EX: u16 = 113;
     /// `KeConnectInterrupt`.
     pub const KE_CONNECT_INTERRUPT: u16 = 98;
+    /// `KeDisconnectInterrupt`.
+    pub const KE_DISCONNECT_INTERRUPT: u16 = 100;
     /// `KeGetCurrentIrql`.
     pub const KE_GET_CURRENT_IRQL: u16 = 103;
     /// `KeInitializeInterrupt`.
@@ -130,10 +140,8 @@ pub mod ordinal {
 }
 
 /// The startup stubs for timers and reclamation.
-const STARTUP_STUBS: [(u16, &str); 2] = [
-    (ordinal::KE_DELAY_EXECUTION_THREAD, "KeDelayExecutionThread"),
-    (ordinal::NT_FREE_VIRTUAL_MEMORY, "NtFreeVirtualMemory"),
-];
+const STARTUP_STUBS: [(u16, &str); 1] =
+    [(ordinal::KE_DELAY_EXECUTION_THREAD, "KeDelayExecutionThread")];
 
 /// Benign exports that succeed as no-ops on the boot path:
 /// (ordinal, name, stdcall argument bytes).
@@ -165,6 +173,7 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     crate::io::register_io_exports(registry)?;
     crate::xe::register_xe_exports(registry)?;
     crate::irql::register_irql_exports(registry)?;
+    crate::av::register_av_exports(registry)?;
     for (ordinal, name, stack_bytes) in BENIGN_SUCCESS {
         registry.register(SuccessExport::new(ordinal, name, stack_bytes))?;
     }
@@ -550,10 +559,11 @@ mod tests {
         register_startup_exports(&registry).expect("registration succeeds");
 
         // Nine thread/handle/event/wait exports, six Rtl and four Ke exports,
-        // five Ex executive exports, eight IRQL/interrupt/PCI exports, one Nt virtual-memory export, seven Nt
+        // five Ex executive exports, nine IRQL/interrupt/PCI exports,
+        // four Av video exports, one Nt virtual-memory export, seven Nt
         // file exports, six Mm exports, four symbolic-link exports, two Xe
         // section exports, one benign success export, and two startup stubs.
-        assert_eq!(registry.len(), 60);
+        assert_eq!(registry.len(), 65);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,

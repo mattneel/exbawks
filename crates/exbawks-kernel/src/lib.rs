@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![doc = "Kernel high-level emulation interfaces for Exbawks."]
 
+mod av;
 mod context;
 mod error;
 mod ex;
@@ -20,6 +21,9 @@ mod status;
 mod vm;
 mod xe;
 
+pub use av::{
+    AvGetSavedDataAddress, AvSendTVEncoderOption, AvSetDisplayMode, AvSetSavedDataAddress,
+};
 pub use context::KernelCallContext;
 pub use error::KernelError;
 pub use ex::{
