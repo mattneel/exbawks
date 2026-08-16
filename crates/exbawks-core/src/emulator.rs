@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use exbawks_cpu::{BasicBlockDecoder, CpuState, DecodeConfig, DecodedBlock, indirect_call_slot};
+use exbawks_cpu::{
+    BasicBlockDecoder, CpuState, DecodeConfig, DecodedBlock, ExecError, classify_register_op,
+    indirect_call_slot,
+};
 use exbawks_debug::{NoopTrace, TraceEvent, TraceSink};
 use exbawks_gpu::{GraphicsFrontend, NullGraphicsBackend};
 use exbawks_jit::{
@@ -42,6 +45,28 @@ pub enum GateAssist {
     },
     /// The current instruction is not a kernel gate call.
     NotAGateCall,
+}
+
+/// How the run loop treats the instruction at one address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryClass {
+    /// The direct backend translates the first instruction.
+    Translatable,
+    /// Decodable but untranslatable: probe the gate, then interpret.
+    Assisted,
+    /// Unfetchable or undecodable: the interpreter reports the typed fault.
+    Interpreted,
+}
+
+/// Extracts the faulting guest address a memory error carries, when any.
+fn memory_fault_address(error: &MemoryError) -> Option<GuestVa> {
+    match error {
+        MemoryError::Unmapped { address, .. }
+        | MemoryError::AccessDenied { address, .. }
+        | MemoryError::Mmio { address, .. }
+        | MemoryError::AlreadyMapped { address } => Some(*address),
+        _ => None,
+    }
 }
 
 /// The guest stack range for the first synthetic thread.
@@ -330,42 +355,107 @@ impl Emulator {
 
         for _ in 0..max_blocks {
             let start = GuestVa(self.cpu.eip);
-            let (_, compiled) = self.compiled_block_at(start)?;
-            let Some(emitted) = compiled.executable.as_ref() else {
-                return Ok(StopReason::RuntimeIncomplete);
-            };
+            match self.classify_entry(start) {
+                EntryClass::Translatable => {
+                    let (_, compiled) = self.compiled_block_at(start)?;
+                    let Some(emitted) = compiled.executable.as_ref() else {
+                        return Ok(StopReason::RuntimeIncomplete);
+                    };
 
-            match Dispatcher.run(emitted, &mut self.cpu)? {
-                BlockExit::DirectSuccessor => {}
-                BlockExit::UnsupportedInstruction => match self.try_kernel_gate_call()? {
-                    GateAssist::Dispatched { stop: Some(stop), .. } => return Ok(stop),
-                    // An unimplemented stub cannot correctly clean the stdcall
-                    // stack or return meaningful values, so halt rather than
-                    // continue past it with corrupted guest state.
-                    GateAssist::Dispatched { ordinal, status, .. }
-                        if status == KernelStatus::NOT_IMPLEMENTED =>
-                    {
-                        return Ok(StopReason::UnimplementedKernelExport { ordinal });
+                    let exit = Dispatcher.run(emitted, &mut self.cpu)?;
+                    self.cpu.tsc =
+                        self.cpu.tsc.wrapping_add(emitted.translated_instructions() as u64);
+                    match exit {
+                        BlockExit::DirectSuccessor => {}
+                        BlockExit::UnsupportedInstruction => {
+                            if let Some(stop) = self.assist_at_current_eip()? {
+                                return Ok(stop);
+                            }
+                        }
+                        _ => {
+                            return Ok(StopReason::UnsupportedInstruction {
+                                address: GuestVa(self.cpu.eip),
+                            });
+                        }
                     }
-                    GateAssist::Dispatched { .. } => {}
-                    GateAssist::MissingExport { ordinal } => {
-                        return Ok(StopReason::MissingKernelExport { ordinal });
+                }
+                EntryClass::Assisted => {
+                    if let Some(stop) = self.assist_at_current_eip()? {
+                        return Ok(stop);
                     }
-                    GateAssist::NotAGateCall => {
-                        return Ok(StopReason::UnsupportedInstruction {
-                            address: GuestVa(self.cpu.eip),
-                        });
+                }
+                EntryClass::Interpreted => {
+                    if let Some(stop) = self.interpret_step()? {
+                        return Ok(stop);
                     }
-                },
-                _ => {
-                    return Ok(StopReason::UnsupportedInstruction {
-                        address: GuestVa(self.cpu.eip),
-                    });
                 }
             }
         }
 
         Ok(StopReason::BudgetExhausted)
+    }
+
+    /// Decides how the run loop treats the instruction at one address.
+    ///
+    /// Only translatable entries reach the code cache, so untranslatable
+    /// regions neither churn executable buffers nor pollute the cache with
+    /// zero-coverage blocks.
+    fn classify_entry(&self, start: GuestVa) -> EntryClass {
+        let Ok(bytes) = self.fetch_executable(start, 15) else {
+            return EntryClass::Interpreted;
+        };
+        let decoder = BasicBlockDecoder::new(DecodeConfig {
+            max_instructions: 1,
+            max_bytes: bytes.len().max(1),
+        });
+        let Ok(block) = decoder.decode(start, &bytes) else {
+            return EntryClass::Interpreted;
+        };
+        match block.instructions.first() {
+            Some(instruction) if classify_register_op(instruction).is_some() => {
+                EntryClass::Translatable
+            }
+            Some(_) => EntryClass::Assisted,
+            None => EntryClass::Interpreted,
+        }
+    }
+
+    /// Probes the kernel gate at the current EIP, then falls back to one
+    /// interpreter step.
+    fn assist_at_current_eip(&mut self) -> Result<Option<StopReason>, CoreError> {
+        match self.try_kernel_gate_call()? {
+            GateAssist::Dispatched { stop: Some(stop), .. } => Ok(Some(stop)),
+            // An unimplemented stub cannot correctly clean the stdcall
+            // stack or return meaningful values, so halt rather than
+            // continue past it with corrupted guest state.
+            GateAssist::Dispatched { ordinal, status, .. }
+                if status == KernelStatus::NOT_IMPLEMENTED =>
+            {
+                Ok(Some(StopReason::UnimplementedKernelExport { ordinal }))
+            }
+            GateAssist::Dispatched { .. } => Ok(None),
+            GateAssist::MissingExport { ordinal } => {
+                Ok(Some(StopReason::MissingKernelExport { ordinal }))
+            }
+            GateAssist::NotAGateCall => self.interpret_step(),
+        }
+    }
+
+    /// Executes one instruction through the tier-0 interpreter (ADR 0008),
+    /// converting typed interpreter failures into controlled stop reasons.
+    fn interpret_step(&mut self) -> Result<Option<StopReason>, CoreError> {
+        let memory = self.memory.clone();
+        match exbawks_cpu::step(&mut self.cpu, memory.as_ref()) {
+            Ok(()) => Ok(None),
+            Err(ExecError::Unsupported { address } | ExecError::InvalidInstruction { address }) => {
+                Ok(Some(StopReason::UnsupportedInstruction { address }))
+            }
+            Err(ExecError::Divide { address }) => Ok(Some(StopReason::GuestFault { address })),
+            Err(ExecError::Memory(error)) => {
+                let address = memory_fault_address(&error).unwrap_or(GuestVa(self.cpu.eip));
+                Ok(Some(StopReason::GuestFault { address }))
+            }
+        }
     }
 
     /// Decodes and plans the current entry block.
@@ -831,6 +921,44 @@ mod tests {
         }
         #[cfg(not(windows))]
         assert_eq!(report.translated_instructions, None);
+    }
+
+    /// The interpreter tier alone can carry a boot from memory-operand code
+    /// through a kernel gate to a controlled exit — on any host.
+    #[test]
+    fn interpreter_fallback_reaches_a_gate_exit() {
+        let code = [
+            0x8B, 0x0D, 0x04, 0x01, 0x01, 0x00, // mov ecx, [0x10104] (header base field)
+            0x6A, 0x00, // push 0
+            0xFF, 0x15, 0x00, 0x12, 0x01, 0x00, // call [0x11200] -> HalReturnToFirmware
+        ];
+        let mut emulator = Emulator::new().expect("emulator must initialize");
+        emulator.load_xbe(synthetic_xbe_with(&code, &[0x8000_0000 | 49])).expect("image must load");
+        let stop = emulator.run(64).expect("run must complete");
+
+        assert_eq!(stop, StopReason::GuestExit { code: 0 });
+        assert_eq!(emulator.cpu().gpr[1], 0x0001_0000, "the interpreted load must land");
+        assert!(emulator.cpu().tsc > 0, "interpreted instructions must advance the counter");
+    }
+
+    /// Register-only blocks run through the JIT while everything between
+    /// them runs through the interpreter, sharing one CpuState.
+    #[cfg(windows)]
+    #[test]
+    fn tiers_interleave_within_one_boot() {
+        let code = [
+            0xB8, 0x05, 0x00, 0x00, 0x00, // mov eax, 5 (translated block)
+            0x8B, 0x0D, 0x04, 0x01, 0x01, 0x00, // mov ecx, [0x10104] (interpreted)
+            0x01, 0xC1, // add ecx, eax (translated block)
+            0x6A, 0x00, // push 0 (interpreted)
+            0xFF, 0x15, 0x00, 0x12, 0x01, 0x00, // call [0x11200]
+        ];
+        let mut emulator = Emulator::new().expect("emulator must initialize");
+        emulator.load_xbe(synthetic_xbe_with(&code, &[0x8000_0000 | 49])).expect("image must load");
+        let stop = emulator.run(64).expect("run must complete");
+
+        assert_eq!(stop, StopReason::GuestExit { code: 0 });
+        assert_eq!(emulator.cpu().gpr[1], 0x0001_0005, "both tiers must contribute");
     }
 
     #[test]

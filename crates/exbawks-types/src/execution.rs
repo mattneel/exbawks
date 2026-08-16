@@ -72,6 +72,10 @@ pub enum StopReason {
     MissingKernelExport { ordinal: u16 },
     /// The emulator reached a registered but unimplemented HLE export.
     UnimplementedKernelExport { ordinal: u16 },
+    /// The guest raised a fault the runtime cannot deliver yet (an invalid
+    /// memory access or a divide error; guest exception delivery arrives
+    /// with the SEH work).
+    GuestFault { address: GuestVa },
     /// The configured execution budget expired.
     BudgetExhausted,
     /// The runtime is not implemented yet.

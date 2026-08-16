@@ -283,7 +283,9 @@ impl WindowsAddressSpace {
                         .ok_or(MemoryError::Unmapped { address: current, access })?;
                     view.write_at(view_offset, &input[offset..offset + chunk])?;
                     Ok(())
-                })
+                })?;
+                crate::access::bump_written_generations(&self.table, address, len);
+                Ok(())
             }
         }
     }

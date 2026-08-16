@@ -166,12 +166,17 @@ impl SoftwareAddressSpace {
             AccessBuffer::Write(input) => {
                 let mut physical = self.physical.write();
                 validate_access(&self.table, physical.len(), access, address, input.len())?;
-                copy_to_guest(&self.table, physical.as_mut(), access, address, input)
+                copy_to_guest(&self.table, physical.as_mut(), access, address, input)?;
+                crate::access::bump_written_generations(&self.table, address, input.len());
+                Ok(())
             }
         }
     }
 }
 
+// Guest writes bump the physical generation of every covered RAM page (see
+// `bump_written_generations`), which is what lets the code cache observe
+// self-modifying code from either execution tier.
 impl GuestMemory for SoftwareAddressSpace {
     fn read(&self, address: GuestVa, output: &mut [u8]) -> Result<(), MemoryError> {
         self.access(AccessKind::Read, address, AccessBuffer::Read(output))
@@ -338,6 +343,40 @@ mod tests {
         let mut first = [0_u8; 1];
         memory.read(GuestVa(0x1FFF), &mut first).expect("read succeeds");
         assert_eq!(first, [0]);
+    }
+
+    #[test]
+    fn writes_bump_physical_page_generations() {
+        let memory = SoftwareAddressSpace::new(64 * 1024).expect("memory is valid");
+        let range = GuestRange::page_aligned(GuestVa(0x1000), 2 * u64::from(GUEST_PAGE_SIZE))
+            .expect("range is valid");
+        memory
+            .map_anonymous(range, MemoryPermissions::READ | MemoryPermissions::WRITE)
+            .expect("mapping succeeds");
+        let table = memory.page_table();
+        let first = table.get(GuestVa(0x1000).page()).physical_page();
+        let second = table.get(GuestVa(0x2000).page()).physical_page();
+        let before_first = table.physical_generation(first).expect("generation exists");
+        let before_second = table.physical_generation(second).expect("generation exists");
+
+        // A write spanning both pages bumps both generations exactly once.
+        memory.write(GuestVa(0x1FFE), &[1, 2, 3, 4]).expect("write succeeds");
+        assert_eq!(
+            table.physical_generation(first),
+            Some(before_first.wrapping_add(1)),
+            "the first written page must invalidate"
+        );
+        assert_eq!(table.physical_generation(second), Some(before_second.wrapping_add(1)));
+
+        // A failed write bumps nothing.
+        let error = memory.write(GuestVa(0x2FFF), &[1, 2]).expect_err("write must fail");
+        assert!(matches!(error, MemoryError::Unmapped { .. }));
+        assert_eq!(table.physical_generation(first), Some(before_first.wrapping_add(1)));
+
+        // Reads bump nothing.
+        let mut scratch = [0_u8; 4];
+        memory.read(GuestVa(0x1FFE), &mut scratch).expect("read succeeds");
+        assert_eq!(table.physical_generation(first), Some(before_first.wrapping_add(1)));
     }
 
     #[test]

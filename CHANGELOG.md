@@ -64,6 +64,13 @@ The project follows Keep a Changelog structure before its first release.
   progress commits across faults, as hardware restarts), a deterministic
   Pentium III CPUID profile (SSE yes, SSE2 no), and RDTSC backed by a
   virtualized per-instruction counter in `CpuState` (`CPU-003`).
+- The run loop falls back to the tier-0 interpreter for untranslatable
+  instructions (gate probe first), guest writes bump physical-page
+  generations in both memory backends so self-modifying code invalidates
+  cached blocks, and invalid guest accesses stop with the new
+  `StopReason::GuestFault`. The retail Dino Crisis 3 image now executes its
+  XAPI entry path and stops at its first real kernel wall,
+  `PsCreateSystemThreadEx` (`CORE-002`).
 
 ### Fixed
 

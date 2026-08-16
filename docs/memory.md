@@ -115,7 +115,12 @@ Protect every alias when write-fault invalidation becomes active.
 
 A compiled block records the generation of each physical code page. A mismatch invalidates the block.
 
-The current software backend exposes explicit generation updates. It does not detect code writes automatically.
+Every checked guest write bumps the generation of each RAM page it covers,
+in both address-space backends. Interpreter stores and future JIT helper
+stores therefore invalidate cached code through one shared path; pages that
+never backed executable mappings pay one atomic bump that no cached block
+observes. Host write-fault detection for JIT direct stores arrives with the
+arena work (ADR 0004).
 
 ## MMIO
 

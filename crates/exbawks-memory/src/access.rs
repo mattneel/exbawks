@@ -23,6 +23,26 @@ impl AccessBuffer<'_> {
     }
 }
 
+/// Bumps the physical-page generation of every RAM page a completed write
+/// covered, so cached translated code depending on those pages revalidates
+/// (ADR 0005). Both address-space backends call this from their write paths;
+/// pages that never backed executable mappings pay one atomic bump and no
+/// cached block ever matches them.
+pub(crate) fn bump_written_generations(table: &PageTable, address: GuestVa, len: usize) {
+    let Ok(length) = u64::try_from(len) else {
+        return;
+    };
+    let Ok(range) = exbawks_types::GuestRange::new(address, length) else {
+        return;
+    };
+    for page in range.pages() {
+        let descriptor = table.get(page);
+        if descriptor.is_valid() && descriptor.kind() == PageKind::Ram {
+            let _ = table.bump_physical_generation(descriptor.physical_page());
+        }
+    }
+}
+
 /// Loads one descriptor and validates kind and permissions for an access.
 pub(crate) fn checked_descriptor(
     table: &PageTable,
