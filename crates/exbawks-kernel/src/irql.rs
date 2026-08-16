@@ -20,7 +20,95 @@ pub(crate) fn register_irql_exports(registry: &KernelRegistry) -> Result<(), Ker
     registry.register(KfLowerIrql)?;
     registry.register(KeGetCurrentIrql)?;
     registry.register(KeRaiseIrqlToDpcLevel)?;
+    registry.register(HalGetInterruptVector)?;
+    registry.register(KeInitializeInterrupt)?;
+    registry.register(KeConnectInterrupt)?;
     Ok(())
+}
+
+/// Fills a guest `KINTERRUPT` object.
+///
+/// Devices are HLE and no interrupt is ever delivered, so recording the
+/// caller's routine is unnecessary; the object just has to exist for the
+/// later connect call.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KeInitializeInterrupt;
+
+impl KernelExport for KeInitializeInterrupt {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::KE_INITIALIZE_INTERRUPT
+    }
+
+    fn name(&self) -> &'static str {
+        "KeInitializeInterrupt"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        28
+    }
+
+    fn call(&self, _context: &mut KernelCallContext<'_>) -> KernelStatus {
+        KernelStatus::SUCCESS
+    }
+}
+
+/// Connects a guest interrupt object, reporting success (BOOLEAN TRUE).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KeConnectInterrupt;
+
+impl KernelExport for KeConnectInterrupt {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::KE_CONNECT_INTERRUPT
+    }
+
+    fn name(&self) -> &'static str {
+        "KeConnectInterrupt"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        4
+    }
+
+    fn call(&self, _context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // BOOLEAN TRUE in AL: the interrupt is "connected" (never fired).
+        KernelStatus(1)
+    }
+}
+
+/// Maps a bus interrupt level to a vector and its IRQL.
+///
+/// No interrupts are ever delivered (devices are HLE), so the mapping only
+/// has to be self-consistent: the Xbox HAL returns `0x30 + level` with IRQL
+/// descending from `DISPATCH_LEVEL + …` — drivers store both and proceed.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HalGetInterruptVector;
+
+impl KernelExport for HalGetInterruptVector {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::HAL_GET_INTERRUPT_VECTOR
+    }
+
+    fn name(&self) -> &'static str {
+        "HalGetInterruptVector"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        8
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        use crate::startup::stack_argument;
+
+        let level = stack_argument(context, 0).unwrap_or(0) & 0xFF;
+        let irql_out = stack_argument(context, 1).unwrap_or(0);
+        if irql_out != 0 {
+            // IRQL above DISPATCH_LEVEL, descending with the level as on
+            // the console's PIC layout.
+            let irql = 26_u32.saturating_sub(level).max(DISPATCH_LEVEL + 1);
+            let _ = context.memory.write_u32(GuestVa(irql_out), irql);
+        }
+        KernelStatus(0x30 + level)
+    }
 }
 
 /// The active thread's `KPCR.Irql` cell, through the `fs` base.

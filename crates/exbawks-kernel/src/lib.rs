@@ -34,7 +34,10 @@ pub use gate::{KERNEL_GATE_BASE, KERNEL_GATE_END, gate_address, gate_ordinal};
 pub use io::{
     IoCreateSymbolicLink, IoDeleteSymbolicLink, NtOpenSymbolicLinkObject, NtQuerySymbolicLinkObject,
 };
-pub use irql::{KeGetCurrentIrql, KfLowerIrql, KfRaiseIrql};
+pub use irql::{
+    HalGetInterruptVector, KeConnectInterrupt, KeGetCurrentIrql, KeInitializeInterrupt,
+    KfLowerIrql, KfRaiseIrql,
+};
 pub use ke::{KeInitializeDpc, KeQuerySystemTime};
 pub use mm::{MmAllocateContiguousMemory, MmGetPhysicalAddress};
 pub use ordinals::{

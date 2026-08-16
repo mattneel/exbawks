@@ -19,6 +19,8 @@ pub mod ordinal {
     pub const EX_QUERY_POOL_BLOCK_SIZE: u16 = 23;
     /// `ExQueryNonVolatileSetting`.
     pub const EX_QUERY_NON_VOLATILE_SETTING: u16 = 24;
+    /// `HalGetInterruptVector`.
+    pub const HAL_GET_INTERRUPT_VECTOR: u16 = 44;
     /// `HalRegisterShutdownNotification`.
     pub const HAL_REGISTER_SHUTDOWN_NOTIFICATION: u16 = 47;
     /// `HalReturnToFirmware`.
@@ -33,8 +35,12 @@ pub mod ordinal {
     pub const KE_INITIALIZE_DPC: u16 = 107;
     /// `KeInitializeTimerEx`.
     pub const KE_INITIALIZE_TIMER_EX: u16 = 113;
+    /// `KeConnectInterrupt`.
+    pub const KE_CONNECT_INTERRUPT: u16 = 98;
     /// `KeGetCurrentIrql`.
     pub const KE_GET_CURRENT_IRQL: u16 = 103;
+    /// `KeInitializeInterrupt`.
+    pub const KE_INITIALIZE_INTERRUPT: u16 = 109;
     /// `KeQuerySystemTime`.
     pub const KE_QUERY_SYSTEM_TIME: u16 = 128;
     /// `KeRaiseIrqlToDpcLevel`.
@@ -55,6 +61,8 @@ pub mod ordinal {
     pub const MM_FREE_CONTIGUOUS_MEMORY: u16 = 171;
     /// `MmGetPhysicalAddress`.
     pub const MM_GET_PHYSICAL_ADDRESS: u16 = 173;
+    /// `MmLockUnlockBufferPages`.
+    pub const MM_LOCK_UNLOCK_BUFFER_PAGES: u16 = 175;
     /// `MmPersistContiguousMemory`.
     pub const MM_PERSIST_CONTIGUOUS_MEMORY: u16 = 178;
     /// `MmQueryAllocationSize`.
@@ -121,10 +129,12 @@ const STARTUP_STUBS: [(u16, &str); 2] = [
 
 /// Benign exports that succeed as no-ops on the boot path:
 /// (ordinal, name, stdcall argument bytes).
-const BENIGN_SUCCESS: [(u16, &str, u16); 2] = [
+const BENIGN_SUCCESS: [(u16, &str, u16); 3] = [
     (ordinal::HAL_REGISTER_SHUTDOWN_NOTIFICATION, "HalRegisterShutdownNotification", 8),
     // A calibrated busy-wait; HLE time passes through the virtual clock.
     (ordinal::KE_STALL_EXECUTION_PROCESSOR, "KeStallExecutionProcessor", 4),
+    // Page pinning for device DMA; HLE pages never move.
+    (ordinal::MM_LOCK_UNLOCK_BUFFER_PAGES, "MmLockUnlockBufferPages", 12),
 ];
 
 /// Registers the startup export set for one synthetic guest thread.
@@ -469,10 +479,10 @@ mod tests {
         register_startup_exports(&registry).expect("registration succeeds");
 
         // Seven thread/handle/event exports, six Rtl and four Ke exports,
-        // five Ex executive exports, four IRQL exports, one Nt virtual-memory export, seven Nt
+        // five Ex executive exports, seven IRQL/interrupt exports, one Nt virtual-memory export, seven Nt
         // file exports, six Mm exports, four symbolic-link exports, two Xe
         // section exports, one benign success export, and two startup stubs.
-        assert_eq!(registry.len(), 52);
+        assert_eq!(registry.len(), 56);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,

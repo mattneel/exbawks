@@ -913,11 +913,43 @@ impl Emulator {
 
         let mut relaunches = 0_u32;
         let mut serviced = 0_usize;
+        // How many identified DSP mailbox pages are out of the partition.
+        fn unmap_mailboxes(
+            devices: &crate::mmio::DeviceSpace,
+            machine: &mut exbawks_whp::Machine,
+            applied: &mut usize,
+            all: bool,
+        ) -> Result<(), CoreError> {
+            let pages = devices.mailbox_pages();
+            let start = if all { 0 } else { *applied };
+            for page in &pages[start.min(pages.len())..] {
+                machine
+                    .unmap_gpa(u64::from(*page), 0x1000)
+                    .map_err(|error| CoreError::Hypervisor(error.to_string()))?;
+            }
+            *applied = pages.len();
+            Ok(())
+        }
+        let mut mailboxes_applied = 0_usize;
+        unmap_mailboxes(&self.devices, &mut machine, &mut mailboxes_applied, true)?;
         while serviced < max_exits {
             let exit = machine.run().map_err(|error| CoreError::Hypervisor(error.to_string()))?;
             let exit_rip = machine.exit_context().rip;
             match exit {
                 exbawks_whp::WhpExit::Canceled => {
+                    // The pump doubles as a sampling profiler: the exit RIP
+                    // is wherever the guest was interrupted.
+                    if tracing::enabled!(tracing::Level::TRACE) {
+                        let rbx = machine
+                            .get_registers(&[exbawks_whp::Register::Rbx])
+                            .map(|values| values[0].low)
+                            .unwrap_or(0);
+                        tracing::trace!(
+                            rip = format_args!("{exit_rip:#010x}"),
+                            rbx = format_args!("{rbx:#010x}"),
+                            "whp cancel sample"
+                        );
+                    }
                     advance_clock(&self.memory);
                     continue;
                 }
@@ -959,16 +991,26 @@ impl Emulator {
                         }
                     }
 
-                    // A data access to a hardware register block: execute
-                    // exactly one instruction on the interpreter over the
-                    // device view, so the access's own semantics come from
-                    // the oracle rather than a hand decoder (WHP-M2).
-                    if access.access_type != 2 && crate::mmio::DeviceSpace::contains(gpa, 1) {
+                    // A data access to a hardware register block (or the
+                    // software DSP mailbox page): execute exactly one
+                    // instruction on the interpreter over the device view,
+                    // so the access's own semantics come from the oracle
+                    // rather than a hand decoder (WHP-M2).
+                    if access.access_type != 2 && self.devices.routes(gpa) {
                         self.whp_read_cpu(&mut machine)?;
                         let memory = self.memory.clone();
                         let view = crate::mmio::MmioView::new(&memory, &self.devices);
                         match exbawks_cpu::step(&mut self.cpu, &view) {
                             Ok(()) => {
+                                // A device write may have just identified a
+                                // DSP mailbox page; take it out of the
+                                // partition so its traffic routes here.
+                                unmap_mailboxes(
+                                    &self.devices,
+                                    &mut machine,
+                                    &mut mailboxes_applied,
+                                    false,
+                                )?;
                                 self.whp_write_cpu(&mut machine)?;
                                 continue;
                             }
@@ -1010,6 +1052,12 @@ impl Emulator {
                             tracing::info!(relaunches, "whp: soft reboot, relaunching title");
                             machine = self.whp_build_machine()?;
                             mapped_epoch = self.memory.mapping_epoch();
+                            unmap_mailboxes(
+                                &self.devices,
+                                &mut machine,
+                                &mut mailboxes_applied,
+                                true,
+                            )?;
                             continue;
                         }
                         return Ok(stop);
@@ -1017,6 +1065,9 @@ impl Emulator {
                     if self.memory.mapping_epoch() != mapped_epoch {
                         self.whp_sync_mappings(&mut machine)?;
                         mapped_epoch = self.memory.mapping_epoch();
+                        // A resync remaps everything; every mailbox page
+                        // must come back out.
+                        unmap_mailboxes(&self.devices, &mut machine, &mut mailboxes_applied, true)?;
                     }
                     self.whp_write_cpu(&mut machine)?;
                 }

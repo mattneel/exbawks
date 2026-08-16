@@ -64,7 +64,17 @@ struct RegionStats {
 pub struct DeviceSpace {
     stats: Mutex<[RegionStats; 4]>,
     registers: Mutex<std::collections::HashMap<u32, u32>>,
+    /// Guest VA pages holding APU DSP command mailboxes, one per comm
+    /// region the guest programs. The engine unmaps them so accesses route
+    /// here: writes are consumed instantly (an "infinitely fast DSP"),
+    /// reads report the consumed (zero) state.
+    mailbox_pages: Mutex<Vec<u32>>,
 }
+
+/// The APU register receiving the GP comm region's physical base address.
+const APU_GP_COMM_BASE: u32 = 0xFE82_0808;
+/// The mailbox cell's page offset within the GP comm region.
+const GP_MAILBOX_PAGE_OFFSET: u32 = 0x1000;
 
 impl DeviceSpace {
     /// True when a whole access lies inside device space.
@@ -94,9 +104,24 @@ impl DeviceSpace {
         // `0xFE82_0010`: an APU GP-DSP status register DirectSound's init
         // polls after programming the global setup (observed in the retail
         // image; never written by the guest).
-        const READY_OVERRIDES: [u32; 1] = [0xFE82_0010];
+        //
+        // `0xFEC0_0130`: the AC'97 global status register (`GLOB_STA`);
+        // DirectSound's init polls it for the codec-ready bits with a
+        // bounded timeout, and a timeout fails `DirectSoundCreate` — which
+        // the retail image never checks, crashing on the null device.
+        const READY_OVERRIDES: [u32; 2] = [0xFE82_0010, 0xFEC0_0130];
+        // Self-clearing command registers: the guest writes a reset bit and
+        // spins until it reads back clear; real hardware clears it
+        // immediately, so latching the write would spin forever. The AC'97
+        // busmaster channel control registers (`CR` at `0xFEC001n0 + 0xB`
+        // for each channel, the SPDIF channel at `+0x70` included) are the
+        // observed cases.
+        let ac97_channel_control =
+            (0xFEC0_0100..=0xFEC0_01FF).contains(&address) && address & 0xF == 0xB;
         if READY_OVERRIDES.contains(&address) {
             output.fill(0xFF);
+        } else if ac97_channel_control {
+            // Already zero-filled: the command completed instantly.
         } else {
             let registers =
                 self.registers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -118,6 +143,20 @@ impl DeviceSpace {
         let take = input.len().min(4);
         bytes[..take].copy_from_slice(&input[..take]);
         let value = u32::from_le_bytes(bytes);
+        if address == APU_GP_COMM_BASE && value != 0 {
+            // A comm region's physical base: its mailbox page (in the
+            // cached kernel window) becomes an instant-consumer mailbox.
+            let page = (0x8000_0000 | value).wrapping_add(GP_MAILBOX_PAGE_OFFSET) & !0xFFF;
+            let mut pages =
+                self.mailbox_pages.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !pages.contains(&page) {
+                pages.push(page);
+                tracing::debug!(
+                    page = format_args!("{page:#010x}"),
+                    "APU DSP mailbox page identified"
+                );
+            }
+        }
         self.registers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -131,6 +170,27 @@ impl DeviceSpace {
             value = format_args!("{value:#x}"),
             "MMIO write"
         );
+    }
+
+    /// The identified DSP mailbox pages.
+    #[must_use]
+    pub fn mailbox_pages(&self) -> Vec<u32> {
+        self.mailbox_pages.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// True when a data fault at this address routes to the device model.
+    pub fn routes(&self, address: u32) -> bool {
+        Self::contains(address, 1) || self.in_mailbox(address, 1)
+    }
+
+    /// True when an access falls inside an identified mailbox page.
+    fn in_mailbox(&self, address: u32, len: usize) -> bool {
+        let end = u64::from(address) + len as u64;
+        self.mailbox_pages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|page| address >= *page && end <= u64::from(*page) + 0x1000)
     }
 
     /// Renders the access counters for diagnostics.
@@ -167,6 +227,11 @@ impl<'a> MmioView<'a> {
 
 impl GuestMemory for MmioView<'_> {
     fn read(&self, address: GuestVa, output: &mut [u8]) -> Result<(), MemoryError> {
+        if self.devices.in_mailbox(address.0, output.len()) {
+            // The infinitely fast DSP already consumed everything.
+            output.fill(0);
+            return Ok(());
+        }
         if DeviceSpace::contains(address.0, output.len()) {
             self.devices.read(address.0, output);
             return Ok(());
@@ -180,6 +245,10 @@ impl GuestMemory for MmioView<'_> {
     }
 
     fn write(&self, address: GuestVa, input: &[u8]) -> Result<(), MemoryError> {
+        if self.devices.in_mailbox(address.0, input.len()) {
+            // Commands are consumed the instant they are written.
+            return Ok(());
+        }
         if DeviceSpace::contains(address.0, input.len()) {
             self.devices.write(address.0, input);
             return Ok(());

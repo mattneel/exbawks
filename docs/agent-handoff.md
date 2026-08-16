@@ -154,23 +154,28 @@ Two active threads:
    hold (parallel 64 MiB partitions hit transient
    `HV_STATUS_INSUFFICIENT_MEMORY`, HRESULT `0xC0370008`).
 
-   **Current DC3 wall (WHP tier): DirectSoundCreate fails under the stub.**
-   DC3 initializes DSOUND far enough to load `D:\DATA\dsstdfx.bin` (the DSP
-   effects image; reads + seeks all succeed), then faults at `0x206A74`
-   dereferencing a NULL DirectSound singleton: the caller at `0x208EC1`
-   passes global `[0x22C2F0]`, which only `DirectSoundCreate` stores — the
-   create failed somewhere in its DSP setup (the error path at `0x206A66`
-   returns `0x80004005`; `[0x22BC6C]` is DSOUND's sticky error flag) and DC3
-   never checks the HRESULT, so real hardware never sees this path. **Next:
-   make DirectSoundCreate succeed** — likely a closer APU GP model: suspect
-   the dsstdfx image download into DSP scratch memory verifies by readback
-   through a different register window than it wrote (the latch keys by
-   exact address, so aliased views read zero). Diagnose with
-   `RUST_LOG=exbawks_core::mmio=trace` and diff write addresses against
-   read-back addresses right before the failure; xemu's `hw/xbox/mcpx/`
-   names the register blocks. After audio, the GPU frontier (graphics HLE
-   feeds the screenshot goal). The interpreter tier remains the
-   deterministic oracle (its frontier: `movss` at `0x1685A0`).
+   **The audio-path burndown so far** (each found with the cancel-pump
+   sampling profiler — `RUST_LOG=exbawks_core::emulator=trace`, tally
+   `cancel sample` RIPs; strip ANSI before grepping for `rip=`):
+   `DirectSoundCreate` needed the AC'97 `GLOB_STA` ready bits (`0xFEC00130`
+   override) — its failure left a NULL singleton the image dereferences
+   unchecked; the AC'97 channel-control registers (`0xFEC001n0+0xB`, SPDIF
+   at `+0x70`) are self-clearing, so their reads bypass the latch; and the
+   GP-DSP command FIFO needed instant-consumer mailboxes — the guest
+   programs comm-region physical bases into `0xFE820808` (twice: two
+   regions), and the engine unmaps each region's mailbox page
+   (`base|0x8000_0000 + 0x1000`) so writes are consumed on landing.
+   Interrupt plumbing landed alongside: `HalGetInterruptVector`,
+   `KeInitializeInterrupt` (28 stack bytes — 24 corrupted the caller's
+   stack into a wild jump), `KeConnectInterrupt` returning TRUE.
+
+   **Current DC3 wall (WHP tier): the next DSOUND null deref** — fault at
+   `0x20EEB3`, address `0x33C` (a null object + 0x33C). Same shape as
+   before: some DSOUND sub-object creation failed quietly under the stub;
+   sample, decode, find which hardware answer it needed. After audio, the
+   GPU frontier (graphics HLE feeds the screenshot goal). The interpreter
+   tier remains the deterministic oracle (its frontier: `movss` at
+   `0x1685A0`).
 
 2. **Kernel HLE burndown** (substrate-independent, needed under either
    engine). Done this session, in order the retail image demanded them:

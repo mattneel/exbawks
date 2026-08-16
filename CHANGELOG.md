@@ -260,6 +260,20 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- The audio-path burndown over the M2 device model, each piece demanded by
+  the retail image's DirectSound init in order: ready-bit overrides for the
+  APU GP-DSP status and the AC'97 `GLOB_STA` codec-ready bits (a zero read
+  spins or fails `DirectSoundCreate`, whose HRESULT the image never checks);
+  self-clearing AC'97 channel-control registers (latching a reset bit spun
+  forever — real hardware clears it instantly); and instant-consumer DSP
+  command mailboxes — when the guest programs a GP comm region's physical
+  base, the engine unmaps that region's mailbox page from the partition and
+  consumes writes the moment they land, breaking the "wait for the DSP to
+  drain the FIFO" spin. The cancel pump now doubles as a sampling profiler
+  (trace-level RIP/RBX per cancellation), which is how each native spin was
+  located. New exports: `HalGetInterruptVector`, `KeInitializeInterrupt`,
+  `KeConnectInterrupt` (connected, never fired — devices are HLE), and
+  `MmLockUnlockBufferPages` (benign; HLE pages never move).
 - WHP-M2: device MMIO dispatch. Hardware register blocks
   (`0xFD00_0000..0xFF00_0000`: NV2A GPU, MCPX APU, AC'97) stay unmapped in
   the partition; a guest access exits and the engine executes exactly one
