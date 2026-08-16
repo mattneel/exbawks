@@ -12,7 +12,9 @@ mod threads;
 mod thunk;
 
 pub use config::EmulatorConfig;
-pub use emulator::{Emulator, EmulatorBuilder, EntryBlockPlan, GateAssist};
+pub use emulator::{
+    CaptureError, CapturedFrame, Emulator, EmulatorBuilder, EntryBlockPlan, GateAssist,
+};
 pub use error::CoreError;
 pub use loaded::LoadedImage;
 pub use report::{BootPlanReport, TranslationActionReport};

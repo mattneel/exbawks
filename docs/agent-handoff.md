@@ -230,20 +230,41 @@ Two active threads:
    now loads its title-screen assets**: `us_font.xtx`, `BG.itk`,
    `pack_00.itk`.
 
-   **Current DC3 wall (WHP tier): the D3D device is created then
-   RELEASED.** Game code calls a D3D API through the device global
-   `[0x1E14B8]`, which is NULL because the device's destructor ran
-   (`0x1C1150`: refcount at `[device+0x934]` hit zero → `rep stosd` clears
-   the object and NULLs the global). Something released the device —
-   either cleanup after a failed step the game ignored, or a
-   release/recreate pair whose recreate failed. Next: find the Release
-   caller (breakpoint-equivalent: log RIPs that reach `0x1C1130` via the
-   cancel sampler, or trace `call 0x1CD9B0` sites), and check whether
-   `Direct3D_CreateDevice`'s second run fails on a stub answer. After the
-   device survives, D3D draws into the pushbuffer for real and the
-   `GraphicsFrontend`/framebuffer/screenshot path opens.
+   **The device wall fell, and the retail title now renders.** The cause was
+   one wrong answer: `AvSendTVEncoderOption`'s capability query (option 6)
+   returned `1`. Direct3D keys a 185-entry display-mode table on that word
+   (video standard in bits 8..15, AV pack class in bits 0..7, and a
+   capability bit each SDTV entry carries), found no matching mode, returned
+   `E_FAIL`, and `Direct3D_CreateDevice` tore its own device down — the game
+   then used the NULL global. Answering `AV_STANDARD_NTSC_M`
+   (`0x0040_0100`) fixed it. Technique worth reusing: `EXBAWKS_GATE_FRAME=<ordinals>`
+   dumps a kernel call's registers and stack frame, which is how the failing
+   `E_FAIL` was read off the destructor's frame beside `Direct3D_CreateDevice`'s
+   return address.
 
-   The interpreter tier remains the deterministic oracle (frontier: `movss`
+   After it, in wall order: `KeWaitForSingleObject`/`KeSetEvent` over guest
+   dispatcher objects, a scheduler rule that releases parked waits instead
+   of reporting a guest exit when the last ready thread ends, mutants,
+   `NtResumeThread`/`NtSuspendThread`, `NtWaitForMultipleObjectsEx`, and a
+   **real GDT** (BINK's CPUID probe ends in `pop es`, which `#GP`s against
+   an empty descriptor table; the table now carries null/code/data plus an
+   `fs` entry holding the running thread's KPCR base).
+
+   **Where DC3 is now:** it creates its Direct3D device, sets its display
+   mode repeatedly (640x480, pitch 2560, `D3DFMT_LIN_A8R8G8B8`), loads the
+   title-screen assets (`title/mdl/title.xom`, `tex_title1.xtx`,
+   `title.eff`, `title_voice.xsp`), enters its main loop (mode word
+   `[0x3D6E14] = 1`), and drives tens of millions of pushbuffer methods with
+   thousands of semaphore releases while the audio mixer runs.
+
+   **`exbawks run --screenshot <file.png>` captures the scanned-out frame**
+   through the cached window. It is black today, and truthfully so: the
+   pusher walks methods but nothing rasterizes. That is the next frontier —
+   decode the method stream into `GraphicsCommand`s and draw. The current
+   stop is a null dereference at `0x1CE0FC` inside Direct3D, reached after
+   millions of exits; expect it to be another readback the device model owes.
+
+      The interpreter tier remains the deterministic oracle (frontier: `movss`
    at `0x1685A0`).
 
 2. **Kernel HLE burndown** (substrate-independent, needed under either

@@ -78,6 +78,49 @@ const GUEST_STACK_BYTES: u32 = 64 * 1024;
 /// The scratch bytes kept above the initial stack pointer.
 const GUEST_STACK_SCRATCH: u32 = 16;
 
+/// The base of the cached physical window (ADR 0010): guest physical
+/// address `pa` is readable at `0x8000_0000 | pa`.
+const KERNEL_WINDOW_BASE: u32 = 0x8000_0000;
+
+/// One captured frame's pixels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedFrame {
+    /// The frame width in pixels.
+    pub width: u32,
+    /// The frame height in pixels.
+    pub height: u32,
+    /// Row-major 8-bit RGBA pixels, `width * height * 4` bytes.
+    pub pixels: Vec<u8>,
+    /// The physical address the frame was scanned out of.
+    pub frame_buffer: u32,
+}
+
+/// Why a frame capture found no image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CaptureError {
+    /// The title never programmed the video encoder.
+    #[error("the title has not set a display mode")]
+    NoDisplayMode,
+    /// The surface format is not one this capture decodes.
+    #[error("the display format {format:#x} is not a linear 32-bit surface")]
+    UnsupportedFormat {
+        /// The Xbox surface format code the title programmed.
+        format: u32,
+    },
+    /// The scanline stride is zero or not a whole number of pixels.
+    #[error("the display pitch {pitch} is not a whole number of 32-bit pixels")]
+    UnsupportedPitch {
+        /// The programmed stride in bytes.
+        pitch: u32,
+    },
+    /// The frame buffer is not readable guest memory.
+    #[error("the frame buffer at {address} is not readable")]
+    Unreadable {
+        /// The first unreadable scanline address.
+        address: GuestVa,
+    },
+}
+
 /// The guest address of the global descriptor table.
 ///
 /// It sits on the second physical page, inside the low range the loader
@@ -885,6 +928,52 @@ impl Emulator {
     }
 
     /// Decodes and plans the current entry block.
+    /// Captures the scanned-out frame as 8-bit RGBA pixels.
+    ///
+    /// The title programs the encoder with a **physical** frame-buffer
+    /// address, which the cached physical window (ADR 0010) makes readable
+    /// at `0x8000_0000 | address`. Only the linear 32-bit surface formats
+    /// the SDTV modes use are decoded; anything else reports its format so
+    /// the caller can say why no image came back.
+    pub fn capture_frame(&self) -> Result<CapturedFrame, CaptureError> {
+        /// `D3DFMT_LIN_A8R8G8B8`, the format every SDTV mode scans out.
+        const LINEAR_A8R8G8B8: u32 = 0x12;
+        /// `D3DFMT_LIN_X8R8G8B8`: the same bytes with the alpha ignored.
+        const LINEAR_X8R8G8B8: u32 = 0x1E;
+        /// The scanline count of the SDTV modes (480i/480p).
+        const SDTV_HEIGHT: u32 = 480;
+
+        let mode = self
+            .threads
+            .as_ref()
+            .and_then(ThreadManager::display_mode)
+            .ok_or(CaptureError::NoDisplayMode)?;
+        if mode.format != LINEAR_A8R8G8B8 && mode.format != LINEAR_X8R8G8B8 {
+            return Err(CaptureError::UnsupportedFormat { format: mode.format });
+        }
+        if mode.pitch == 0 || mode.pitch % 4 != 0 {
+            return Err(CaptureError::UnsupportedPitch { pitch: mode.pitch });
+        }
+
+        let width = mode.pitch / 4;
+        let height = SDTV_HEIGHT;
+        let base = KERNEL_WINDOW_BASE | mode.frame_buffer;
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        let mut scanline = vec![0_u8; mode.pitch as usize];
+        for row in 0..height {
+            let at = GuestVa(base.wrapping_add(row * mode.pitch));
+            self.memory
+                .read(at, &mut scanline)
+                .map_err(|_| CaptureError::Unreadable { address: at })?;
+            // The surface stores each pixel as little-endian ARGB, so the
+            // bytes arrive blue, green, red, alpha.
+            for pixel in scanline.chunks_exact(4) {
+                pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 0xFF]);
+            }
+        }
+        Ok(CapturedFrame { width, height, pixels, frame_buffer: mode.frame_buffer })
+    }
+
     pub fn plan_entry_block(&self) -> Result<EntryBlockPlan, CoreError> {
         let image = self.loaded.clone().ok_or(CoreError::NoImageLoaded)?;
         let (decoded, compiled) = self.compiled_block_at(GuestVa(self.cpu.eip))?;

@@ -260,6 +260,25 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- Frame capture: `exbawks run --screenshot <file.png>` writes the frame the
+  title programmed on the video encoder. `AvSetDisplayMode` now records the
+  mode through a kernel service, `Emulator::capture_frame` reads the linear
+  32-bit surface through the cached physical window (ADR 0010), and
+  `exbawks-debug` encodes it with a dependency-free PNG writer (deflate
+  stored blocks, deterministic byte-for-byte so goldens are stable).
+- `exbawks run --peek <addresses>` prints guest dwords after a stop, which is
+  how a title's own state machine gets read without a debugger.
+- Dispatcher-object waits (`KeWaitForSingleObject`, `KeSetEvent`), mutants
+  (`NtCreateMutant`, `NtReleaseMutant`, with recursive ownership and a
+  contended wait that parks), thread control (`NtResumeThread`,
+  `NtSuspendThread`), and `NtWaitForMultipleObjectsEx`.
+- A real global descriptor table for the guest. The boot state loads segment
+  registers with cached descriptors, which executes fine until guest code
+  performs an actual segment load — BINK's CPUID probe ends with `pop es`,
+  which raised `#GP` against the empty table. The table now lives on a
+  reserved low page with null, code, data, and `fs` entries, the last
+  carrying the running thread's KPCR base so a reload keeps it.
+
 - GPU-M0: the NV2A pushbuffer engine (`exbawks-gpu::PushbufferEngine`).
   When the guest advances a channel's `DMA_PUT`, the engine replays the
   hardware DMA pusher over guest RAM: method headers (increasing and
@@ -414,6 +433,21 @@ The project follows Keep a Changelog structure before its first release.
   (ADR 0013) exists for.
 
 ### Fixed
+
+- **Direct3D device creation on the retail image.** `AvSendTVEncoderOption`'s
+  capability query (option 6) answered `1`, a value naming no video standard.
+  Direct3D uses that word to pick a display-mode group — video standard in
+  bits 8..15, AV pack class in bits 0..7, and a capability bit every SDTV
+  mode entry carries — so its mode search matched nothing and returned
+  `E_FAIL`; `Direct3D_CreateDevice` then ran its own teardown, leaving the
+  device global NULL while the title used it anyway. The query now answers
+  `AV_STANDARD_NTSC_M` (`0x0040_0100`). The retail title now creates its
+  device, sets its display mode, and drives millions of pushbuffer methods.
+- The scheduler reported a guest exit when the last *ready* thread ended
+  while others were parked on objects nothing could signal. Those waits are
+  satisfied in fact — the emulated devices raise no interrupts and complete
+  their work synchronously — so they are released and the run continues.
+
 
 - `NtQueryVolumeInformationFile` size queries now report FATX hard-disk
   geometry (512-byte sectors, 32 sectors per unit — 16 KiB clusters) instead

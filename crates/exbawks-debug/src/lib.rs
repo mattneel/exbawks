@@ -5,6 +5,7 @@ mod breakpoint;
 mod coverage;
 mod diagnose;
 mod json_trace;
+mod png;
 mod source_map;
 mod trace;
 
@@ -14,5 +15,6 @@ pub use coverage::{
 };
 pub use diagnose::render_site;
 pub use json_trace::{JsonLinesTrace, TraceRecord};
+pub use png::encode_rgba;
 pub use source_map::{BlockSourceMap, FaultSite, SourceMapError, SourceRange};
 pub use trace::{NoopTrace, TraceEvent, TraceEventKind, TraceSink, VecTrace};

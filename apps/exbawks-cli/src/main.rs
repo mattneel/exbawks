@@ -101,6 +101,12 @@ enum Command {
         /// The execution engine.
         #[arg(long, value_enum, default_value_t = EngineArg::Interpreter)]
         engine: EngineArg,
+        /// Prints these guest addresses' dword values after the stop.
+        #[arg(long, value_parser = parse_u32, value_delimiter = ',')]
+        peek: Vec<u32>,
+        /// Writes the scanned-out frame to this PNG file after the stop.
+        #[arg(long)]
+        screenshot: Option<PathBuf>,
     },
     /// Reports the implementation burndown across emulator surfaces.
     Coverage {
@@ -217,13 +223,26 @@ fn main() -> Result<()> {
             trace_filter,
             max_blocks,
             engine,
+            peek,
+            screenshot,
         } => {
             let tracing = TraceOptions {
                 path: trace.as_deref(),
                 host_paths: trace_host_paths,
                 filter: &trace_filter,
             };
-            run(&path, ram_mib, &tracing, max_blocks, engine, cli.json)
+            run(
+                &path,
+                &tracing,
+                &RunOptions {
+                    ram_mib,
+                    max_blocks,
+                    engine,
+                    peek: &peek,
+                    screenshot: screenshot.as_deref(),
+                    json: cli.json,
+                },
+            )
         }
         Command::Coverage { surface, xbe, missing } => {
             coverage(surface.map(Into::into), xbe.as_deref(), missing, cli.json)
@@ -514,14 +533,24 @@ struct TraceOptions<'a> {
     filter: &'a [TraceFilterArg],
 }
 
-fn run(
-    path: &Path,
+/// One `run` invocation's options beyond the image itself.
+struct RunOptions<'a> {
+    /// The emulated physical RAM size in MiB.
     ram_mib: usize,
-    tracing: &TraceOptions<'_>,
+    /// The maximum executed block count.
     max_blocks: usize,
+    /// The execution engine.
     engine: EngineArg,
+    /// Guest addresses whose dwords print after the stop.
+    peek: &'a [u32],
+    /// Where the captured frame is written, when asked for.
+    screenshot: Option<&'a Path>,
+    /// Whether the report prints as JSON.
     json: bool,
-) -> Result<()> {
+}
+
+fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Result<()> {
+    let RunOptions { ram_mib, max_blocks, engine, peek, screenshot, json } = *options;
     let bytes = read_file(path)?;
     let config = EmulatorConfig {
         physical_memory_bytes: mib_to_bytes(ram_mib)?,
@@ -603,6 +632,34 @@ fn run(
     println!("Final EBP:    0x{:08X}", gpr[5]);
     println!("Final ESI:    0x{:08X}", gpr[6]);
     println!("Final EDI:    0x{:08X}", gpr[7]);
+
+    if let Some(path) = screenshot {
+        match emulator.capture_frame() {
+            Ok(frame) => {
+                let png = exbawks_debug::encode_rgba(frame.width, frame.height, &frame.pixels);
+                fs::write(path, &png)
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+                println!(
+                    "Screenshot:   {}x{} from {} -> {}",
+                    frame.width,
+                    frame.height,
+                    GuestVa(frame.frame_buffer),
+                    path.display()
+                );
+            }
+            Err(error) => eprintln!("warning: no frame captured: {error}"),
+        }
+    }
+
+    if !peek.is_empty() {
+        use exbawks_memory::GuestMemory;
+        for &address in peek {
+            match emulator.memory().read_u32(GuestVa(address)) {
+                Ok(value) => println!("Peek [{}]: 0x{value:08X}", GuestVa(address)),
+                Err(_) => println!("Peek [{}]: <unmapped>", GuestVa(address)),
+            }
+        }
+    }
 
     if let Some(diagnosis) = diagnose_stop(&emulator, &stop) {
         println!("\n{diagnosis}");
