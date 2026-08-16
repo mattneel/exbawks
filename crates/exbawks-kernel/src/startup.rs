@@ -31,6 +31,12 @@ pub mod ordinal {
     pub const PS_CREATE_SYSTEM_THREAD_EX: u16 = 255;
     /// `PsTerminateSystemThread`.
     pub const PS_TERMINATE_SYSTEM_THREAD: u16 = 258;
+    /// `RtlEnterCriticalSection`.
+    pub const RTL_ENTER_CRITICAL_SECTION: u16 = 277;
+    /// `RtlInitializeCriticalSection`.
+    pub const RTL_INITIALIZE_CRITICAL_SECTION: u16 = 291;
+    /// `RtlLeaveCriticalSection`.
+    pub const RTL_LEAVE_CRITICAL_SECTION: u16 = 294;
 }
 
 /// The startup stubs for virtual memory, events, timers, and files.
@@ -51,6 +57,7 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     registry.register(PsCreateSystemThreadEx)?;
     registry.register(PsTerminateSystemThread)?;
     registry.register(NtClose)?;
+    crate::rtl::register_rtl_exports(registry)?;
     for (ordinal, name) in STARTUP_STUBS {
         registry.register(StubExport::new(ordinal, name))?;
     }
@@ -241,7 +248,7 @@ impl KernelExport for NtClose {
 }
 
 /// Reads one 32-bit stack argument above the return-address slot.
-fn stack_argument(context: &KernelCallContext<'_>, index: u32) -> Option<u32> {
+pub(crate) fn stack_argument(context: &KernelCallContext<'_>, index: u32) -> Option<u32> {
     let esp = context.cpu.gpr[4];
     let address = esp.checked_add(4)?.checked_add(index.checked_mul(4)?)?;
     context.memory.read_u32(GuestVa(address)).ok()
@@ -289,7 +296,9 @@ mod tests {
         let registry = KernelRegistry::new();
         register_startup_exports(&registry).expect("registration succeeds");
 
-        assert_eq!(registry.len(), 12);
+        // Five thread/handle exports, three Rtl critical-section exports, and
+        // the seven remaining startup stubs.
+        assert_eq!(registry.len(), 15);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,

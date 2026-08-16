@@ -80,6 +80,11 @@ The project follows Keep a Changelog structure before its first release.
   thread handle instead of halting; the retail image advances past handle
   cleanup (first slice of `HLE-005`; the namespace, symbolic links, and Ob*
   exports follow).
+- The Rtl critical-section family (`RtlInitializeCriticalSection`,
+  `RtlEnterCriticalSection`, `RtlLeaveCriticalSection`) maintains the guest
+  `RTL_CRITICAL_SECTION` lock and recursion counts without blocking, which is
+  correct under the cooperative single-thread scheduler; the retail image
+  advances past its heap-init critical section (first slice of `HLE-007`).
 - Implementation-burndown diagnostics: `exbawks coverage` reports
   implemented/stub/missing counts across the CPU, kernel, and GPU surfaces
   (with `--xbe` to scope the kernel surface to one image's imports), and a

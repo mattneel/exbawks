@@ -7,6 +7,7 @@ mod export;
 mod gate;
 mod ordinals;
 mod registry;
+mod rtl;
 mod services;
 mod startup;
 mod status;
@@ -19,6 +20,7 @@ pub use ordinals::{
     CallingConvention, ExportKind, KERNEL_ORDINALS, KernelOrdinalInfo, kernel_ordinal_info,
 };
 pub use registry::KernelRegistry;
+pub use rtl::{RtlEnterCriticalSection, RtlInitializeCriticalSection, RtlLeaveCriticalSection};
 pub use services::{
     KernelServiceError, KernelServices, ThreadCreateRequest, ThreadCreated, UnsupportedServices,
 };
