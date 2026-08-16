@@ -56,6 +56,10 @@ The project follows Keep a Changelog structure before its first release.
   executes memory-operand and integer-ALU instructions at 8, 16, and 32-bit
   widths over checked guest memory with architectural flag semantics and
   typed faults (`CPU-001`).
+- Interpreter control flow and stack traffic: near jumps, conditional
+  branches, call/ret with argument cleanup, push/pop in both widths,
+  PUSHAD/POPAD as single accesses, PUSHFD/POPFD with a writable ID flag for
+  CPUID probes, LEAVE, and the LOOP/JECXZ family (`CPU-002`).
 
 ### Fixed
 

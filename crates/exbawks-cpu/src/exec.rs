@@ -2,9 +2,10 @@
 //! guest memory.
 //!
 //! `step` fetches, decodes, and executes exactly one instruction at the guest
-//! EIP. This stage covers memory operands and the integer ALU across 8, 16,
-//! and 32-bit widths; control flow, string operations, and floating point
-//! arrive in later stages and report `ExecError::Unsupported`.
+//! EIP. This stage covers memory operands, the integer ALU across 8, 16, and
+//! 32-bit widths, near control flow, and stack traffic; string operations
+//! and floating point arrive in later stages and report
+//! `ExecError::Unsupported`.
 //!
 //! Flags follow the architectural definitions. Where hardware leaves a flag
 //! undefined (auxiliary carry after shifts, sign/zero after `mul`, every flag
@@ -103,6 +104,15 @@ enum Operand {
     Immediate(u32),
 }
 
+/// How one executed instruction affects the instruction pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    /// Execution continues at the next sequential instruction.
+    Next,
+    /// The instruction wrote the guest EIP itself.
+    Jumped,
+}
+
 /// Executes one instruction at the guest EIP and advances it.
 ///
 /// State mutation is ordered so every fallible guest memory access happens
@@ -111,8 +121,9 @@ enum Operand {
 pub fn step(state: &mut CpuState, memory: &dyn GuestMemory) -> Result<(), ExecError> {
     let address = GuestVa(state.eip);
     let instruction = decode_at(state.eip, memory, address)?;
-    execute(state, memory, &instruction, address)?;
-    state.eip = state.eip.wrapping_add(instruction.len() as u32);
+    if execute(state, memory, &instruction, address)? == Flow::Next {
+        state.eip = state.eip.wrapping_add(instruction.len() as u32);
+    }
     Ok(())
 }
 
@@ -149,6 +160,158 @@ fn decode_at(
 }
 
 fn execute(
+    state: &mut CpuState,
+    memory: &dyn GuestMemory,
+    instruction: &Instruction,
+    address: GuestVa,
+) -> Result<Flow, ExecError> {
+    if let Some(flow) = branch(state, memory, instruction, address)? {
+        return Ok(flow);
+    }
+    execute_straightline(state, memory, instruction, address)?;
+    Ok(Flow::Next)
+}
+
+/// Executes the EIP-writing instruction families; returns `None` for every
+/// other mnemonic.
+fn branch(
+    state: &mut CpuState,
+    memory: &dyn GuestMemory,
+    instruction: &Instruction,
+    address: GuestVa,
+) -> Result<Option<Flow>, ExecError> {
+    let fallthrough = address.0.wrapping_add(instruction.len() as u32);
+    match instruction.mnemonic() {
+        Mnemonic::Jmp => {
+            let target = branch_target(state, memory, instruction, address)?;
+            state.eip = target;
+            Ok(Some(Flow::Jumped))
+        }
+        Mnemonic::Call => {
+            let target = branch_target(state, memory, instruction, address)?;
+            push_value(state, memory, Width::D, fallthrough)?;
+            state.eip = target;
+            Ok(Some(Flow::Jumped))
+        }
+        Mnemonic::Ret => {
+            // Only the 32-bit near returns; `66 C3` pops 2 bytes on hardware.
+            if !matches!(instruction.code(), Code::Retnd | Code::Retnd_imm16) {
+                return Err(ExecError::Unsupported { address });
+            }
+            let target = pop_value(state, memory, Width::D)?;
+            if instruction.code() == Code::Retnd_imm16 {
+                state.gpr[4] = state.gpr[4].wrapping_add(u32::from(instruction.immediate16()));
+            }
+            state.eip = target;
+            Ok(Some(Flow::Jumped))
+        }
+        Mnemonic::Loop | Mnemonic::Loope | Mnemonic::Loopne => {
+            // Only the ECX-counted 32-bit forms exist in XDK code.
+            if !matches!(
+                instruction.code(),
+                Code::Loop_rel8_32_ECX | Code::Loope_rel8_32_ECX | Code::Loopne_rel8_32_ECX
+            ) {
+                return Err(ExecError::Unsupported { address });
+            }
+            let counter = state.gpr[1].wrapping_sub(1);
+            state.gpr[1] = counter;
+            let zero = state.eflags & flags::ZERO != 0;
+            let taken = counter != 0
+                && match instruction.mnemonic() {
+                    Mnemonic::Loope => zero,
+                    Mnemonic::Loopne => !zero,
+                    _ => true,
+                };
+            Ok(Some(jump_if(state, instruction, taken)))
+        }
+        Mnemonic::Jecxz => {
+            if instruction.code() != Code::Jecxz_rel8_32 {
+                return Err(ExecError::Unsupported { address });
+            }
+            let taken = state.gpr[1] == 0;
+            Ok(Some(jump_if(state, instruction, taken)))
+        }
+        mnemonic => {
+            // Jcc: a condition code with a near-branch operand.
+            if instruction.condition_code() != ConditionCode::None
+                && mnemonic_class(mnemonic).is_none()
+            {
+                if instruction.op_kind(0) != OpKind::NearBranch32 {
+                    return Err(ExecError::Unsupported { address });
+                }
+                let taken = condition_met(state.eflags, instruction.condition_code());
+                return Ok(Some(jump_if(state, instruction, taken)));
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn jump_if(state: &mut CpuState, instruction: &Instruction, taken: bool) -> Flow {
+    if taken {
+        state.eip = instruction.near_branch32();
+        Flow::Jumped
+    } else {
+        Flow::Next
+    }
+}
+
+/// Resolves a near jump or call target: relative, register, or memory.
+fn branch_target(
+    state: &CpuState,
+    memory: &dyn GuestMemory,
+    instruction: &Instruction,
+    address: GuestVa,
+) -> Result<u32, ExecError> {
+    match instruction.op_kind(0) {
+        OpKind::NearBranch32 => Ok(instruction.near_branch32()),
+        OpKind::Register => {
+            read_register(state, instruction.op_register(0), address).and_then(|value| {
+                if instruction.op_register(0).size() == 4 {
+                    Ok(value)
+                } else {
+                    Err(ExecError::Unsupported { address })
+                }
+            })
+        }
+        OpKind::Memory => {
+            // Far-pointer operands (m16:16 is also 4 bytes) must not pass as
+            // near indirect targets, so the exact near codes are required.
+            if !matches!(instruction.code(), Code::Jmp_rm32 | Code::Call_rm32) {
+                return Err(ExecError::Unsupported { address });
+            }
+            let location = effective_address(state, instruction, address, true)?;
+            Ok(read_memory(memory, location, Width::D)?)
+        }
+        _ => Err(ExecError::Unsupported { address }),
+    }
+}
+
+/// Pushes one value; the stack write commits before ESP moves.
+fn push_value(
+    state: &mut CpuState,
+    memory: &dyn GuestMemory,
+    width: Width,
+    value: u32,
+) -> Result<(), ExecError> {
+    let new_esp = state.gpr[4].wrapping_sub(width.bytes() as u32);
+    write_memory(memory, GuestVa(new_esp), width, value)?;
+    state.gpr[4] = new_esp;
+    Ok(())
+}
+
+/// Pops one value; the stack read commits before ESP moves.
+fn pop_value(
+    state: &mut CpuState,
+    memory: &dyn GuestMemory,
+    width: Width,
+) -> Result<u32, ExecError> {
+    let value = read_memory(memory, GuestVa(state.gpr[4]), width)?;
+    state.gpr[4] = state.gpr[4].wrapping_add(width.bytes() as u32);
+    Ok(value)
+}
+
+fn execute_straightline(
     state: &mut CpuState,
     memory: &dyn GuestMemory,
     instruction: &Instruction,
@@ -243,6 +406,107 @@ fn execute(
         Mnemonic::Sahf => {
             let ah = (state.gpr[0] >> 8) & 0xFF;
             state.eflags = (state.eflags & !0xD5) | (ah & 0xD5) | 0x02;
+            Ok(())
+        }
+        Mnemonic::Push => {
+            let (width, value) = match instruction.op_kind(0) {
+                OpKind::Immediate8to32 => (Width::D, instruction.immediate8to32() as u32),
+                OpKind::Immediate32 => (Width::D, instruction.immediate32()),
+                OpKind::Immediate8to16 => {
+                    (Width::W, u32::from(instruction.immediate8to16() as u16))
+                }
+                OpKind::Immediate16 => (Width::W, u32::from(instruction.immediate16())),
+                _ => {
+                    let width = operand_width(instruction, 0, address)?;
+                    let source = operand(state, instruction, 0, address)?;
+                    // `push esp` reads the value before the decrement.
+                    (width, read_operand(state, memory, source, width)?)
+                }
+            };
+            push_value(state, memory, width, value)
+        }
+        Mnemonic::Pop => {
+            let width = operand_width(instruction, 0, address)?;
+            let value = read_memory(memory, GuestVa(state.gpr[4]), width)?;
+            let old_esp = state.gpr[4];
+            // The increment commits before the destination resolves, so an
+            // ESP-relative memory destination sees the new stack pointer;
+            // `pop esp` then overwrites the increment with the loaded value.
+            state.gpr[4] = old_esp.wrapping_add(width.bytes() as u32);
+            let dst = operand(state, instruction, 0, address)
+                .and_then(|dst| write_operand(state, memory, dst, width, value));
+            if let Err(error) = dst {
+                state.gpr[4] = old_esp;
+                return Err(error);
+            }
+            Ok(())
+        }
+        Mnemonic::Pushad => {
+            let esp = state.gpr[4];
+            let mut frame = [0_u8; 32];
+            for (slot, value) in frame.chunks_exact_mut(4).zip(
+                [
+                    state.gpr[7],
+                    state.gpr[6],
+                    state.gpr[5],
+                    esp,
+                    state.gpr[3],
+                    state.gpr[2],
+                    state.gpr[1],
+                    state.gpr[0],
+                ]
+                .iter(),
+            ) {
+                slot.copy_from_slice(&value.to_le_bytes());
+            }
+            // One 32-byte write keeps the eight pushes all-or-nothing.
+            let base = esp.wrapping_sub(32);
+            memory.write(GuestVa(base), &frame)?;
+            state.gpr[4] = base;
+            Ok(())
+        }
+        Mnemonic::Popad => {
+            let mut frame = [0_u8; 32];
+            memory.read(GuestVa(state.gpr[4]), &mut frame)?;
+            let value = |slot: usize| {
+                u32::from_le_bytes([
+                    frame[slot * 4],
+                    frame[slot * 4 + 1],
+                    frame[slot * 4 + 2],
+                    frame[slot * 4 + 3],
+                ])
+            };
+            state.gpr[7] = value(0);
+            state.gpr[6] = value(1);
+            state.gpr[5] = value(2);
+            // The stored ESP image is discarded.
+            state.gpr[3] = value(4);
+            state.gpr[2] = value(5);
+            state.gpr[1] = value(6);
+            state.gpr[0] = value(7);
+            state.gpr[4] = state.gpr[4].wrapping_add(32);
+            Ok(())
+        }
+        Mnemonic::Pushfd => push_value(state, memory, Width::D, state.eflags),
+        Mnemonic::Popfd => {
+            const WRITABLE: u32 = flags::ARITHMETIC
+                | flags::DIRECTION
+                | flags::INTERRUPT
+                | flags::ALIGNMENT_CHECK
+                | flags::ID;
+            let value = pop_value(state, memory, Width::D)?;
+            state.eflags = (value & WRITABLE) | (state.eflags & !WRITABLE) | 0x02;
+            Ok(())
+        }
+        Mnemonic::Leave => {
+            // Only the 32-bit form; `66 C9` pops 2 bytes into BP on hardware.
+            if instruction.code() != Code::Leaved {
+                return Err(ExecError::Unsupported { address });
+            }
+            let frame = state.gpr[5];
+            let value = read_memory(memory, GuestVa(frame), Width::D)?;
+            state.gpr[4] = frame.wrapping_add(4);
+            state.gpr[5] = value;
             Ok(())
         }
         _ => {
@@ -1422,7 +1686,8 @@ mod tests {
     }
 
     fn exec(state: &mut CpuState, memory: &SoftwareAddressSpace, bytes: &[u8]) {
-        try_exec(state, memory, bytes).expect("instruction executes");
+        try_exec(state, memory, bytes)
+            .unwrap_or_else(|error| panic!("{bytes:02X?} failed: {error:?}"));
     }
 
     fn arith(state: &CpuState) -> u32 {
@@ -1892,6 +2157,198 @@ mod tests {
             memory.write(GuestVa(CODE), &bytes).expect("code writes");
             let _ = step(&mut state, &memory);
         }
+    }
+
+    fn stackframe(state: &mut CpuState) {
+        state.gpr[4] = DATA + 0x1000; // stack grows down inside the data pages
+    }
+
+    #[test]
+    fn jumps_and_branches_move_the_instruction_pointer() {
+        let (mut state, memory) = machine();
+        exec(&mut state, &memory, &[0xEB, 0x02]); // jmp +2
+        assert_eq!(state.eip, CODE + 4);
+
+        state.eip = CODE;
+        exec(&mut state, &memory, &[0xE9, 0x10, 0x00, 0x00, 0x00]); // jmp rel32 +0x10
+        assert_eq!(state.eip, CODE + 5 + 0x10);
+
+        state.eip = CODE;
+        exec(&mut state, &memory, &[0x31, 0xC0]); // xor eax, eax -> ZF
+        exec(&mut state, &memory, &[0x74, 0x10]); // je +0x10 (taken)
+        assert_eq!(state.eip, CODE + 4 + 0x10);
+
+        state.eip = CODE;
+        exec(&mut state, &memory, &[0x75, 0x10]); // jne +0x10 (not taken)
+        assert_eq!(state.eip, CODE + 2);
+    }
+
+    #[test]
+    fn call_and_ret_round_trip_through_the_stack() {
+        let (mut state, memory) = machine();
+        stackframe(&mut state);
+        let esp = state.gpr[4];
+
+        exec(&mut state, &memory, &[0xE8, 0x2B, 0x00, 0x00, 0x00]); // call +0x2B
+        assert_eq!(state.eip, CODE + 5 + 0x2B);
+        assert_eq!(state.gpr[4], esp - 4);
+        assert_eq!(memory.read_u32(GuestVa(esp - 4)).expect("read"), CODE + 5);
+
+        exec(&mut state, &memory, &[0xC3]); // ret
+        assert_eq!(state.eip, CODE + 5);
+        assert_eq!(state.gpr[4], esp);
+
+        // Indirect call through a register, then ret imm16 argument cleanup.
+        state.eip = CODE;
+        state.gpr[0] = CODE + 0x40;
+        exec(&mut state, &memory, &[0xFF, 0xD0]); // call eax
+        assert_eq!(state.eip, CODE + 0x40);
+        exec(&mut state, &memory, &[0xC2, 0x08, 0x00]); // ret 8
+        assert_eq!(state.eip, CODE + 2);
+        assert_eq!(state.gpr[4], esp + 8);
+
+        // Indirect call through a memory slot.
+        state.gpr[4] = esp;
+        state.eip = CODE;
+        memory.write_u32(GuestVa(DATA + 0x80), CODE + 0x60).expect("data writes");
+        exec(&mut state, &memory, &[0xFF, 0x15, 0x80, 0x00, 0x02, 0x00]); // call [DATA+0x80]
+        assert_eq!(state.eip, CODE + 0x60);
+        assert_eq!(memory.read_u32(GuestVa(esp - 4)).expect("read"), CODE + 6);
+    }
+
+    #[test]
+    fn push_and_pop_follow_stack_pointer_rules() {
+        let (mut state, memory) = machine();
+        stackframe(&mut state);
+        let esp = state.gpr[4];
+
+        state.gpr[0] = 0x1234_5678;
+        exec(&mut state, &memory, &[0x50]); // push eax
+        exec(&mut state, &memory, &[0x59]); // pop ecx
+        assert_eq!(state.gpr[1], 0x1234_5678);
+        assert_eq!(state.gpr[4], esp);
+
+        // `push esp` stores the pre-decrement value.
+        exec(&mut state, &memory, &[0x54]);
+        assert_eq!(memory.read_u32(GuestVa(esp - 4)).expect("read"), esp);
+        // `pop esp` replaces the increment with the loaded value.
+        exec(&mut state, &memory, &[0x5C]);
+        assert_eq!(state.gpr[4], esp);
+
+        exec(&mut state, &memory, &[0x6A, 0xFE]); // push -2 (imm8 sign-extends)
+        assert_eq!(memory.read_u32(GuestVa(esp - 4)).expect("read"), 0xFFFF_FFFE);
+        exec(&mut state, &memory, &[0x66, 0x58]); // pop ax (16-bit)
+        assert_eq!(state.gpr[0] & 0xFFFF, 0xFFFE);
+        assert_eq!(state.gpr[4], esp - 4 + 2);
+    }
+
+    #[test]
+    fn pushad_and_popad_round_trip_and_discard_esp() {
+        let (mut state, memory) = machine();
+        stackframe(&mut state);
+        let esp = state.gpr[4];
+        state.gpr = [1, 2, 3, 4, esp, 5, 6, 7];
+
+        exec(&mut state, &memory, &[0x60]); // pushad
+        assert_eq!(state.gpr[4], esp - 32);
+        state.gpr = [0; 8];
+        state.gpr[4] = esp - 32;
+        exec(&mut state, &memory, &[0x61]); // popad
+        assert_eq!(state.gpr, [1, 2, 3, 4, esp, 5, 6, 7]);
+    }
+
+    /// The classic CPUID-availability probe: toggling the ID flag through
+    /// PUSHFD/POPFD must round-trip on a Pentium III class machine.
+    #[test]
+    fn eflags_id_bit_toggles_through_pushfd_popfd() {
+        let (mut state, memory) = machine();
+        stackframe(&mut state);
+
+        exec(&mut state, &memory, &[0x9C]); // pushfd
+        exec(&mut state, &memory, &[0x58]); // pop eax
+        let original = state.gpr[0];
+        exec(&mut state, &memory, &[0x35, 0x00, 0x00, 0x20, 0x00]); // xor eax, ID
+        exec(&mut state, &memory, &[0x50]); // push eax
+        exec(&mut state, &memory, &[0x9D]); // popfd
+        exec(&mut state, &memory, &[0x9C]); // pushfd
+        exec(&mut state, &memory, &[0x58]); // pop eax
+        assert_eq!(state.gpr[0] ^ original, flags::ID, "the ID flag must be writable");
+    }
+
+    #[test]
+    fn leave_unwinds_one_frame() {
+        let (mut state, memory) = machine();
+        stackframe(&mut state);
+        let frame = state.gpr[4] - 0x20;
+        memory.write_u32(GuestVa(frame), 0xBBBB_0000).expect("data writes");
+        state.gpr[5] = frame;
+        state.gpr[4] = frame - 0x10;
+
+        exec(&mut state, &memory, &[0xC9]); // leave
+        assert_eq!(state.gpr[4], frame + 4);
+        assert_eq!(state.gpr[5], 0xBBBB_0000);
+    }
+
+    #[test]
+    fn loops_count_down_and_jecxz_tests_ecx() {
+        let (mut state, memory) = machine();
+        state.gpr[1] = 2;
+        exec(&mut state, &memory, &[0xE2, 0x10]); // loop +0x10 (taken)
+        assert_eq!(state.gpr[1], 1);
+        assert_eq!(state.eip, CODE + 2 + 0x10);
+
+        state.eip = CODE;
+        exec(&mut state, &memory, &[0xE2, 0x10]); // loop (counter reaches zero)
+        assert_eq!(state.gpr[1], 0);
+        assert_eq!(state.eip, CODE + 2);
+
+        exec(&mut state, &memory, &[0xE3, 0x08]); // jecxz (ecx == 0, taken)
+        assert_eq!(state.eip, CODE + 4 + 8);
+    }
+
+    /// 66-prefixed and far control-flow forms must fail typed instead of
+    /// silently executing with 32-bit semantics.
+    #[test]
+    fn narrow_and_far_control_flow_forms_are_rejected() {
+        let (mut state, memory) = machine();
+        stackframe(&mut state);
+        memory.write_u32(GuestVa(DATA + 0x80), CODE).expect("data writes");
+        let before = state.clone();
+
+        for bytes in [
+            &[0x66, 0xC3][..],                               // retnw
+            &[0x66, 0xC2, 0x08, 0x00][..],                   // retnw imm16
+            &[0x66, 0xC9][..],                               // leavew
+            &[0x66, 0xFF, 0x2D, 0x80, 0x00, 0x02, 0x00][..], // jmp m16:16
+            &[0x66, 0xFF, 0x1D, 0x80, 0x00, 0x02, 0x00][..], // call m16:16
+        ] {
+            let error = try_exec(&mut state, &memory, bytes);
+            assert!(
+                matches!(error, Err(ExecError::Unsupported { .. })),
+                "{bytes:02X?} must be rejected"
+            );
+            assert_eq!(state, before, "{bytes:02X?} must not mutate state");
+        }
+    }
+
+    #[test]
+    fn stack_faults_are_typed_and_atomic() {
+        let (mut state, memory) = machine();
+        state.gpr[4] = UNMAPPED;
+        state.gpr[0] = 7;
+        let before = state.clone();
+
+        let error = try_exec(&mut state, &memory, &[0x50]); // push eax
+        assert!(matches!(error, Err(ExecError::Memory(MemoryError::Unmapped { .. }))));
+        assert_eq!(state, before);
+
+        let error = try_exec(&mut state, &memory, &[0xC3]); // ret
+        assert!(matches!(error, Err(ExecError::Memory(MemoryError::Unmapped { .. }))));
+        assert_eq!(state, before);
+
+        let error = try_exec(&mut state, &memory, &[0xE8, 0x00, 0x00, 0x00, 0x00]); // call
+        assert!(matches!(error, Err(ExecError::Memory(MemoryError::Unmapped { .. }))));
+        assert_eq!(state, before);
     }
 
     #[test]

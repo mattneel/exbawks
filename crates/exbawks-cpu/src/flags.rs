@@ -10,10 +10,16 @@ pub const AUXILIARY: u32 = 1 << 4;
 pub const ZERO: u32 = 1 << 6;
 /// The sign flag.
 pub const SIGN: u32 = 1 << 7;
+/// The interrupt-enable flag.
+pub const INTERRUPT: u32 = 1 << 9;
 /// The direction flag.
 pub const DIRECTION: u32 = 1 << 10;
 /// The overflow flag.
 pub const OVERFLOW: u32 = 1 << 11;
+/// The alignment-check flag.
+pub const ALIGNMENT_CHECK: u32 = 1 << 18;
+/// The CPUID-availability identification flag.
+pub const ID: u32 = 1 << 21;
 
 /// Every guest-visible arithmetic flag.
 pub const ARITHMETIC: u32 = CARRY | PARITY | AUXILIARY | ZERO | SIGN | OVERFLOW;
