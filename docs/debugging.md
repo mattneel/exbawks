@@ -15,11 +15,16 @@ Use `trace` only for focused runs. Instruction traces can become large.
 
 The debug crate defines structured trace events.
 
+`exbawks run --trace <file>` writes one JSON object per line. Kernel-call
+records carry the verified export name when the ordinal table knows it.
+
+Restrict output to selected event kinds with
+`--trace-filter block,kernel,graphics,memory,stop` (comma-separated).
+Filtered files keep monotonic sequence numbers without gaps.
+
 Future JSON Lines output will include these event groups:
 
 - Block decode and compile.
-- Block entry and exit.
-- Kernel HLE calls.
 - MMIO accesses.
 - Code invalidation.
 - Exceptions and stop reasons.

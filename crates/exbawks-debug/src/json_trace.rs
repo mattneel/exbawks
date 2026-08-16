@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::{TraceEvent, TraceSink};
+use crate::{TraceEvent, TraceEventKind, TraceSink};
 
 /// One serialized trace record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +27,7 @@ pub struct JsonLinesTrace<W: Write + Send> {
     writer: Mutex<W>,
     sequence: AtomicU64,
     host_path: Option<String>,
+    filter: Option<Vec<TraceEventKind>>,
     write_errors: AtomicU64,
 }
 
@@ -37,6 +38,7 @@ impl<W: Write + Send> JsonLinesTrace<W> {
             writer: Mutex::new(writer),
             sequence: AtomicU64::new(0),
             host_path: None,
+            filter: None,
             write_errors: AtomicU64::new(0),
         }
     }
@@ -45,6 +47,13 @@ impl<W: Write + Send> JsonLinesTrace<W> {
     #[must_use]
     pub fn with_host_path(mut self, host_path: impl Into<String>) -> Self {
         self.host_path = Some(host_path.into());
+        self
+    }
+
+    /// Restricts records to the listed event kinds.
+    #[must_use]
+    pub fn with_event_filter(mut self, kinds: impl IntoIterator<Item = TraceEventKind>) -> Self {
+        self.filter = Some(kinds.into_iter().collect());
         self
     }
 
@@ -64,6 +73,12 @@ impl<W: Write + Send> JsonLinesTrace<W> {
 
 impl<W: Write + Send> TraceSink for JsonLinesTrace<W> {
     fn record(&self, event: TraceEvent) {
+        if let Some(filter) = &self.filter
+            && !filter.contains(&event.kind())
+        {
+            return;
+        }
+
         let record = TraceRecord {
             sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
             event,
@@ -89,7 +104,11 @@ mod tests {
     fn events() -> [TraceEvent; 3] {
         [
             TraceEvent::BlockEnter { address: GuestVa(0x1000) },
-            TraceEvent::KernelCall { ordinal: 8, caller: GuestVa(0x1008) },
+            TraceEvent::KernelCall {
+                ordinal: 8,
+                name: Some("DbgPrint".to_owned()),
+                caller: GuestVa(0x1008),
+            },
             TraceEvent::Stop { reason: "GuestExit { code: 0 }".to_owned() },
         ]
     }
@@ -111,6 +130,27 @@ mod tests {
                 serde_json::from_str(line).expect("each line parses as one record");
             assert_eq!(record.sequence, index as u64);
             assert_eq!(record.host_path, None);
+        }
+    }
+
+    #[test]
+    fn event_filters_drop_unlisted_kinds_and_keep_sequences_monotonic() {
+        let trace = JsonLinesTrace::new(Vec::new())
+            .with_event_filter([TraceEventKind::KernelCall, TraceEventKind::Stop]);
+        for event in events() {
+            trace.record(event);
+        }
+
+        let text = String::from_utf8(trace.into_inner()).expect("trace output is UTF-8");
+        let records: Vec<TraceRecord> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line parses"))
+            .collect();
+
+        assert_eq!(records.len(), 2);
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(record.sequence, index as u64);
+            assert!(!matches!(record.event, TraceEvent::BlockEnter { .. }));
         }
     }
 

@@ -14,6 +14,9 @@ pub enum TraceEvent {
     KernelCall {
         /// The export ordinal.
         ordinal: u16,
+        /// The verified export name, when the ordinal table knows it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         /// The guest call site.
         caller: GuestVa,
     },
@@ -38,6 +41,35 @@ pub enum TraceEvent {
         /// A stable diagnostic reason.
         reason: String,
     },
+}
+
+/// The kind of one trace event, for filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TraceEventKind {
+    /// Block-entry events.
+    BlockEnter,
+    /// Kernel HLE call events.
+    KernelCall,
+    /// Graphics method events.
+    GraphicsMethod,
+    /// Memory slow-path events.
+    MemorySlowPath,
+    /// Execution stop events.
+    Stop,
+}
+
+impl TraceEvent {
+    /// Returns the kind of this event.
+    #[must_use]
+    pub const fn kind(&self) -> TraceEventKind {
+        match self {
+            Self::BlockEnter { .. } => TraceEventKind::BlockEnter,
+            Self::KernelCall { .. } => TraceEventKind::KernelCall,
+            Self::GraphicsMethod { .. } => TraceEventKind::GraphicsMethod,
+            Self::MemorySlowPath { .. } => TraceEventKind::MemorySlowPath,
+            Self::Stop { .. } => TraceEventKind::Stop,
+        }
+    }
 }
 
 /// A destination for structured trace events.

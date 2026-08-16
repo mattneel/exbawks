@@ -9,4 +9,4 @@ mod trace;
 pub use breakpoint::BreakpointSet;
 pub use json_trace::{JsonLinesTrace, TraceRecord};
 pub use source_map::{BlockSourceMap, FaultSite, SourceMapError, SourceRange};
-pub use trace::{NoopTrace, TraceEvent, TraceSink, VecTrace};
+pub use trace::{NoopTrace, TraceEvent, TraceEventKind, TraceSink, VecTrace};

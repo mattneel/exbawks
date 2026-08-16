@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use exbawks_core::{BootPlanReport, EmulatorBuilder, EmulatorConfig};
 use exbawks_cpu::{BasicBlockDecoder, DecodeConfig, format_instruction};
-use exbawks_debug::JsonLinesTrace;
+use exbawks_debug::{JsonLinesTrace, TraceEventKind};
 use exbawks_platform::{
     HostCapabilities, SystemMemoryInfo, probe_host_capabilities, query_system_memory_info,
 };
@@ -86,6 +86,9 @@ enum Command {
         /// Includes the private XBE host path in trace records.
         #[arg(long, requires = "trace")]
         trace_host_paths: bool,
+        /// Restricts trace records to these event kinds.
+        #[arg(long, requires = "trace", value_enum, value_delimiter = ',')]
+        trace_filter: Vec<TraceFilterArg>,
         /// The maximum executed block count.
         #[arg(long, default_value_t = 1 << 20)]
         max_blocks: usize,
@@ -96,6 +99,27 @@ enum Command {
 enum BackendArg {
     Direct,
     Cranelift,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TraceFilterArg {
+    Block,
+    Kernel,
+    Graphics,
+    Memory,
+    Stop,
+}
+
+impl From<TraceFilterArg> for TraceEventKind {
+    fn from(value: TraceFilterArg) -> Self {
+        match value {
+            TraceFilterArg::Block => Self::BlockEnter,
+            TraceFilterArg::Kernel => Self::KernelCall,
+            TraceFilterArg::Graphics => Self::GraphicsMethod,
+            TraceFilterArg::Memory => Self::MemorySlowPath,
+            TraceFilterArg::Stop => Self::Stop,
+        }
+    }
 }
 
 impl From<BackendArg> for BackendKind {
@@ -139,9 +163,15 @@ fn main() -> Result<()> {
         Command::Thunks { path, limit, check_registry } => {
             thunks(&path, limit, check_registry, cli.json)
         }
-        Command::Run { path, ram_mib, trace, trace_host_paths, max_blocks } => {
-            run(&path, ram_mib, trace.as_deref(), trace_host_paths, max_blocks, cli.json)
-        }
+        Command::Run { path, ram_mib, trace, trace_host_paths, trace_filter, max_blocks } => run(
+            &path,
+            ram_mib,
+            trace.as_deref(),
+            trace_host_paths,
+            &trace_filter,
+            max_blocks,
+            cli.json,
+        ),
     }
 }
 
@@ -418,6 +448,7 @@ fn run(
     ram_mib: usize,
     trace: Option<&Path>,
     trace_host_paths: bool,
+    trace_filter: &[TraceFilterArg],
     max_blocks: usize,
     json: bool,
 ) -> Result<()> {
@@ -433,6 +464,9 @@ fn run(
         let mut sink = JsonLinesTrace::new(std::io::BufWriter::new(file));
         if trace_host_paths {
             sink = sink.with_host_path(path.display().to_string());
+        }
+        if !trace_filter.is_empty() {
+            sink = sink.with_event_filter(trace_filter.iter().copied().map(TraceEventKind::from));
         }
         builder = builder.trace(std::sync::Arc::new(sink));
     }
@@ -456,12 +490,25 @@ fn run(
     }
 
     let gpr = emulator.cpu().gpr;
-    println!("Stop reason:  {stop:?}");
+    println!("Stop reason:  {stop:?}{}", stop_reason_note(&stop));
     println!("Final EIP:    {}", GuestVa(emulator.cpu().eip));
     println!("Final EAX:    0x{:08X}", gpr[0]);
     println!("Final ESI:    0x{:08X}", gpr[6]);
     println!("Final EDI:    0x{:08X}", gpr[7]);
     Ok(())
+}
+
+/// Names the export behind kernel-related stop reasons.
+fn stop_reason_note(stop: &StopReason) -> String {
+    match stop {
+        StopReason::MissingKernelExport { ordinal }
+        | StopReason::UnimplementedKernelExport { ordinal } => {
+            exbawks_kernel::kernel_ordinal_info(*ordinal)
+                .map(|info| format!(" ({})", info.name))
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    }
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>> {

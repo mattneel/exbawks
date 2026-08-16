@@ -48,6 +48,10 @@ The project follows Keep a Changelog structure before its first release.
   triage tool for kernel HLE burn-down (`CLI-001`).
 - `exbawks run --max-blocks <count>` replaces the fixed one-million block
   budget (`CLI-002`).
+- Trace filtering and kernel-call name enrichment: `exbawks run
+  --trace-filter kernel,stop` restricts JSON Lines records to selected event
+  kinds, kernel-call records carry verified export names, and kernel-related
+  stop reasons print their export name (`DBG-002`).
 
 ### Fixed
 

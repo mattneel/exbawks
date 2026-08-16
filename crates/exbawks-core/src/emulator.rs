@@ -259,7 +259,11 @@ impl Emulator {
             .checked_add(u32::try_from(instruction.len()).unwrap_or(u32::MAX))
             .ok_or(CoreError::KernelThunkAddressOverflow { address })?;
         tracing::trace!(ordinal, name = export.name(), "dispatching kernel gate call");
-        self.trace.record(TraceEvent::KernelCall { ordinal, caller: address });
+        self.trace.record(TraceEvent::KernelCall {
+            ordinal,
+            name: exbawks_kernel::kernel_ordinal_info(ordinal).map(|info| info.name.to_owned()),
+            caller: address,
+        });
         let memory = self.memory.clone();
 
         // Perform the call: push the return address so exports see the real
