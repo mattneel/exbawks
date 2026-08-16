@@ -23,7 +23,7 @@ pub use services::{
     KernelServiceError, KernelServices, ThreadCreateRequest, ThreadCreated, UnsupportedServices,
 };
 pub use startup::{
-    DbgPrint, HalReturnToFirmware, PsCreateSystemThreadEx, PsTerminateSystemThread, ordinal,
-    register_startup_exports,
+    DbgPrint, HalReturnToFirmware, NtClose, PsCreateSystemThreadEx, PsTerminateSystemThread,
+    ordinal, register_startup_exports,
 };
 pub use status::KernelStatus;

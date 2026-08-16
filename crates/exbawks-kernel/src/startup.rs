@@ -34,11 +34,10 @@ pub mod ordinal {
 }
 
 /// The startup stubs for virtual memory, events, timers, and files.
-const STARTUP_STUBS: [(u16, &str); 8] = [
+const STARTUP_STUBS: [(u16, &str); 7] = [
     (ordinal::KE_DELAY_EXECUTION_THREAD, "KeDelayExecutionThread"),
     (ordinal::KE_SET_TIMER, "KeSetTimer"),
     (ordinal::NT_ALLOCATE_VIRTUAL_MEMORY, "NtAllocateVirtualMemory"),
-    (ordinal::NT_CLOSE, "NtClose"),
     (ordinal::NT_CREATE_EVENT, "NtCreateEvent"),
     (ordinal::NT_CREATE_FILE, "NtCreateFile"),
     (ordinal::NT_FREE_VIRTUAL_MEMORY, "NtFreeVirtualMemory"),
@@ -51,6 +50,7 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     registry.register(HalReturnToFirmware)?;
     registry.register(PsCreateSystemThreadEx)?;
     registry.register(PsTerminateSystemThread)?;
+    registry.register(NtClose)?;
     for (ordinal, name) in STARTUP_STUBS {
         registry.register(StubExport::new(ordinal, name))?;
     }
@@ -211,6 +211,35 @@ impl KernelExport for PsTerminateSystemThread {
     }
 }
 
+/// Closes one guest handle (minimal object-manager surface).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NtClose;
+
+impl KernelExport for NtClose {
+    fn ordinal(&self) -> u16 {
+        ordinal::NT_CLOSE
+    }
+
+    fn name(&self) -> &'static str {
+        "NtClose"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        4
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        let Some(handle) = stack_argument(context, 0) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        if context.services.close_handle(handle) {
+            KernelStatus::SUCCESS
+        } else {
+            KernelStatus::INVALID_HANDLE
+        }
+    }
+}
+
 /// Reads one 32-bit stack argument above the return-address slot.
 fn stack_argument(context: &KernelCallContext<'_>, index: u32) -> Option<u32> {
     let esp = context.cpu.gpr[4];
@@ -328,6 +357,10 @@ mod tests {
         fn exit_current_thread(&mut self, status: u32) {
             self.exited = Some(status);
         }
+
+        fn close_handle(&mut self, handle: u32) -> bool {
+            handle == 0xE004
+        }
     }
 
     #[test]
@@ -372,6 +405,32 @@ mod tests {
         };
         assert_eq!(PsTerminateSystemThread.call(&mut context), KernelStatus::SUCCESS);
         assert_eq!(services.exited, Some(0x42));
+    }
+
+    #[test]
+    fn close_reports_known_and_unknown_handles() {
+        let memory = memory_with_stack();
+        let mut cpu = CpuState::default();
+        cpu.gpr[4] = 0x2000;
+        let mut services = RecordingServices::default();
+
+        memory.write_u32(GuestVa(0x2004), 0xE004).expect("write");
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut services,
+            stop_request: None,
+        };
+        assert_eq!(NtClose.call(&mut context), KernelStatus::SUCCESS);
+
+        memory.write_u32(GuestVa(0x2004), 0x1234).expect("write");
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut services,
+            stop_request: None,
+        };
+        assert_eq!(NtClose.call(&mut context), KernelStatus::INVALID_HANDLE);
     }
 
     #[test]

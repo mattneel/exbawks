@@ -14,6 +14,8 @@ impl KernelStatus {
     pub const ACCESS_VIOLATION: Self = Self(0xC000_0005);
     /// Insufficient guest resources exist to complete the request.
     pub const INSUFFICIENT_RESOURCES: Self = Self(0xC000_009A);
+    /// A handle value does not name an open object.
+    pub const INVALID_HANDLE: Self = Self(0xC000_0008);
 
     /// Returns true when the status represents success.
     #[must_use]

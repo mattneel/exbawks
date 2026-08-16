@@ -76,6 +76,10 @@ The project follows Keep a Changelog structure before its first release.
   `KernelServices` context (ADR 0012), a cooperative thread table (ADR 0011),
   and real `PsCreateSystemThreadEx`/`PsTerminateSystemThread` exports let the
   retail image create its worker thread and advance to `NtClose` (`KRN-005`).
+- A minimal object handle table with a real `NtClose` export closes the
+  thread handle instead of halting; the retail image advances past handle
+  cleanup (first slice of `HLE-005`; the namespace, symbolic links, and Ob*
+  exports follow).
 
 ### Fixed
 

@@ -1350,15 +1350,15 @@ mod tests {
         #[cfg(windows)]
         #[test]
         fn unimplemented_stub_halts_the_run() {
-            // Ordinal 187 (NtClose) is a registered but unimplemented stub.
+            // Ordinal 189 (NtCreateEvent) is a registered but unimplemented stub.
             let code = [0xFF, 0x15, 0x00, 0x12, 0x01, 0x00, 0xC3];
             let mut emulator = Emulator::new().expect("emulator must initialize");
             emulator
-                .load_xbe(synthetic_xbe_with(&code, &[0x8000_00BB]))
+                .load_xbe(synthetic_xbe_with(&code, &[0x8000_00BD]))
                 .expect("synthetic XBE must load");
 
             let stop = emulator.run(16).expect("the run must stop cleanly");
-            assert_eq!(stop, StopReason::UnimplementedKernelExport { ordinal: 187 });
+            assert_eq!(stop, StopReason::UnimplementedKernelExport { ordinal: 189 });
         }
 
         #[cfg(windows)]

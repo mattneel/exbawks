@@ -60,6 +60,12 @@ pub trait KernelServices {
 
     /// Records the pending termination of the calling thread.
     fn exit_current_thread(&mut self, status: u32);
+
+    /// Closes one guest handle.
+    ///
+    /// Returns `true` when the handle was open, `false` for an unknown
+    /// handle so the caller can report `STATUS_INVALID_HANDLE`.
+    fn close_handle(&mut self, handle: u32) -> bool;
 }
 
 /// A services implementation for contexts without an emulator.
@@ -75,4 +81,8 @@ impl KernelServices for UnsupportedServices {
     }
 
     fn exit_current_thread(&mut self, _status: u32) {}
+
+    fn close_handle(&mut self, _handle: u32) -> bool {
+        false
+    }
 }

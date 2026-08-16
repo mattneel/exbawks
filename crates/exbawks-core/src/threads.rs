@@ -1,5 +1,6 @@
 //! The guest thread table and kernel service implementation (ADR 0011/0012).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use exbawks_cpu::{CpuState, Segment, SegmentState};
@@ -78,6 +79,9 @@ pub(crate) struct ThreadManager {
     pending: Option<PendingAction>,
     kernel_cursor: u32,
     kernel_region_end: u32,
+    /// Open guest handles (minimal object table; the full object manager is
+    /// HLE-005). Thread creation registers its handle here.
+    handles: HashSet<u32>,
 }
 
 impl ThreadManager {
@@ -94,6 +98,7 @@ impl ThreadManager {
             pending: None,
             kernel_cursor: KERNEL_REGION_BASE,
             kernel_region_end,
+            handles: HashSet::new(),
         }
     }
 
@@ -243,6 +248,7 @@ impl KernelServices for ThreadManager {
         let index = self.threads.len();
         let id = index as u32 + 1;
         let handle = 0x0000_E000 + (index as u32) * 4;
+        self.handles.insert(handle);
         self.threads.push(GuestThread {
             cpu,
             state: if request.create_suspended {
@@ -259,5 +265,9 @@ impl KernelServices for ThreadManager {
 
     fn exit_current_thread(&mut self, status: u32) {
         self.pending = Some(PendingAction::Exit { status });
+    }
+
+    fn close_handle(&mut self, handle: u32) -> bool {
+        self.handles.remove(&handle)
     }
 }
