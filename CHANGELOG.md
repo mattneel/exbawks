@@ -60,6 +60,10 @@ The project follows Keep a Changelog structure before its first release.
   branches, call/ret with argument cleanup, push/pop in both widths,
   PUSHAD/POPAD as single accesses, PUSHFD/POPFD with a writable ID flag for
   CPUID probes, LEAVE, and the LOOP/JECXZ family (`CPU-002`).
+- Interpreter string operations with repeat prefixes and DF (partial
+  progress commits across faults, as hardware restarts), a deterministic
+  Pentium III CPUID profile (SSE yes, SSE2 no), and RDTSC backed by a
+  virtualized per-instruction counter in `CpuState` (`CPU-003`).
 
 ### Fixed
 

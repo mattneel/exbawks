@@ -94,6 +94,12 @@ pub struct CpuState {
     pub mxcsr: u32,
     /// The x87 register file.
     pub x87: X87State,
+    /// The deterministic virtualized time-stamp counter.
+    ///
+    /// The interpreter advances it once per retired instruction; the
+    /// virtual-clock design (boot plan D3) will formalize its scaling. It
+    /// never reads the host time-stamp counter.
+    pub tsc: u64,
 }
 
 impl CpuState {
@@ -143,6 +149,7 @@ impl Default for CpuState {
             xmm: [0; 8],
             mxcsr: 0x1F80,
             x87: X87State::default(),
+            tsc: 0,
         }
     }
 }

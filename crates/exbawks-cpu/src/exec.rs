@@ -2,10 +2,11 @@
 //! guest memory.
 //!
 //! `step` fetches, decodes, and executes exactly one instruction at the guest
-//! EIP. This stage covers memory operands, the integer ALU across 8, 16, and
-//! 32-bit widths, near control flow, and stack traffic; string operations
-//! and floating point arrive in later stages and report
-//! `ExecError::Unsupported`.
+//! EIP. The implemented set covers memory operands, the integer ALU across
+//! 8, 16, and 32-bit widths, near control flow, stack traffic, string
+//! operations with repeat prefixes (committing per completed iteration, as
+//! hardware restartability requires), CPUID, and RDTSC; floating point and
+//! SIMD arrive in later stages and report `ExecError::Unsupported`.
 //!
 //! Flags follow the architectural definitions. Where hardware leaves a flag
 //! undefined (auxiliary carry after shifts, sign/zero after `mul`, every flag
@@ -117,13 +118,17 @@ enum Flow {
 ///
 /// State mutation is ordered so every fallible guest memory access happens
 /// before registers, flags, or the EIP change; a fault leaves `CpuState`
-/// exactly as it was.
+/// exactly as it was. The one exception is a repeated string instruction,
+/// which commits ESI/EDI/ECX and flags per completed iteration so a
+/// mid-repeat fault leaves the partial progress hardware would leave; the
+/// EIP still never moves on a fault, keeping the instruction restartable.
 pub fn step(state: &mut CpuState, memory: &dyn GuestMemory) -> Result<(), ExecError> {
     let address = GuestVa(state.eip);
     let instruction = decode_at(state.eip, memory, address)?;
     if execute(state, memory, &instruction, address)? == Flow::Next {
         state.eip = state.eip.wrapping_add(instruction.len() as u32);
     }
+    state.tsc = state.tsc.wrapping_add(1);
     Ok(())
 }
 
@@ -485,6 +490,60 @@ fn execute_straightline(
             state.gpr[1] = value(6);
             state.gpr[0] = value(7);
             state.gpr[4] = state.gpr[4].wrapping_add(32);
+            Ok(())
+        }
+        Mnemonic::Movsb => {
+            string_op(state, memory, instruction, address, StringKind::Movs, Width::B)
+        }
+        Mnemonic::Movsw => {
+            string_op(state, memory, instruction, address, StringKind::Movs, Width::W)
+        }
+        Mnemonic::Movsd => {
+            string_op(state, memory, instruction, address, StringKind::Movs, Width::D)
+        }
+        Mnemonic::Stosb => {
+            string_op(state, memory, instruction, address, StringKind::Stos, Width::B)
+        }
+        Mnemonic::Stosw => {
+            string_op(state, memory, instruction, address, StringKind::Stos, Width::W)
+        }
+        Mnemonic::Stosd => {
+            string_op(state, memory, instruction, address, StringKind::Stos, Width::D)
+        }
+        Mnemonic::Lodsb => {
+            string_op(state, memory, instruction, address, StringKind::Lods, Width::B)
+        }
+        Mnemonic::Lodsw => {
+            string_op(state, memory, instruction, address, StringKind::Lods, Width::W)
+        }
+        Mnemonic::Lodsd => {
+            string_op(state, memory, instruction, address, StringKind::Lods, Width::D)
+        }
+        Mnemonic::Scasb => {
+            string_op(state, memory, instruction, address, StringKind::Scas, Width::B)
+        }
+        Mnemonic::Scasw => {
+            string_op(state, memory, instruction, address, StringKind::Scas, Width::W)
+        }
+        Mnemonic::Scasd => {
+            string_op(state, memory, instruction, address, StringKind::Scas, Width::D)
+        }
+        Mnemonic::Cmpsb => {
+            string_op(state, memory, instruction, address, StringKind::Cmps, Width::B)
+        }
+        Mnemonic::Cmpsw => {
+            string_op(state, memory, instruction, address, StringKind::Cmps, Width::W)
+        }
+        Mnemonic::Cmpsd => {
+            string_op(state, memory, instruction, address, StringKind::Cmps, Width::D)
+        }
+        Mnemonic::Cpuid => {
+            cpuid(state);
+            Ok(())
+        }
+        Mnemonic::Rdtsc => {
+            state.gpr[0] = state.tsc as u32;
+            state.gpr[2] = (state.tsc >> 32) as u32;
             Ok(())
         }
         Mnemonic::Pushfd => push_value(state, memory, Width::D, state.eflags),
@@ -1625,6 +1684,134 @@ fn bit_test(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StringKind {
+    Movs,
+    Stos,
+    Lods,
+    Scas,
+    Cmps,
+}
+
+/// Executes one string instruction, honoring repeat prefixes and DF.
+///
+/// Repeated forms commit ESI/EDI/ECX and flags per completed iteration, so a
+/// fault mid-repeat leaves the partial progress hardware would leave (the
+/// instruction is restartable at the unchanged EIP).
+fn string_op(
+    state: &mut CpuState,
+    memory: &dyn GuestMemory,
+    instruction: &Instruction,
+    address: GuestVa,
+    kind: StringKind,
+    width: Width,
+) -> Result<(), ExecError> {
+    // Require the 32-bit address-size forms; this also excludes the SSE2
+    // instructions sharing the MOVSD/CMPSD mnemonics.
+    let operands_valid = match kind {
+        StringKind::Movs => {
+            instruction.op0_kind() == OpKind::MemoryESEDI
+                && instruction.op1_kind() == OpKind::MemorySegESI
+        }
+        StringKind::Stos => instruction.op0_kind() == OpKind::MemoryESEDI,
+        StringKind::Lods => instruction.op1_kind() == OpKind::MemorySegESI,
+        StringKind::Scas => instruction.op1_kind() == OpKind::MemoryESEDI,
+        StringKind::Cmps => {
+            instruction.op0_kind() == OpKind::MemorySegESI
+                && instruction.op1_kind() == OpKind::MemoryESEDI
+        }
+    };
+    if !operands_valid {
+        return Err(ExecError::Unsupported { address });
+    }
+
+    let repeated = instruction.has_rep_prefix() || instruction.has_repne_prefix();
+    let conditional = matches!(kind, StringKind::Scas | StringKind::Cmps);
+    // REPNE continues while ZF is clear; REPE/REP continues while ZF is set.
+    let continue_on_zero = !instruction.has_repne_prefix();
+    let source_base = segment_base(state, instruction.memory_segment(), address)?;
+    let destination_base = state.segment(Segment::Es).base;
+    let accumulator = match width {
+        Width::B => Register::AL,
+        Width::W => Register::AX,
+        Width::D => Register::EAX,
+    };
+
+    loop {
+        if repeated && state.gpr[1] == 0 {
+            break;
+        }
+
+        let delta = if state.eflags & flags::DIRECTION != 0 {
+            0_u32.wrapping_sub(width.bytes() as u32)
+        } else {
+            width.bytes() as u32
+        };
+        let source = GuestVa(source_base.wrapping_add(state.gpr[6]));
+        let destination = GuestVa(destination_base.wrapping_add(state.gpr[7]));
+
+        match kind {
+            StringKind::Movs => {
+                let value = read_memory(memory, source, width)?;
+                write_memory(memory, destination, width, value)?;
+                state.gpr[6] = state.gpr[6].wrapping_add(delta);
+                state.gpr[7] = state.gpr[7].wrapping_add(delta);
+            }
+            StringKind::Stos => {
+                let value = read_register(state, accumulator, address)?;
+                write_memory(memory, destination, width, value)?;
+                state.gpr[7] = state.gpr[7].wrapping_add(delta);
+            }
+            StringKind::Lods => {
+                let value = read_memory(memory, source, width)?;
+                write_register(state, accumulator, value, address)?;
+                state.gpr[6] = state.gpr[6].wrapping_add(delta);
+            }
+            StringKind::Scas => {
+                let value = read_memory(memory, destination, width)?;
+                let a = read_register(state, accumulator, address)?;
+                let (_, bits) = sub_bits(a, value, 0, width);
+                merge_flags(state, flags::ARITHMETIC, bits);
+                state.gpr[7] = state.gpr[7].wrapping_add(delta);
+            }
+            StringKind::Cmps => {
+                let a = read_memory(memory, source, width)?;
+                let b = read_memory(memory, destination, width)?;
+                let (_, bits) = sub_bits(a, b, 0, width);
+                merge_flags(state, flags::ARITHMETIC, bits);
+                state.gpr[6] = state.gpr[6].wrapping_add(delta);
+                state.gpr[7] = state.gpr[7].wrapping_add(delta);
+            }
+        }
+
+        if !repeated {
+            break;
+        }
+        state.gpr[1] = state.gpr[1].wrapping_sub(1);
+        if conditional && (state.eflags & flags::ZERO != 0) != continue_on_zero {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Reports a deterministic Pentium III (Coppermine) identity.
+///
+/// Family 6, model 8; features include MMX, FXSR, and SSE and exclude SSE2,
+/// matching the Xbox CPU. Out-of-range leaves return the highest basic leaf,
+/// as hardware does.
+fn cpuid(state: &mut CpuState) {
+    let (a, b, c, d) = match state.gpr[0] {
+        0 => (2, 0x756E_6547, 0x6C65_746E, 0x4965_6E69), // "GenuineIntel"
+        1 => (0x0000_068A, 0, 0, 0x0383_F9FF),
+        _ => (0x0302_0101, 0, 0, 0x0C04_0843),
+    };
+    state.gpr[0] = a;
+    state.gpr[3] = b;
+    state.gpr[1] = c;
+    state.gpr[2] = d;
+}
+
 fn bit_scan(
     state: &mut CpuState,
     memory: &dyn GuestMemory,
@@ -2306,6 +2493,147 @@ mod tests {
         assert_eq!(state.eip, CODE + 4 + 8);
     }
 
+    #[test]
+    fn rep_movs_copies_in_both_directions() {
+        let (mut state, memory) = machine();
+        memory.write(GuestVa(DATA), b"exbawks!").expect("data writes");
+        state.gpr[6] = DATA; // esi
+        state.gpr[7] = DATA + 0x100; // edi
+        state.gpr[1] = 8; // ecx
+        exec(&mut state, &memory, &[0xF3, 0xA4]); // rep movsb
+        let mut copied = [0_u8; 8];
+        memory.read(GuestVa(DATA + 0x100), &mut copied).expect("read");
+        assert_eq!(&copied, b"exbawks!");
+        assert_eq!(state.gpr[1], 0);
+        assert_eq!(state.gpr[6], DATA + 8);
+        assert_eq!(state.gpr[7], DATA + 0x108);
+
+        // Downward copy with DF set: two dwords ending at the start indices.
+        exec(&mut state, &memory, &[0xFD]); // std
+        state.gpr[6] = DATA + 4;
+        state.gpr[7] = DATA + 0x204;
+        state.gpr[1] = 2;
+        exec(&mut state, &memory, &[0xF3, 0xA5]); // rep movsd
+        let mut copied = [0_u8; 8];
+        memory.read(GuestVa(DATA + 0x200), &mut copied).expect("read");
+        assert_eq!(&copied, b"exbawks!");
+        exec(&mut state, &memory, &[0xFC]); // cld
+    }
+
+    #[test]
+    fn rep_stos_fills_and_zero_count_is_a_no_op() {
+        let (mut state, memory) = machine();
+        state.gpr[0] = 0xABAB_ABAB;
+        state.gpr[7] = DATA;
+        state.gpr[1] = 4;
+        exec(&mut state, &memory, &[0xF3, 0xAB]); // rep stosd
+        assert_eq!(memory.read_u32(GuestVa(DATA + 12)).expect("read"), 0xABAB_ABAB);
+        assert_eq!(state.gpr[7], DATA + 16);
+
+        state.gpr[1] = 0;
+        state.gpr[7] = UNMAPPED; // must not be touched with a zero count
+        exec(&mut state, &memory, &[0xF3, 0xAB]);
+        assert_eq!(state.gpr[7], UNMAPPED);
+    }
+
+    #[test]
+    fn repne_scas_finds_a_byte() {
+        let (mut state, memory) = machine();
+        memory.write(GuestVa(DATA), b"abcXdef\0").expect("data writes");
+        state.gpr[0] = u32::from(b'X');
+        state.gpr[7] = DATA;
+        state.gpr[1] = 8;
+        exec(&mut state, &memory, &[0xF2, 0xAE]); // repne scasb
+        assert_eq!(state.gpr[7], DATA + 4, "EDI stops one past the match");
+        assert_eq!(state.gpr[1], 4);
+        assert_ne!(state.eflags & flags::ZERO, 0);
+    }
+
+    #[test]
+    fn repe_cmps_stops_at_the_first_mismatch() {
+        let (mut state, memory) = machine();
+        memory.write(GuestVa(DATA), b"same-same-DIFF").expect("data writes");
+        memory.write(GuestVa(DATA + 0x100), b"same-same-diff").expect("data writes");
+        state.gpr[6] = DATA;
+        state.gpr[7] = DATA + 0x100;
+        state.gpr[1] = 14;
+        exec(&mut state, &memory, &[0xF3, 0xA6]); // repe cmpsb
+        assert_eq!(state.gpr[6], DATA + 11);
+        assert_eq!(state.gpr[1], 3);
+        assert_eq!(state.eflags & flags::ZERO, 0);
+    }
+
+    #[test]
+    fn a_faulting_repeat_commits_partial_progress() {
+        let (mut state, memory) = machine();
+        // The destination run ends where the read-only page begins... use the
+        // unmapped hole instead: DATA maps two pages, so DATA+0x2000 faults.
+        state.gpr[0] = 0x5A5A_5A5A;
+        state.gpr[7] = DATA + 0x2000 - 8;
+        state.gpr[1] = 4;
+        let error = try_exec(&mut state, &memory, &[0xF3, 0xAB]); // rep stosd
+        assert!(matches!(error, Err(ExecError::Memory(MemoryError::Unmapped { .. }))));
+        assert_eq!(state.gpr[1], 2, "two iterations completed before the fault");
+        assert_eq!(state.gpr[7], DATA + 0x2000);
+        assert_eq!(state.eip, CODE, "the instruction stays restartable");
+        assert_eq!(memory.read_u32(GuestVa(DATA + 0x2000 - 4)).expect("read"), 0x5A5A_5A5A);
+    }
+
+    #[test]
+    fn lods_honors_segment_overrides() {
+        let (mut state, memory) = machine();
+        let mut fs = state.segment(Segment::Fs);
+        fs.base = DATA;
+        state.set_segment(Segment::Fs, fs);
+        memory.write_u32(GuestVa(DATA + 0x30), 0xCAFE_D00D).expect("data writes");
+        state.gpr[6] = 0x30;
+        exec(&mut state, &memory, &[0x64, 0xAD]); // lodsd fs:[esi]
+        assert_eq!(state.gpr[0], 0xCAFE_D00D);
+        assert_eq!(state.gpr[6], 0x34);
+    }
+
+    #[test]
+    fn sixteen_bit_string_forms_are_rejected() {
+        let (mut state, memory) = machine();
+        let error = try_exec(&mut state, &memory, &[0x67, 0xA4]); // movsb [di],[si]
+        assert!(matches!(error, Err(ExecError::Unsupported { .. })));
+    }
+
+    #[test]
+    fn cpuid_reports_the_pentium_iii_profile() {
+        let (mut state, memory) = machine();
+        state.gpr[0] = 0;
+        exec(&mut state, &memory, &[0x0F, 0xA2]); // cpuid
+        assert_eq!(state.gpr[0], 2);
+        let vendor: [u8; 12] = {
+            let mut bytes = [0_u8; 12];
+            bytes[..4].copy_from_slice(&state.gpr[3].to_le_bytes());
+            bytes[4..8].copy_from_slice(&state.gpr[2].to_le_bytes());
+            bytes[8..].copy_from_slice(&state.gpr[1].to_le_bytes());
+            bytes
+        };
+        assert_eq!(&vendor, b"GenuineIntel");
+
+        state.gpr[0] = 1;
+        exec(&mut state, &memory, &[0x0F, 0xA2]);
+        assert_eq!(state.gpr[0], 0x0000_068A, "family 6 model 8");
+        const SSE: u32 = 1 << 25;
+        const SSE2: u32 = 1 << 26;
+        assert_ne!(state.gpr[2] & SSE, 0, "SSE must be present");
+        assert_eq!(state.gpr[2] & SSE2, 0, "SSE2 must be absent");
+    }
+
+    #[test]
+    fn rdtsc_reads_the_deterministic_counter() {
+        let (mut state, memory) = machine();
+        exec(&mut state, &memory, &[0x0F, 0x31]); // rdtsc
+        let first = state.gpr[0];
+        exec(&mut state, &memory, &[0x90]); // nop
+        exec(&mut state, &memory, &[0x0F, 0x31]); // rdtsc
+        assert_eq!(state.gpr[0], first + 2, "one tick per retired instruction");
+        assert_eq!(state.gpr[2], 0);
+    }
+
     /// 66-prefixed and far control-flow forms must fail typed instead of
     /// silently executing with 32-bit semantics.
     #[test]
@@ -2452,6 +2780,8 @@ mod tests {
                     .expect("program decodes");
                 crate::step_register_only(&mut state_b, &block.instructions[0])
                     .expect("oracle executes");
+                // The legacy oracle does not model the time-stamp counter.
+                state_b.tsc = state_a.tsc;
 
                 assert_eq!(state_a, state_b, "tiers diverged on {program:02X?}");
             }
