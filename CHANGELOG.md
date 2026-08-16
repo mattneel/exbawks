@@ -46,6 +46,8 @@ The project follows Keep a Changelog structure before its first release.
 - `exbawks thunks --check-registry` names every imported ordinal and reports
   it as implemented, stub, or missing with summary counts — the standing
   triage tool for kernel HLE burn-down (`CLI-001`).
+- `exbawks run --max-blocks <count>` replaces the fixed one-million block
+  budget (`CLI-002`).
 
 ### Fixed
 

@@ -86,6 +86,9 @@ enum Command {
         /// Includes the private XBE host path in trace records.
         #[arg(long, requires = "trace")]
         trace_host_paths: bool,
+        /// The maximum executed block count.
+        #[arg(long, default_value_t = 1 << 20)]
+        max_blocks: usize,
     },
 }
 
@@ -136,8 +139,8 @@ fn main() -> Result<()> {
         Command::Thunks { path, limit, check_registry } => {
             thunks(&path, limit, check_registry, cli.json)
         }
-        Command::Run { path, ram_mib, trace, trace_host_paths } => {
-            run(&path, ram_mib, trace.as_deref(), trace_host_paths, cli.json)
+        Command::Run { path, ram_mib, trace, trace_host_paths, max_blocks } => {
+            run(&path, ram_mib, trace.as_deref(), trace_host_paths, max_blocks, cli.json)
         }
     }
 }
@@ -415,10 +418,9 @@ fn run(
     ram_mib: usize,
     trace: Option<&Path>,
     trace_host_paths: bool,
+    max_blocks: usize,
     json: bool,
 ) -> Result<()> {
-    const MAX_RUN_BLOCKS: usize = 1 << 20;
-
     let bytes = read_file(path)?;
     let config = EmulatorConfig {
         physical_memory_bytes: mib_to_bytes(ram_mib)?,
@@ -436,7 +438,7 @@ fn run(
     }
     let mut emulator = builder.build()?;
     emulator.load_xbe(bytes).with_context(|| format!("failed to load {}", path.display()))?;
-    let stop = emulator.run(MAX_RUN_BLOCKS)?;
+    let stop = emulator.run(max_blocks)?;
 
     if json {
         #[derive(Serialize)]
