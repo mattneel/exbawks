@@ -2,13 +2,15 @@ use exbawks_types::{GuestVa, StopReason};
 
 use crate::{
     KernelCallContext, KernelError, KernelExport, KernelRegistry, KernelStatus, StubExport,
-    ThreadCreateRequest,
+    SuccessExport, ThreadCreateRequest,
 };
 
 /// Xbox kernel export ordinals from the public XboxDev export table.
 pub mod ordinal {
     /// `DbgPrint`.
     pub const DBG_PRINT: u16 = 8;
+    /// `HalRegisterShutdownNotification`.
+    pub const HAL_REGISTER_SHUTDOWN_NOTIFICATION: u16 = 47;
     /// `HalReturnToFirmware`.
     pub const HAL_RETURN_TO_FIRMWARE: u16 = 49;
     /// `KeDelayExecutionThread`.
@@ -50,6 +52,11 @@ const STARTUP_STUBS: [(u16, &str); 7] = [
     (ordinal::NT_SET_EVENT, "NtSetEvent"),
 ];
 
+/// Benign exports that succeed as no-ops on the boot path:
+/// (ordinal, name, stdcall argument bytes).
+const BENIGN_SUCCESS: [(u16, &str, u16); 1] =
+    [(ordinal::HAL_REGISTER_SHUTDOWN_NOTIFICATION, "HalRegisterShutdownNotification", 8)];
+
 /// Registers the startup export set for one synthetic guest thread.
 pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register(DbgPrint)?;
@@ -58,6 +65,9 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     registry.register(PsTerminateSystemThread)?;
     registry.register(NtClose)?;
     crate::rtl::register_rtl_exports(registry)?;
+    for (ordinal, name, stack_bytes) in BENIGN_SUCCESS {
+        registry.register(SuccessExport::new(ordinal, name, stack_bytes))?;
+    }
     for (ordinal, name) in STARTUP_STUBS {
         registry.register(StubExport::new(ordinal, name))?;
     }
@@ -296,9 +306,9 @@ mod tests {
         let registry = KernelRegistry::new();
         register_startup_exports(&registry).expect("registration succeeds");
 
-        // Five thread/handle exports, three Rtl critical-section exports, and
-        // the seven remaining startup stubs.
-        assert_eq!(registry.len(), 15);
+        // Five thread/handle exports, three Rtl critical-section exports, one
+        // benign success export, and the seven remaining startup stubs.
+        assert_eq!(registry.len(), 16);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,

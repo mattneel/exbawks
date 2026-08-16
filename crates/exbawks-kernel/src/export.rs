@@ -54,3 +54,41 @@ impl KernelExport for StubExport {
         KernelStatus::NOT_IMPLEMENTED
     }
 }
+
+/// A benign export that succeeds without side effects.
+///
+/// Used for exports whose behavior is a safe no-op on the path to a title
+/// screen (registration callbacks, cache-size setters, shutdown notices).
+/// Unlike [`StubExport`] it returns success and does not halt the run.
+#[derive(Debug, Clone, Copy)]
+pub struct SuccessExport {
+    ordinal: u16,
+    name: &'static str,
+    stack_bytes: u16,
+}
+
+impl SuccessExport {
+    /// Creates a benign success export with its stdcall argument bytes.
+    #[must_use]
+    pub const fn new(ordinal: u16, name: &'static str, stack_bytes: u16) -> Self {
+        Self { ordinal, name, stack_bytes }
+    }
+}
+
+impl KernelExport for SuccessExport {
+    fn ordinal(&self) -> u16 {
+        self.ordinal
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        self.stack_bytes
+    }
+
+    fn call(&self, _context: &mut KernelCallContext<'_>) -> KernelStatus {
+        KernelStatus::SUCCESS
+    }
+}

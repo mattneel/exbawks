@@ -14,7 +14,7 @@ mod status;
 
 pub use context::KernelCallContext;
 pub use error::KernelError;
-pub use export::{KernelExport, StubExport};
+pub use export::{KernelExport, StubExport, SuccessExport};
 pub use gate::{KERNEL_GATE_BASE, KERNEL_GATE_END, gate_address, gate_ordinal};
 pub use ordinals::{
     CallingConvention, ExportKind, KERNEL_ORDINALS, KernelOrdinalInfo, kernel_ordinal_info,

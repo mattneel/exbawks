@@ -94,6 +94,9 @@ The project follows Keep a Changelog structure before its first release.
   PE section table) find a valid DOS/PE header; the kernel object region
   moved above it to avoid colliding with the kernel's address. The retail
   image advances past its kernel-image section parse (`CORE-003`).
+- A reusable `SuccessExport` backs benign kernel exports that are safe no-ops
+  on the boot path; `HalRegisterShutdownNotification` uses it, so the retail
+  image advances past its shutdown-notification registration (`HLE-010`).
 - Implementation-burndown diagnostics: `exbawks coverage` reports
   implemented/stub/missing counts across the CPU, kernel, and GPU surfaces
   (with `--xbe` to scope the kernel surface to one image's imports), and a
