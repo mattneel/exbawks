@@ -33,8 +33,10 @@ pub fn render_site(
         offset += line.len() + 1;
     }
 
+    // Color is disabled so the annotation renders identically to a terminal,
+    // a pipe, or a file; the spatial underline carries the diagnosis.
     let mut builder = Report::build(ReportKind::Error, ID, span.start)
-        .with_config(Config::default())
+        .with_config(Config::default().with_color(false))
         .with_message(title.to_owned())
         .with_label(Label::new((ID, span)).with_message(label.to_owned()).with_color(Color::Red));
     if let Some(note) = note {

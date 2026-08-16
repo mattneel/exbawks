@@ -238,7 +238,23 @@ impl Emulator {
             image.header.kernel_thunk_address,
             self.config.max_kernel_thunks,
         )?;
-        patch_kernel_thunks(&memory, &thunks)?;
+
+        // The kernel-side state (thread table, object handles, and the
+        // bump-allocated kernel region) is built before thunk patching so
+        // DATA-export slots can point at real kernel variables (ADR 0010).
+        let mut threads = ThreadManager::new(memory.clone());
+        let data_ordinals: Vec<u16> = thunks
+            .entries
+            .iter()
+            .filter(|thunk| {
+                exbawks_kernel::kernel_ordinal_info(thunk.ordinal)
+                    .is_some_and(|info| info.kind == exbawks_kernel::ExportKind::Data)
+            })
+            .map(|thunk| thunk.ordinal)
+            .collect();
+        let image_name = image_device_name(&image);
+        let kernel_variables = threads.build_kernel_variables(&data_ordinals, &image_name)?;
+        patch_kernel_thunks(&memory, &thunks, &kernel_variables)?;
 
         // The boot thread's stack is sized from the XBE header, page-rounded
         // and clamped to a working minimum (ADR 0010).
@@ -256,7 +272,6 @@ impl Emulator {
 
         // Build the boot thread's KPCR/KTHREAD pages and wire the fs base so
         // XAPI startup can read its TIB and current-thread pointers.
-        let mut threads = ThreadManager::new(memory.clone());
         let kpcr = threads.create_boot_environment(GUEST_STACK_BASE, stack_bytes)?;
 
         self.cpu = CpuState { eip: image.header.entry_point.0, ..CpuState::default() };
@@ -385,9 +400,15 @@ impl Emulator {
 
         for _ in 0..max_blocks {
             let start = GuestVa(self.cpu.eip);
-            if start == THREAD_EXIT_SENTINEL {
-                // A guest thread's start routine returned (ADR 0011). Exit it
-                // with its EAX status and switch to the next ready thread.
+            // A thread's start routine returned (ADR 0011): a created thread
+            // returns to the exit sentinel; the boot thread, whose stack has
+            // no set-up return address, returns to null. Either exits the
+            // current thread with its EAX status and switches to the next
+            // ready thread. A null reached by any other thread is a genuine
+            // fault (a null call or corrupt return), not an exit.
+            let null_exit = start == GuestVa(0)
+                && self.threads.as_ref().is_some_and(ThreadManager::active_exits_on_null_return);
+            if start == THREAD_EXIT_SENTINEL || null_exit {
                 if let Some(stop) = self.exit_current_thread(self.cpu.gpr[0]) {
                     return Ok(stop);
                 }
@@ -856,8 +877,16 @@ fn apply_merged_permissions(
 fn patch_kernel_thunks(
     memory: &SoftwareAddressSpace,
     table: &KernelThunkTable,
+    data_variables: &BTreeMap<u16, GuestVa>,
 ) -> Result<(), CoreError> {
     for thunk in &table.entries {
+        // A data export's slot points at its live kernel variable; a
+        // function export's slot points at its dispatch gate (ADR 0010).
+        let target = match data_variables.get(&thunk.ordinal) {
+            Some(address) => address.0,
+            None => gate_address(thunk.ordinal).0,
+        };
+
         let span = GuestRange::new(thunk.slot, 4).map_err(MemoryError::from)?;
         let mut originals = Vec::new();
         for page in span.pages() {
@@ -868,7 +897,7 @@ fn patch_kernel_thunks(
             originals.push((range, original));
         }
 
-        memory.write_u32(thunk.slot, gate_address(thunk.ordinal).0)?;
+        memory.write_u32(thunk.slot, target)?;
 
         for (range, original) in originals {
             memory.protect(range, original)?;
@@ -876,6 +905,13 @@ fn patch_kernel_thunks(
     }
 
     Ok(())
+}
+
+/// Derives the guest device path of the loaded image for `XeImageFileName`.
+fn image_device_name(_image: &XbeImage) -> String {
+    // The retail boot medium is the DVD; XAPI derives the `D:` mount from
+    // this path. The leaf name is conventional across retail titles.
+    "\\Device\\CdRom0\\default.xbe".to_owned()
 }
 
 fn physical_dependencies(
@@ -994,6 +1030,48 @@ mod tests {
         assert_eq!(stop, StopReason::GuestExit { code: 0 });
         assert_eq!(emulator.cpu().gpr[1], 0x0001_0000, "the interpreted load must land");
         assert!(emulator.cpu().tsc > 0, "interpreted instructions must advance the counter");
+    }
+
+    /// A boot thread that returns off its stack (to a null return address)
+    /// exits cleanly instead of faulting at address zero.
+    #[test]
+    fn boot_thread_returning_to_null_exits() {
+        // `xor eax, eax; ret` — the entry returns 0 with an unset return slot.
+        let mut emulator = Emulator::new().expect("emulator must initialize");
+        emulator.load_xbe(synthetic_xbe_with(&[0x31, 0xC0, 0xC3], &[])).expect("image must load");
+        let stop = emulator.run(64).expect("run must complete");
+        assert_eq!(stop, StopReason::GuestExit { code: 0 });
+    }
+
+    /// A created thread reaching a null address is a genuine fault, not an
+    /// intended exit — only the boot thread returns to null on purpose.
+    #[test]
+    fn created_thread_reaching_null_faults() {
+        use exbawks_kernel::{KernelServices, ThreadCreateRequest};
+
+        let mut emulator = Emulator::new().expect("emulator must initialize");
+        emulator.load_xbe(synthetic_xbe()).expect("image must load");
+        emulator
+            .threads
+            .as_mut()
+            .unwrap()
+            .create_thread(ThreadCreateRequest {
+                thread_extension_size: 0,
+                kernel_stack_size: 0,
+                tls_data_size: 0,
+                start_routine: GuestVa(0x0002_0000),
+                start_context1: 0,
+                start_context2: 0,
+                create_suspended: false,
+            })
+            .expect("thread creates");
+
+        // The boot thread exits, making the created thread active.
+        assert_eq!(emulator.exit_current_thread(0), None, "the child keeps execution alive");
+        // Force the created thread to a null address: it must fault.
+        emulator.cpu.eip = 0;
+        let stop = emulator.run(4).expect("run must complete");
+        assert_eq!(stop, StopReason::GuestFault { address: GuestVa(0) });
     }
 
     /// Loading an image builds a KPCR the guest can read through fs, and the

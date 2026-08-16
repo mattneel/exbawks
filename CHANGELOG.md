@@ -89,6 +89,15 @@ The project follows Keep a Changelog structure before its first release.
   capability doctor that dynamically loads `WinHvPlatform.dll` and reports
   library/hypervisor/tier availability without breaking the CLI on hosts
   without WHP. `exbawks doctor` now reports WHP status.
+- A kernel-variables region backs the DATA exports (ADR 0010): the loader
+  patches each imported data-ordinal thunk slot with a pointer to a live
+  variable (`KeTickCount` cell (static until the virtual clock lands),
+  `KeTimeIncrement`, `XeImageFileName` ANSI string, `XboxKrnlVersion`, zeroed
+  keys and object types, and `LaunchDataPage` NULL) while function slots keep
+  gates (`KRN-002`). The
+  boot thread now returns off its stack to a thread exit and the scheduler
+  switches to the game's created thread, so the retail image advances past
+  its bootstrap to `RtlEnterCriticalSection`.
 
 ### Fixed
 

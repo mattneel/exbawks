@@ -200,6 +200,7 @@ dependencies = [
  "exbawks-memory",
  "exbawks-platform",
  "exbawks-types",
+ "exbawks-whp",
  "exbawks-xbe",
  "miette",
  "serde",
@@ -307,6 +308,14 @@ name = "exbawks-types"
 version = "0.1.0"
 dependencies = [
  "bitflags",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "exbawks-whp"
+version = "0.1.0"
+dependencies = [
  "serde",
  "thiserror",
 ]
