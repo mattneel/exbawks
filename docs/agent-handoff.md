@@ -91,10 +91,26 @@ form is creating the main thread's context inline and running it, deferring
 the full scheduler. `CORE-003` (KPCR/TIB page, XBE-declared stack size)
 naturally pairs with it.
 
-Next tasks in boot order: `CORE-003`, then a minimal `KRN-005` main-thread
-form (write the `cooperative-scheduler` ADR first), then M2's data exports
-(`KRN-002`) and clock (`KRN-003`). The retail image stays outside the
-repository; automated tests remain synthetic.
+`CORE-003` and `KRN-005` are complete (ADRs 0011 and 0012 accepted): the
+boot thread has a KPCR/KTHREAD page with an fs base, an XBE-sized stack, and
+guard-page-protected child stacks; `PsCreateSystemThreadEx`,
+`PsTerminateSystemThread`, and a minimal `NtClose` (first `HLE-005` slice)
+are real. The retail image now runs its whole XAPI startup — creating its
+worker thread and closing the handle — and stops with
+`GuestFault { address: 0 }`: guest code shortly after the `NtClose` return
+(last translated block at guest `0x1A6A5A`) transfers control to null, with
+no kernel call in between.
+
+Next task: `KRN-002` (data exports, per ADR 0010). XAPI reads the 19
+DATA-export slots, which the loader still patches with unmapped gate
+addresses; it must instead build a kernel-variables region (ticking
+`KeTickCount`, `KeTimeIncrement`, `LaunchDataPage` NULL, `XeImageFileName`
+ANSI string, zeroed synthetic keys, version/hardware structs, object-type
+placeholders) and patch DATA-ordinal slots with pointers into it while
+function slots keep gates (use `kernel_ordinal_info(ordinal).kind`). The
+null-jump fault is the expected symptom; verify KRN-002 clears it by running
+the image and reading the new wall. `KRN-003` (virtual clock) follows. The
+retail image stays outside the repository; automated tests remain synthetic.
 
 Do not start runtime graphics work before memory operands translate. The
 portable pure-logic graphics subset (`GPU-001` command vocabulary, `GPU-002`
