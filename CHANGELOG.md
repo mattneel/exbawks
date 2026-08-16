@@ -237,7 +237,27 @@ The project follows Keep a Changelog structure before its first release.
 - The run loop advances the `KeTickCount` cell deterministically (one
   millisecond per 4096 executed blocks, `KRN-003`), so titles that pace
   themselves by polling the tick counter make progress instead of spinning
-  forever. The retail image runs minutes deep into its initialization.
+  forever.
+- A repeated string instruction yields back to the run loop every 64 Ki
+  iterations with its committed partial progress (hardware REP is
+  interruptible; EIP stays on the instruction), so one giant guest `memset`
+  can no longer freeze the run loop, the virtual clock, or the block budget.
+- The run loop emits an info-level heartbeat (executed blocks, EIP, TSC)
+  every 16 Mi blocks, so a long or looping run stays observable.
+
+### Performance
+
+- Guest writes are no longer O(page table): `bump_physical_generation`
+  synchronized every descriptor's embedded generation stamp by walking all
+  2^20 entries on **every guest write** (~3 ms each), grinding write-heavy
+  guest phases to a crawl — diagnosed by stack-sampling a "frozen" run that
+  was 100%-CPU inside the walk. The per-physical-page generation array is
+  the authoritative store (ADR 0005): dependencies are now captured from it
+  as well as revalidated against it, and the walk is gone. The interpreter
+  runs ~1000× faster in write-heavy phases; the retail image completes its
+  **entire kernel-facing initialization in under a second** and stops at its
+  first SSE instruction (`movss`) — the CPU-tier frontier the WHP pivot
+  (ADR 0013) exists for.
 
 ### Fixed
 

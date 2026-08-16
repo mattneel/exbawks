@@ -595,12 +595,25 @@ impl Emulator {
         }
         let tick_cell = self.threads.as_ref().and_then(ThreadManager::tick_count_cell);
 
+        /// Blocks between progress heartbeats (tens of seconds of interpreter
+        /// time), so a long or spinning run stays visible without spam.
+        const BLOCKS_PER_HEARTBEAT: usize = 1 << 24;
+
         for executed in 0..max_blocks {
-            if executed.is_multiple_of(BLOCKS_PER_TICK)
-                && let Some(cell) = tick_cell
-                && let Ok(ticks) = self.memory.read_u32(cell)
-            {
-                let _ = self.memory.write_u32(cell, ticks.wrapping_add(1));
+            if executed.is_multiple_of(BLOCKS_PER_TICK) {
+                if let Some(cell) = tick_cell
+                    && let Ok(ticks) = self.memory.read_u32(cell)
+                {
+                    let _ = self.memory.write_u32(cell, ticks.wrapping_add(1));
+                }
+                if executed > 0 && executed.is_multiple_of(BLOCKS_PER_HEARTBEAT) {
+                    tracing::info!(
+                        executed,
+                        eip = format_args!("{:#010x}", self.cpu.eip),
+                        tsc = self.cpu.tsc,
+                        "run heartbeat"
+                    );
+                }
             }
             let start = GuestVa(self.cpu.eip);
             // A thread's start routine returned (ADR 0011): a created thread
@@ -1225,7 +1238,13 @@ fn physical_dependencies(
             }
             .into());
         }
-        pages.entry(descriptor.physical_page()).or_insert(descriptor.generation());
+        // The baseline comes from the authoritative per-physical-page
+        // generation array (ADR 0005), which cache revalidation also reads;
+        // the descriptor's embedded stamp is not kept in sync (a per-write
+        // full-table sync walk made every guest write O(page table)).
+        let physical_page = descriptor.physical_page();
+        let generation = table.physical_generation(physical_page).unwrap_or_default();
+        pages.entry(physical_page).or_insert(generation);
     }
 
     Ok(pages

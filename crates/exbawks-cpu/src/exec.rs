@@ -1770,10 +1770,25 @@ fn string_op(
         Width::D => Register::EAX,
     };
 
+    // A repeated string instruction is interruptible on hardware: EIP stays
+    // on the instruction while ECX/ESI/EDI record progress. Bounding the
+    // iterations per `step` keeps one giant REP (a multi-megabyte memset)
+    // from freezing the run loop; the instruction simply resumes on the next
+    // step with its committed partial progress.
+    const MAX_REP_ITERATIONS_PER_STEP: u32 = 0x1_0000;
+
+    let mut iterations = 0_u32;
     loop {
         if repeated && state.gpr[1] == 0 {
             break;
         }
+        if repeated && iterations == MAX_REP_ITERATIONS_PER_STEP {
+            // Pre-compensate the caller's unconditional advance so the EIP
+            // stays on this instruction and it restarts where it left off.
+            state.eip = state.eip.wrapping_sub(instruction.len() as u32);
+            break;
+        }
+        iterations += 1;
 
         let delta = if state.eflags & flags::DIRECTION != 0 {
             0_u32.wrapping_sub(width.bytes() as u32)

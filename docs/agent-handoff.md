@@ -197,21 +197,41 @@ Two active threads:
    — the dashboard reason code names the failing subsystem precisely (it is
    now a permanent `tracing::debug` in `relaunch_title`).
 
-   **Current DC3 wall: the CRT TLS accessor.** At guest `0x1A8F92`:
-   `mov ecx, fs:[4]; mov eax, ds:[0x61E828]; mov eax, [ecx+eax*4];
-   mov [eax+4], ecx` — the compiler's thread-local-storage pattern. On the
-   Xbox the TIB field at `fs:[4]` holds the thread's **TLS-pointer array**
-   (desktop MSVC uses `fs:[0x2C]`; the XDK CRT repurposes TIB+4), and
-   `ds:[0x61E828]` is `_tls_index`. Our KPCR writes `NtTib.StackBase` there,
-   so the game indexes stack garbage and faults at address 4. Fix (CORE-003
-   extension, in `threads.rs::build_thread_pages`): allocate a small
-   per-thread TLS array page, point `fs:[4]` at it, and make slot
-   `[_tls_index]` point to the thread's TLS block (the XBE header names the
-   TLS template: raw data start/end, zero-fill size — copy the template per
-   thread; the boot thread and created threads both need it). After TLS the
-   game should read real assets (`NtReadFile` works), then the long pole is
-   graphics HLE (only `NullGraphicsBackend` exists), which the
-   screenshot/frame-dump command hangs off.
+   Landed past the save bootstrap, in wall order: stack-top TLS (the XDK CRT
+   contract — `_tls_index = -size/4`, block pointer at `[StackBase - size]`,
+   decoded from DC3's own CRT at `0x1A9AE9`; the emulator reserves the region
+   above the initial ESP, `CORE-003`); `FileNetworkOpenInformation`;
+   `XeLoadSection`/`XeUnloadSection`; `NtOpenSymbolicLinkObject`/
+   `NtQuerySymbolicLinkObject`; the x87 control subset
+   (`fninit`/`fnstsw`/`fnstcw`/`fldcw`/`fnclex`); `KeQuerySystemTime`
+   (tsc-derived deterministic clock) and `MmQueryStatistics`; real
+   `NtCreateEvent`/`NtSetEvent`; and the ticking `KeTickCount` (KRN-003).
+
+   **Then the big one: a 1000× interpreter speedup.** A "frozen" run
+   (100%-CPU, no progress) was stack-sampled with cdb:
+   `bump_physical_generation` walked all 2^20 page-table entries on **every
+   guest write** (~3 ms each) to sync the descriptors' embedded generation
+   stamps. The per-physical-page array is the authoritative store (ADR
+   0005); dependencies are now captured from it too, the walk is deleted,
+   and guest writes are O(1). Also: REP string ops now yield every 64 Ki
+   iterations (interruptible, EIP stays put) so a giant memset cannot freeze
+   the loop, and the run loop emits a heartbeat every 16 Mi blocks.
+   Diagnosis recipe that cracked it, for reuse: bisect `--max-blocks` to
+   find the stall, check the process is CPU-pegged vs blocked, then
+   `cdb -pv -p <pid> -y target\debug -c ".reload /f; ~0 k; qd"` for the hot
+   stack.
+
+   **Current DC3 wall: SSE — the game proper.** The retail image now
+   completes its ENTIRE kernel-facing initialization in **under one second**
+   and stops at `movss xmm0, [esp+4]` (guest `0x1685A0`) — real game-engine
+   float math. This is the CPU-tier frontier the WHP pivot (ADR 0013) exists
+   for: implementing x87/SSE arithmetic in the interpreter is the long tail
+   WHP gives us for free. The **WHP-M0 spike** (see the top of this section)
+   is now clearly the highest-leverage next step; an interim
+   SSE-data-movement subset (`movss` load/store/move is just 32-bit moves
+   through `CpuState.xmm`) could probe a little further first but real
+   arithmetic follows immediately. Graphics HLE (the screenshot command's
+   long pole) remains after the CPU tier.
 
 The retail image stays outside the repository; automated tests remain
 synthetic.

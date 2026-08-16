@@ -370,23 +370,18 @@ impl PageTable {
             .map(|generation| generation.load(Ordering::Acquire))
     }
 
-    /// Increments the generation of every virtual page that maps one physical page.
+    /// Increments the generation of one guest physical page.
+    ///
+    /// The per-physical-page array is the authoritative generation store
+    /// (ADR 0005): code-cache dependencies are captured from it and
+    /// revalidated against it, covering every virtual alias by construction.
+    /// Descriptors' embedded generation stamps are *not* synchronized here —
+    /// a sync walk over the whole table made every guest write
+    /// O(page table), freezing write-heavy guest phases.
     pub fn bump_physical_generation(&self, physical_page: GuestPage) -> Option<u16> {
-        let _mutation = self.mutation_lock.lock();
         let generation = self.physical_generations.get(physical_page.index())?;
         let next_generation = generation.load(Ordering::Acquire).wrapping_add(1);
         generation.store(next_generation, Ordering::Release);
-
-        for entry in &self.entries {
-            let raw = entry.load(Ordering::Acquire);
-            let descriptor = PageDescriptor(raw);
-            if descriptor.kind() != PageKind::Ram || descriptor.physical_page() != physical_page {
-                continue;
-            }
-
-            entry.store(descriptor.with_generation(next_generation).0, Ordering::Release);
-        }
-
         Some(next_generation)
     }
 
@@ -527,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn new_alias_inherits_physical_generation() {
+    fn physical_generation_is_authoritative_across_aliases() {
         let table = PageTable::new();
         let first = GuestRange::page_aligned(GuestVa(0x1000), u64::from(GUEST_PAGE_SIZE))
             .expect("range is aligned");
@@ -538,8 +533,13 @@ mod tests {
             .expect("range is aligned");
         table.map_ram(alias, GuestPage(7), MemoryPermissions::READ).expect("alias succeeds");
 
-        assert_eq!(table.get(GuestPage(1)).generation(), 1);
-        assert_eq!(table.get(GuestPage(9)).generation(), 1);
+        // The per-physical-page array is the authoritative generation store
+        // (ADR 0005): a bump is O(1) and visible through it for every alias.
+        // A mapping created after a bump snapshots the current value; earlier
+        // descriptors' embedded stamps are not synchronized.
         assert_eq!(table.physical_generation(GuestPage(7)), Some(1));
+        assert_eq!(table.get(GuestPage(9)).generation(), 1, "a new alias snapshots the current");
+        assert_eq!(table.bump_physical_generation(GuestPage(7)), Some(2));
+        assert_eq!(table.physical_generation(GuestPage(7)), Some(2));
     }
 }
