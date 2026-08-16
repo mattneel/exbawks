@@ -21,12 +21,21 @@ const MAX_PATH_BYTES: usize = 512;
 /// `FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `GENERIC_WRITE`, `GENERIC_ALL`.
 const WRITE_ACCESS_BITS: u32 = 0x0000_0002 | 0x0000_0004 | 0x4000_0000 | 0x1000_0000;
 
-/// `CreateDisposition` values that modify the file (not a plain open):
-/// `FILE_SUPERSEDE`(0), `FILE_CREATE`(2), `FILE_OVERWRITE`(4),
-/// `FILE_OVERWRITE_IF`(5). `FILE_OPEN`(1) and `FILE_OPEN_IF`(3) only read.
+/// `CreateDisposition` values that overwrite existing content:
+/// `FILE_SUPERSEDE`(0), `FILE_OVERWRITE`(4), `FILE_OVERWRITE_IF`(5).
 fn disposition_writes(disposition: u32) -> bool {
-    matches!(disposition, 0 | 2 | 4 | 5)
+    matches!(disposition, 0 | 4 | 5)
 }
+
+/// `CreateDisposition` values that create the object when it is missing:
+/// `FILE_SUPERSEDE`(0), `FILE_CREATE`(2), `FILE_OPEN_IF`(3),
+/// `FILE_OVERWRITE_IF`(5).
+fn disposition_creates(disposition: u32) -> bool {
+    matches!(disposition, 0 | 2 | 3 | 5)
+}
+
+/// The `FILE_DIRECTORY_FILE` create/open option: the object is a directory.
+const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 
 /// `IO_STATUS_BLOCK.Information` results.
 const FILE_OPENED: u32 = 1;
@@ -45,6 +54,7 @@ pub(crate) fn register_file_exports(registry: &KernelRegistry) -> Result<(), Ker
     registry.register(NtQueryInformationFile)?;
     registry.register(NtDeviceIoControlFile)?;
     registry.register(NtQueryVolumeInformationFile)?;
+    registry.register(NtWriteFile)?;
     Ok(())
 }
 
@@ -105,6 +115,8 @@ fn open_file(
     attributes: u32,
     iosb: u32,
     write_access: bool,
+    create: bool,
+    directory: bool,
 ) -> KernelStatus {
     if handle_out == 0 {
         return KernelStatus::INVALID_PARAMETER;
@@ -113,9 +125,9 @@ fn open_file(
         write_io_status(context, iosb, KernelStatus::OBJECT_NAME_NOT_FOUND, 0);
         return KernelStatus::OBJECT_NAME_NOT_FOUND;
     };
-    tracing::debug!(%path, write_access, "NtOpenFile/NtCreateFile");
+    tracing::debug!(%path, write_access, create, directory, "NtOpenFile/NtCreateFile");
 
-    match context.services.open_file(FileOpenRequest { path, write_access }) {
+    match context.services.open_file(FileOpenRequest { path, write_access, create, directory }) {
         Ok(opened) => {
             let _ = context.memory.write_u32(GuestVa(handle_out), opened.handle);
             let information = if opened.created { FILE_CREATED } else { FILE_OPENED };
@@ -158,13 +170,15 @@ impl KernelExport for NtOpenFile {
         ) else {
             return KernelStatus::INVALID_PARAMETER;
         };
+        let options = stack_argument(context, 5).unwrap_or(0);
         let write_access = access & WRITE_ACCESS_BITS != 0;
-        open_file(context, handle_out, attributes, iosb, write_access)
+        let directory = options & FILE_DIRECTORY_FILE != 0;
+        open_file(context, handle_out, attributes, iosb, write_access, false, directory)
     }
 }
 
-/// Creates or opens a file. Read dispositions open; write dispositions are
-/// refused on the read-only device.
+/// Creates or opens a file. Creation and writing succeed only on the
+/// writable hard-disk mount (ADR 0016); the disc stays read-only.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NtCreateFile;
 
@@ -194,8 +208,11 @@ impl KernelExport for NtCreateFile {
             return KernelStatus::INVALID_PARAMETER;
         };
         let disposition = stack_argument(context, 7).unwrap_or(1);
+        let options = stack_argument(context, 8).unwrap_or(0);
         let write_access = access & WRITE_ACCESS_BITS != 0 || disposition_writes(disposition);
-        open_file(context, handle_out, attributes, iosb, write_access)
+        let create = disposition_creates(disposition);
+        let directory = options & FILE_DIRECTORY_FILE != 0;
+        open_file(context, handle_out, attributes, iosb, write_access, create, directory)
     }
 }
 
@@ -254,6 +271,66 @@ impl KernelExport for NtReadFile {
                 };
                 write_io_status(context, iosb, status, read);
                 status
+            }
+            Err(error) => {
+                let status = open_error_status(error);
+                write_io_status(context, iosb, status, 0);
+                status
+            }
+        }
+    }
+}
+
+/// Writes bytes from a guest buffer to an open file (ADR 0016).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NtWriteFile;
+
+impl KernelExport for NtWriteFile {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::NT_WRITE_FILE
+    }
+
+    fn name(&self) -> &'static str {
+        "NtWriteFile"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        32
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext,
+        //             IoStatusBlock, Buffer, Length, ByteOffset).
+        let (Some(handle), Some(iosb), Some(buffer), Some(length)) = (
+            stack_argument(context, 0),
+            stack_argument(context, 4),
+            stack_argument(context, 5),
+            stack_argument(context, 6),
+        ) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        let offset = match stack_argument(context, 7).unwrap_or(0) {
+            0 => None,
+            pointer => {
+                let low = context.memory.read_u32(GuestVa(pointer)).unwrap_or(0);
+                let high = context.memory.read_u32(GuestVa(pointer + 4)).unwrap_or(0);
+                let value = (u64::from(high) << 32) | u64::from(low);
+                if value == 0xFFFF_FFFF_FFFF_FFFE { None } else { Some(value) }
+            }
+        };
+
+        // Bounded copy out of guest memory before the host write.
+        let want = (length as usize).min(16 * 1024 * 1024);
+        let mut bytes = vec![0_u8; want];
+        if want > 0 && context.memory.read(GuestVa(buffer), &mut bytes).is_err() {
+            write_io_status(context, iosb, KernelStatus::ACCESS_VIOLATION, 0);
+            return KernelStatus::ACCESS_VIOLATION;
+        }
+
+        match context.services.write_file(handle, offset, &bytes) {
+            Ok(written) => {
+                write_io_status(context, iosb, KernelStatus::SUCCESS, written);
+                KernelStatus::SUCCESS
             }
             Err(error) => {
                 let status = open_error_status(error);

@@ -519,6 +519,12 @@ fn run(
     if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         emulator.set_disc_root(parent.to_path_buf());
     }
+    // Mount a persistent per-title directory as the writable hard disk
+    // (ADR 0016), so the title can create its save directories and files.
+    match hdd_root_for(&bytes) {
+        Ok(hdd) => emulator.set_hdd_root(hdd),
+        Err(error) => eprintln!("warning: no writable hard-disk mount: {error:#}"),
+    }
     emulator.load_xbe(bytes).with_context(|| format!("failed to load {}", path.display()))?;
     let stop = emulator.run(max_blocks)?;
 
@@ -619,6 +625,31 @@ fn read_guest_prefix(
 }
 
 /// Names the export behind kernel-related stop reasons.
+/// Creates and returns the per-title writable hard-disk directory
+/// (ADR 0016): `%LOCALAPPDATA%\exbawks\hdd\<title-id>\`, falling back to the
+/// system temp directory when `LOCALAPPDATA` is unset.
+fn hdd_root_for(xbe_bytes: &[u8]) -> Result<PathBuf> {
+    // The certificate's dwTitleId lives at certificate+8; the header region
+    // maps 1:1 from the file start at the base address.
+    let read_u32 = |offset: usize| -> Option<u32> {
+        let slice = xbe_bytes.get(offset..offset + 4)?;
+        Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+    };
+    let base = read_u32(0x104).context("XBE too short for a base address")?;
+    let certificate = read_u32(0x118).context("XBE too short for a certificate address")?;
+    let title_id = certificate
+        .checked_sub(base)
+        .and_then(|offset| read_u32(offset as usize + 8))
+        .context("certificate lies outside the image bytes")?;
+
+    let base_dir =
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let hdd = base_dir.join("exbawks").join("hdd").join(format!("{title_id:08X}"));
+    fs::create_dir_all(&hdd)
+        .with_context(|| format!("failed to create hard-disk directory {}", hdd.display()))?;
+    Ok(hdd)
+}
+
 fn stop_reason_note(stop: &StopReason) -> String {
     match stop {
         StopReason::MissingKernelExport { ordinal }

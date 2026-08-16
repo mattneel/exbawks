@@ -60,13 +60,18 @@ pub struct VirtualAllocation {
     pub size: u32,
 }
 
-/// A request to open a guest file through a host-backed device (ADR 0014).
+/// A request to open a guest file through a host-backed device (ADR 0014,
+/// ADR 0016).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileOpenRequest {
     /// The raw NT object path the guest supplied (device-qualified).
     pub path: String,
     /// Whether the guest requested any write or create-modifying access.
     pub write_access: bool,
+    /// Whether the disposition creates the object when it is missing.
+    pub create: bool,
+    /// Whether the open names a directory (`FILE_DIRECTORY_FILE`).
+    pub directory: bool,
 }
 
 /// The result of opening one file.
@@ -169,6 +174,19 @@ pub trait KernelServices {
         Err(KernelServiceError::Unsupported)
     }
 
+    /// Writes bytes to one open file on a writable mount (ADR 0016).
+    ///
+    /// `offset` writes at an explicit byte offset; `None` writes at the
+    /// maintained file pointer and advances it. Returns the bytes written.
+    fn write_file(
+        &mut self,
+        _handle: u32,
+        _offset: Option<u64>,
+        _bytes: &[u8],
+    ) -> Result<u32, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
     /// Allocates a physically contiguous, page-rounded guest buffer.
     ///
     /// Returns the guest address of the buffer in the kernel window (ADR
@@ -183,6 +201,25 @@ pub trait KernelServices {
     /// before a title relaunches itself; the emulator preserves the recorded
     /// regions across the reset. The default is a no-op.
     fn persist_memory(&mut self, _base: u32, _size: u32) {}
+
+    /// Creates an object-namespace symbolic link (drive-letter mounting).
+    ///
+    /// Titles link `\??\D:` and their data letters to device paths at
+    /// startup; the file device consults the links during path resolution.
+    fn create_symbolic_link(
+        &mut self,
+        _name: String,
+        _target: String,
+    ) -> Result<(), KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
+    /// Removes an object-namespace symbolic link.
+    ///
+    /// Returns `true` when the link existed.
+    fn delete_symbolic_link(&mut self, _name: &str) -> bool {
+        false
+    }
 }
 
 /// A services implementation for contexts without an emulator.

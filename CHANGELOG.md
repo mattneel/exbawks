@@ -192,6 +192,25 @@ The project follows Keep a Changelog structure before its first release.
   self-relaunch (a `HalReturnToFirmware` quick-reboot through a launch-data
   helper, the next milestone).
 
+### Added
+
+- Object-namespace symbolic links (`HLE-005` slice): `IoCreateSymbolicLink`
+  and `IoDeleteSymbolicLink` record guest drive-letter mounts (`\??\D:` →
+  `\Device\CdRom0`, …) in the host file device, which rewrites a matching
+  link prefix during path resolution, so opens through a drive letter reach
+  the right mount.
+- A writable hard-disk mount (ADR 0016): `\Device\Harddisk0\Partition1`
+  resolves to a per-title host directory
+  (`%LOCALAPPDATA%\exbawks\hdd\<title-id>\`) where the guest can create
+  directories (`FILE_DIRECTORY_FILE`), create files, and write
+  (`NtWriteFile` over a new `KernelServices::write_file`). The disc mount
+  stays read-only, and the ADR 0014 sandbox applies to creation paths. The
+  retail image creates its `TDATA` save directory instead of reading the
+  disk as full.
+- `RtlInitAnsiString` and `RtlEqualString` (`HLE-007`). The retail image
+  advances through its title-data bootstrap to its CRT thread-local-storage
+  accessor, the next wall (a per-thread TLS array behind `fs:[4]`).
+
 ### Fixed
 
 - `NtQueryVolumeInformationFile` size queries now report FATX hard-disk

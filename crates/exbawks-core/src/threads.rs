@@ -133,7 +133,11 @@ pub(crate) struct ThreadManager {
 const LAUNCH_DATA_PAGE_ORDINAL: u16 = 164;
 
 impl ThreadManager {
-    pub(crate) fn new(memory: Arc<SoftwareAddressSpace>, disc_root: Option<PathBuf>) -> Self {
+    pub(crate) fn new(
+        memory: Arc<SoftwareAddressSpace>,
+        disc_root: Option<PathBuf>,
+        hdd_root: Option<PathBuf>,
+    ) -> Self {
         // Kernel blocks stay inside the cached physical window
         // (`0x8000_0000 | PA`, ADR 0010) so they never stray into the
         // higher windows the ADR reserves.
@@ -148,7 +152,7 @@ impl ThreadManager {
             kernel_region_end,
             user_cursor: USER_ALLOC_BASE,
             handles: HashSet::new(),
-            files: HostFileSystem::new(disc_root),
+            files: HostFileSystem::new(disc_root, hdd_root),
             persisted: Vec::new(),
             launch_data_page_cell: None,
         }
@@ -438,6 +442,28 @@ impl KernelServices for ThreadManager {
         self.files.info(handle)
     }
 
+    fn write_file(
+        &mut self,
+        handle: u32,
+        offset: Option<u64>,
+        bytes: &[u8],
+    ) -> Result<u32, KernelServiceError> {
+        self.files.write(handle, offset, bytes)
+    }
+
+    fn create_symbolic_link(
+        &mut self,
+        name: String,
+        target: String,
+    ) -> Result<(), KernelServiceError> {
+        self.files.create_link(&name, &target);
+        Ok(())
+    }
+
+    fn delete_symbolic_link(&mut self, name: &str) -> bool {
+        self.files.delete_link(name)
+    }
+
     fn persist_memory(&mut self, base: u32, size: u32) {
         // A title may persist the same page more than once; keep one entry per
         // base and grow it to the largest size seen so a later, larger persist
@@ -529,7 +555,7 @@ mod tests {
 
     fn manager() -> ThreadManager {
         let memory = Arc::new(SoftwareAddressSpace::new(4 * 1024 * 1024).expect("memory is valid"));
-        ThreadManager::new(memory, None)
+        ThreadManager::new(memory, None, None)
     }
 
     #[test]

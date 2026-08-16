@@ -147,6 +147,7 @@ impl EmulatorBuilder {
             loaded: None,
             threads: None,
             disc_root: None,
+            hdd_root: None,
             last_relaunch_data: None,
         })
     }
@@ -173,6 +174,8 @@ pub struct Emulator {
     threads: Option<ThreadManager>,
     /// The host directory mounted as the read-only game disc (ADR 0014).
     disc_root: Option<PathBuf>,
+    /// The host directory mounted as the writable hard disk (ADR 0016).
+    hdd_root: Option<PathBuf>,
     /// The persisted launch data of the previous relaunch (ADR 0015). A
     /// relaunch that persists identical data is a reboot loop, not progress,
     /// so the run stops instead of spinning.
@@ -203,6 +206,16 @@ impl Emulator {
     /// `Nt*File` exports. Guest file access is confined to this directory.
     pub fn set_disc_root(&mut self, root: PathBuf) {
         self.disc_root = Some(root);
+    }
+
+    /// Mounts a host directory as the writable hard-disk partition
+    /// (ADR 0016).
+    ///
+    /// Set before [`Emulator::load_xbe`]. Titles create their save
+    /// directories and files here; guest writes are confined to this
+    /// directory.
+    pub fn set_hdd_root(&mut self, root: PathBuf) {
+        self.hdd_root = Some(root);
     }
 
     /// Returns the guest CPU state.
@@ -260,7 +273,8 @@ impl Emulator {
         // The kernel-side state (thread table, object handles, and the
         // bump-allocated kernel region) is built before thunk patching so
         // DATA-export slots can point at real kernel variables (ADR 0010).
-        let mut threads = ThreadManager::new(memory.clone(), self.disc_root.clone());
+        let mut threads =
+            ThreadManager::new(memory.clone(), self.disc_root.clone(), self.hdd_root.clone());
         let data_ordinals: Vec<u16> = thunks
             .entries
             .iter()
@@ -437,6 +451,25 @@ impl Emulator {
             // A reboot with no launch data is a dashboard return, not a
             // self-relaunch.
             return Ok(false);
+        }
+        // The launch header and the first data words name the reboot's cause
+        // precisely (an LDT_TO_DASHBOARD carries its reason code), which is
+        // the single most useful diagnostic for a boot that bails.
+        let mut head = [0_u8; 8];
+        let mut data = [0_u8; 16];
+        if self.memory.read(GuestVa(launch_pointer), &mut head).is_ok()
+            && self.memory.read(GuestVa(launch_pointer.wrapping_add(0x400)), &mut data).is_ok()
+        {
+            let dw = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+            tracing::debug!(
+                launch_type = format_args!("{:#x}", dw(&head, 0)),
+                title = format_args!("{:#x}", dw(&head, 4)),
+                data0 = format_args!("{:#x}", dw(&data, 0)),
+                data1 = format_args!("{:#x}", dw(&data, 4)),
+                data2 = format_args!("{:#x}", dw(&data, 8)),
+                data3 = format_args!("{:#x}", dw(&data, 12)),
+                "soft reboot launch data"
+            );
         }
 
         // The most launch data one soft reboot preserves. The size is a raw
