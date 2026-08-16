@@ -71,10 +71,19 @@ impl KernelExport for AvSendTVEncoderOption {
         // Queries answer a synthetic profile; settings are accepted.
         // Option 4 (`AV_QUERY_MODE_TABLE_VERSION`-family) and the flicker/
         // cable queries all take zero safely; the one that matters is the
-        // display-standard query, answered as NTSC-M composite.
-        const AV_OPTION_QUERY_MODE: u32 = 6;
+        // capability query, whose answer selects a whole mode table.
+        //
+        // The word packs three fields Direct3D reads apart: the video
+        // standard in bits 8..15 (`1` NTSC-M, `2` NTSC-J, `3` PAL), the AV
+        // pack class in bits 0..7 (`0` the SDTV packs, `3` SCART, `4`
+        // component, `5` VGA), and capability bits above — of which
+        // `0x0040_0000` is the one every SDTV mode entry carries and the
+        // mode search requires. `AV_STANDARD_NTSC_M` is exactly this word
+        // for a composite NTSC console.
+        const AV_QUERY_AV_CAPABILITIES: u32 = 6;
+        const AV_STANDARD_NTSC_M: u32 = 0x0040_0100;
         let value = match option {
-            AV_OPTION_QUERY_MODE => 0x0000_0001, // NTSC-M
+            AV_QUERY_AV_CAPABILITIES => AV_STANDARD_NTSC_M,
             _ => 0,
         };
         if result_out != 0 {
@@ -116,6 +125,7 @@ impl KernelExport for AvSetDisplayMode {
             frame_buffer = format_args!("{frame_buffer:#010x}"),
             "display mode set"
         );
+        context.services.set_display_mode(crate::DisplayMode { frame_buffer, format, pitch, mode });
         KernelStatus::SUCCESS
     }
 }
