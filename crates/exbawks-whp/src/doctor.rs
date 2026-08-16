@@ -62,10 +62,9 @@ fn probe() -> (bool, bool) {
     let mut wide: Vec<u16> = "WinHvPlatform.dll".encode_utf16().collect();
     wide.push(0);
 
-    // SAFETY: `wide` is a live null-terminated UTF-16 string for the call.
-    // The module handle, when non-null, is freed before return, and the
-    // resolved symbol is transmuted to its documented signature and called
-    // with a live 4-byte output and a live u32 written-count.
+    // SAFETY: `wide` is a live null-terminated UTF-16 string; the module
+    // handle is freed before return and the resolved symbol is transmuted to
+    // its documented signature, called with live 4-byte and u32 outputs.
     unsafe {
         let module = LoadLibraryW(wide.as_ptr());
         if module.is_null() {
