@@ -232,6 +232,7 @@ impl Emulator {
         let image = XbeImage::parse(&bytes)?;
         let memory = Arc::new(SoftwareAddressSpace::new(self.config.physical_memory_bytes)?);
         map_xbe(&memory, &image, &bytes)?;
+        map_synthetic_kernel_image(&memory)?;
 
         let thunks = KernelThunkTable::read(
             memory.as_ref(),
@@ -907,6 +908,45 @@ fn patch_kernel_thunks(
     Ok(())
 }
 
+/// The guest virtual base of the Xbox kernel image in the cached window.
+const KERNEL_IMAGE_BASE: u32 = 0x8001_0000;
+
+/// Maps a minimal synthetic kernel PE image at the kernel's fixed base.
+///
+/// Retail titles read the kernel image directly at `0x8001_0000` — for
+/// example parsing its PE section table (e.g. to discard the `INIT`
+/// section). This provides just enough of a valid DOS + PE header that such
+/// a parse reads sane fields and lands inside the mapped page; the single
+/// section is left unnamed, so the `INIT`-section check takes its clean
+/// no-op return. A fuller kernel image is future work (and unnecessary under
+/// the WHP tier, where the real kernel is present).
+fn map_synthetic_kernel_image(memory: &SoftwareAddressSpace) -> Result<(), CoreError> {
+    const E_LFANEW: u32 = 0x40;
+    let base = KERNEL_IMAGE_BASE;
+    let range = GuestRange::page_aligned(GuestVa(base), u64::from(GUEST_PAGE_SIZE))
+        .map_err(MemoryError::from)?;
+    memory.map_anonymous(range, MemoryPermissions::READ | MemoryPermissions::WRITE)?;
+
+    // DOS header: the `MZ` magic and the `e_lfanew` offset to the PE header.
+    memory.write(GuestVa(base), b"MZ")?;
+    memory.write_u32(GuestVa(base + 0x3C), E_LFANEW)?;
+
+    // PE header: signature, then an `IMAGE_FILE_HEADER` with one section and
+    // a standard optional-header size. The guest reconstructs the section
+    // table from `NumberOfSections` (+6) and `SizeOfOptionalHeader` (+0x14).
+    let nt = base + E_LFANEW;
+    memory.write(GuestVa(nt), b"PE\0\0")?;
+    memory.write(GuestVa(nt + 4), &0x014C_u16.to_le_bytes())?; // Machine: i386
+    memory.write(GuestVa(nt + 6), &1_u16.to_le_bytes())?; // NumberOfSections
+    memory.write(GuestVa(nt + 0x14), &0xE0_u16.to_le_bytes())?; // SizeOfOptionalHeader
+    memory.write(GuestVa(nt + 0x18), &0x010B_u16.to_le_bytes())?; // PE32 magic
+
+    // The lone section header (at nt + 0x18 + 0xE0) stays zeroed, so its
+    // name is not `INIT` and the kernel-image section check returns cleanly.
+    memory.protect(range, MemoryPermissions::READ | MemoryPermissions::EXECUTE)?;
+    Ok(())
+}
+
 /// Derives the guest device path of the loaded image for `XeImageFileName`.
 fn image_device_name(_image: &XbeImage) -> String {
     // The retail boot medium is the DVD; XAPI derives the `D:` mount from
@@ -1030,6 +1070,22 @@ mod tests {
         assert_eq!(stop, StopReason::GuestExit { code: 0 });
         assert_eq!(emulator.cpu().gpr[1], 0x0001_0000, "the interpreted load must land");
         assert!(emulator.cpu().tsc > 0, "interpreted instructions must advance the counter");
+    }
+
+    /// The synthetic kernel image parses as a PE whose last section is not
+    /// `INIT`, so the guest's kernel-image section check returns cleanly.
+    #[test]
+    fn synthetic_kernel_image_parses_without_an_init_section() {
+        let mut emulator = Emulator::new().expect("emulator must initialize");
+        emulator.load_xbe(synthetic_xbe()).expect("image must load");
+        let memory = emulator.memory();
+
+        assert_eq!(memory.read_u32(GuestVa(0x8001_003C)).expect("read"), 0x40, "e_lfanew");
+        let nt = 0x8001_0000 + 0x40;
+        assert_eq!(memory.read_u32(GuestVa(nt)).expect("read"), 0x0000_4550, "PE signature");
+        // The address the guest computes for the last section header's name.
+        let name = memory.read_u32(GuestVa(0x8001_0138)).expect("read");
+        assert_ne!(name, 0x5449_4E49, "the last section must not be named INIT");
     }
 
     /// A boot thread that returns off its stack (to a null return address)

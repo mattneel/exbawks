@@ -20,8 +20,10 @@ pub(crate) const THREAD_EXIT_SENTINEL: GuestVa = GuestVa(0xFFBF_FFF4);
 ///
 /// Until the real allocators land (MEM-006/007), kernel blocks are
 /// bump-mapped here; the guest-visible property that matters is that every
-/// kernel pointer compares above `0x8000_0000`.
-const KERNEL_REGION_BASE: u32 = 0x8001_0000;
+/// kernel pointer compares above `0x8000_0000`. This sits above the
+/// synthetic kernel image (which the guest accesses at its fixed
+/// `0x8001_0000` base) so the two never collide.
+const KERNEL_REGION_BASE: u32 = 0x8010_0000;
 
 /// The KTHREAD block offset inside each thread's KPCR page.
 const KTHREAD_OFFSET: u32 = 0x200;

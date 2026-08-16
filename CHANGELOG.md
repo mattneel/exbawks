@@ -89,6 +89,11 @@ The project follows Keep a Changelog structure before its first release.
   (`fs:[0x20]`) at the embedded KPRCB, whose `CurrentThread` field XAPI reads;
   the retail image advances past its `KeGetCurrentThread`-style Prcb walk
   (`CORE-003`).
+- A minimal synthetic kernel PE image maps at the kernel's fixed base
+  `0x8001_0000` so titles that read the kernel image directly (parsing its
+  PE section table) find a valid DOS/PE header; the kernel object region
+  moved above it to avoid colliding with the kernel's address. The retail
+  image advances past its kernel-image section parse (`CORE-003`).
 - Implementation-burndown diagnostics: `exbawks coverage` reports
   implemented/stub/missing counts across the CPU, kernel, and GPU surfaces
   (with `--xbe` to scope the kernel surface to one image's imports), and a
