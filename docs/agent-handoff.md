@@ -139,16 +139,38 @@ Two active threads:
    execute fault's GPA is page-aligned — take the exact gate address from
    the exit RIP; SSE requires CR4 bits or every SSE op is #UD.
 
-   **Current DC3 wall (WHP tier): audio MMIO.** DC3 runs natively through
-   its whole boot, its SSE game code, and D3D/CRT init, and stops touching
-   `0xFE80_0200` from the DSOUND section — the APU register block. **Next
-   (M2): MMIO dispatch.** Route non-gate `MemoryAccess` exits by GPA region
-   (APU `0xFE80_0000`, NV2A GPU `0xFD00_0000`) to device stubs: decode the
-   faulting instruction (the exit carries instruction bytes; the interpreter
-   can execute the access against a device model), start with a
-   read-zero/write-ignore APU stub to see how far DSOUND init tolerates it,
-   then the GPU frontier (graphics HLE feeds the screenshot goal). The
-   interpreter tier remains the deterministic oracle.
+   **WHP-M2: MMIO dispatch DONE.** Device space
+   (`0xFD00_0000..0xFF00_0000`) stays unmapped; on a data-access exit the
+   engine runs exactly one interpreter step over `MmioView`
+   (`core/src/mmio.rs`) — instruction semantics come from the oracle, no
+   hand decoder. The stub latches writes for readback (device init programs
+   base addresses and rereads them), reads zero for unwritten registers,
+   answers all-ones for `0xFE82_0010` (an APU GP-DSP status the retail image
+   polls for a hardware-set bit; a zero read spins 100M+ exits), and counts
+   accesses per region (`whp heartbeat` lines carry the summary). Also
+   landed: `KeStallExecutionProcessor` (benign), `MmQueryAllocationSize`,
+   `NtSetInformationFile` (position/allocation/EOF), and a workspace-wide
+   `exbawks_whp::hardware_serial_lock()` every partition-creating test must
+   hold (parallel 64 MiB partitions hit transient
+   `HV_STATUS_INSUFFICIENT_MEMORY`, HRESULT `0xC0370008`).
+
+   **Current DC3 wall (WHP tier): DirectSoundCreate fails under the stub.**
+   DC3 initializes DSOUND far enough to load `D:\DATA\dsstdfx.bin` (the DSP
+   effects image; reads + seeks all succeed), then faults at `0x206A74`
+   dereferencing a NULL DirectSound singleton: the caller at `0x208EC1`
+   passes global `[0x22C2F0]`, which only `DirectSoundCreate` stores — the
+   create failed somewhere in its DSP setup (the error path at `0x206A66`
+   returns `0x80004005`; `[0x22BC6C]` is DSOUND's sticky error flag) and DC3
+   never checks the HRESULT, so real hardware never sees this path. **Next:
+   make DirectSoundCreate succeed** — likely a closer APU GP model: suspect
+   the dsstdfx image download into DSP scratch memory verifies by readback
+   through a different register window than it wrote (the latch keys by
+   exact address, so aliased views read zero). Diagnose with
+   `RUST_LOG=exbawks_core::mmio=trace` and diff write addresses against
+   read-back addresses right before the failure; xemu's `hw/xbox/mcpx/`
+   names the register blocks. After audio, the GPU frontier (graphics HLE
+   feeds the screenshot goal). The interpreter tier remains the
+   deterministic oracle (its frontier: `movss` at `0x1685A0`).
 
 2. **Kernel HLE burndown** (substrate-independent, needed under either
    engine). Done this session, in order the retail image demanded them:

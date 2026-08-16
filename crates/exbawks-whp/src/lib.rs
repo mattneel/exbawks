@@ -22,3 +22,17 @@ pub use machine::{
     Canceller, GuestException, HostRegion, Machine, MapFlags, MemoryAccess, Register,
     RegisterValue, VpExitContext, WhpExit,
 };
+
+/// Serializes hardware-touching tests across the workspace.
+///
+/// Concurrent partition bring-up, teardown, and large mappings are flaky on
+/// real hypervisors (transient `HV_STATUS_INSUFFICIENT_MEMORY` under
+/// parallel 64 MiB partitions), and the tier itself only ever runs one
+/// machine. Every test that creates a [`Machine`] should hold this guard.
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[doc(hidden)]
+#[must_use]
+pub fn hardware_serial_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}

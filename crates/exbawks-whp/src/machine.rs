@@ -625,12 +625,9 @@ fn decode_memory_access(payload: &[u8; 96]) -> MemoryAccess {
 mod tests {
     use super::*;
 
-    /// Serializes the hardware tests: concurrent partition bring-up and
-    /// teardown is flaky on real hypervisors, and the tier itself only ever
-    /// runs one machine.
+    /// Serializes the hardware tests across the workspace.
     fn hardware_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::hardware_serial_lock()
     }
 
     /// Skips hardware tests on hosts without a usable hypervisor.

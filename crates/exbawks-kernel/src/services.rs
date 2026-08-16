@@ -189,6 +189,16 @@ pub trait KernelServices {
         Err(KernelServiceError::Unsupported)
     }
 
+    /// Moves one open file's pointer to an absolute byte offset.
+    fn set_file_position(&mut self, _handle: u32, _offset: u64) -> Result<(), KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
+    /// Sets one open file's length (truncating or extending).
+    fn set_file_length(&mut self, _handle: u32, _length: u64) -> Result<(), KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
     /// Allocates a physically contiguous, page-rounded guest buffer.
     ///
     /// Returns the guest address of the buffer in the kernel window (ADR

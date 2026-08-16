@@ -148,6 +148,7 @@ impl EmulatorBuilder {
             threads: None,
             disc_root: None,
             hdd_root: None,
+            devices: crate::mmio::DeviceSpace::default(),
             last_relaunch_data: None,
         })
     }
@@ -176,6 +177,8 @@ pub struct Emulator {
     disc_root: Option<PathBuf>,
     /// The host directory mounted as the writable hard disk (ADR 0016).
     hdd_root: Option<PathBuf>,
+    /// The device model behind unmapped hardware register blocks (WHP-M2).
+    devices: crate::mmio::DeviceSpace,
     /// The persisted launch data of the previous relaunch (ADR 0015). A
     /// relaunch that persists identical data is a reboot loop, not progress,
     /// so the run stops instead of spinning.
@@ -920,6 +923,14 @@ impl Emulator {
                 }
                 exbawks_whp::WhpExit::MemoryAccess(access) => {
                     serviced += 1;
+                    if serviced.is_multiple_of(1 << 16) {
+                        tracing::info!(
+                            serviced,
+                            eip = format_args!("{exit_rip:#010x}"),
+                            devices = %self.devices.summary(),
+                            "whp heartbeat"
+                        );
+                    }
                     let gpa = u32::try_from(access.gpa).unwrap_or(u32::MAX);
                     // An execute fault's GPA is page-aligned, losing the
                     // slot offset; the exit RIP carries the exact gate
@@ -945,6 +956,36 @@ impl Emulator {
                             }
                             self.whp_write_cpu(&mut machine)?;
                             continue;
+                        }
+                    }
+
+                    // A data access to a hardware register block: execute
+                    // exactly one instruction on the interpreter over the
+                    // device view, so the access's own semantics come from
+                    // the oracle rather than a hand decoder (WHP-M2).
+                    if access.access_type != 2 && crate::mmio::DeviceSpace::contains(gpa, 1) {
+                        self.whp_read_cpu(&mut machine)?;
+                        let memory = self.memory.clone();
+                        let view = crate::mmio::MmioView::new(&memory, &self.devices);
+                        match exbawks_cpu::step(&mut self.cpu, &view) {
+                            Ok(()) => {
+                                self.whp_write_cpu(&mut machine)?;
+                                continue;
+                            }
+                            Err(
+                                ExecError::Unsupported { address }
+                                | ExecError::InvalidInstruction { address },
+                            ) => {
+                                return Ok(StopReason::UnsupportedInstruction { address });
+                            }
+                            Err(ExecError::Divide { address }) => {
+                                return Ok(StopReason::GuestFault { address });
+                            }
+                            Err(ExecError::Memory(error)) => {
+                                let address =
+                                    memory_fault_address(&error).unwrap_or(GuestVa(self.cpu.eip));
+                                return Ok(StopReason::GuestFault { address });
+                            }
                         }
                     }
 
@@ -2167,6 +2208,7 @@ mod tests {
         #[cfg(all(windows, target_arch = "x86_64"))]
         #[test]
         fn synthetic_title_boots_on_the_whp_tier() {
+            let _hardware = exbawks_whp::hardware_serial_lock();
             if !exbawks_whp::probe_whp().usable() {
                 eprintln!("skipping: WHP is not usable on this host");
                 return;
@@ -2185,6 +2227,42 @@ mod tests {
                 STATUS_INVALID_PARAMETER,
                 "the export status reached guest eax across the gate exit"
             );
+        }
+
+        /// A guest MMIO access on the WHP tier is absorbed by the device
+        /// stub and execution continues: the write is ignored, the read
+        /// returns zero, and the title still reaches its clean exit.
+        ///
+        /// ```text
+        /// mov eax, 0x1234
+        /// mov [0xFE800200], eax   ; APU register write -> device stub
+        /// mov esi, [0xFE800204]   ; APU register read  -> zero
+        /// call [0x11200]          ; HalReturnToFirmware(halt)
+        /// ```
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        #[test]
+        fn mmio_accesses_are_absorbed_on_the_whp_tier() {
+            const MMIO_CODE: [u8; 24] = [
+                0xB8, 0x34, 0x12, 0x00, 0x00, // mov eax, 0x1234
+                0xA3, 0x00, 0x02, 0x80, 0xFE, // mov [0xFE800200], eax
+                0x8B, 0x35, 0x04, 0x02, 0x80, 0xFE, // mov esi, [0xFE800204]
+                0x6A, 0x00, // push 0
+                0xFF, 0x15, 0x00, 0x12, 0x01, 0x00, // call [0x11200]
+            ];
+            let _hardware = exbawks_whp::hardware_serial_lock();
+            if !exbawks_whp::probe_whp().usable() {
+                eprintln!("skipping: WHP is not usable on this host");
+                return;
+            }
+            let mut emulator = Emulator::new().expect("emulator must initialize");
+            emulator
+                .load_xbe(synthetic_xbe_with(&MMIO_CODE, &[0x8000_0031]))
+                .expect("synthetic XBE must load");
+
+            let stop = emulator.run_whp(64).expect("the run must complete");
+
+            assert_eq!(stop, StopReason::GuestExit { code: 0 });
+            assert_eq!(emulator.cpu().gpr[6], 0, "the device read returned zero");
         }
 
         #[cfg(windows)]

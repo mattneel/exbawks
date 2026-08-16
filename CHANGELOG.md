@@ -260,6 +260,24 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- WHP-M2: device MMIO dispatch. Hardware register blocks
+  (`0xFD00_0000..0xFF00_0000`: NV2A GPU, MCPX APU, AC'97) stay unmapped in
+  the partition; a guest access exits and the engine executes exactly one
+  instruction on the interpreter over an `MmioView` that overlays the device
+  model onto RAM — addressing forms, read-modify-write, and flags come from
+  the oracle, not a hand decoder. The stub device model latches writes for
+  readback (device init programs base addresses and rereads them; zero
+  reads corrupt pointers), returns zero for unwritten registers, answers
+  all-ones for observed hardware-set ready bits (the APU GP-DSP status the
+  retail image polls), and counts accesses per region so a stalled boot
+  names the device it waits on. An end-to-end test drives a native guest's
+  APU write and readback through the stub to a clean exit. New exports the
+  deeper run demanded: `KeStallExecutionProcessor` (benign no-op),
+  `MmQueryAllocationSize`, and `NtSetInformationFile` (position, allocation,
+  and end-of-file classes over new file-position/length services). The
+  retail image now initializes DirectSound far enough to create its
+  title-data files, probe the config partition, and load `dsstdfx.bin` (the
+  DSP effects image) from the disc.
 - WHP-M1: the retail image runs natively on the hypervisor tier (ADR 0013).
   Guest physical RAM moved into a page-aligned, address-stable allocation
   (`exbawks-platform::AlignedBuffer`) that the partition maps directly — the

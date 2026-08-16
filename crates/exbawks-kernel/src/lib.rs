@@ -27,7 +27,9 @@ pub use ex::{
     ExQueryPoolBlockSize,
 };
 pub use export::{KernelExport, StubExport, SuccessExport};
-pub use file::{NtCreateFile, NtOpenFile, NtQueryInformationFile, NtReadFile, NtWriteFile};
+pub use file::{
+    NtCreateFile, NtOpenFile, NtQueryInformationFile, NtReadFile, NtSetInformationFile, NtWriteFile,
+};
 pub use gate::{KERNEL_GATE_BASE, KERNEL_GATE_END, gate_address, gate_ordinal};
 pub use io::{
     IoCreateSymbolicLink, IoDeleteSymbolicLink, NtOpenSymbolicLinkObject, NtQuerySymbolicLinkObject,

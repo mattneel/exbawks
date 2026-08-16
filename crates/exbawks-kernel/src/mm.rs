@@ -24,7 +24,34 @@ pub(crate) fn register_mm_exports(registry: &KernelRegistry) -> Result<(), Kerne
     registry.register(MmGetPhysicalAddress)?;
     registry.register(MmPersistContiguousMemory)?;
     registry.register(MmQueryStatistics)?;
+    registry.register(MmQueryAllocationSize)?;
     Ok(())
+}
+
+/// Reports the byte size of one contiguous allocation in EAX.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MmQueryAllocationSize;
+
+impl KernelExport for MmQueryAllocationSize {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::MM_QUERY_ALLOCATION_SIZE
+    }
+
+    fn name(&self) -> &'static str {
+        "MmQueryAllocationSize"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        4
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        let base = stack_argument(context, 0).unwrap_or(0);
+        match context.services.pool_block_size(base) {
+            Ok(size) => KernelStatus(size),
+            Err(_) => KernelStatus(0),
+        }
+    }
 }
 
 /// Answers `MM_STATISTICS` queries with a retail memory profile.

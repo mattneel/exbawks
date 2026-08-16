@@ -57,6 +57,7 @@ pub(crate) fn register_file_exports(registry: &KernelRegistry) -> Result<(), Ker
     registry.register(NtCreateFile)?;
     registry.register(NtReadFile)?;
     registry.register(NtQueryInformationFile)?;
+    registry.register(NtSetInformationFile)?;
     registry.register(NtDeviceIoControlFile)?;
     registry.register(NtQueryVolumeInformationFile)?;
     registry.register(NtWriteFile)?;
@@ -342,6 +343,63 @@ impl KernelExport for NtWriteFile {
                 write_io_status(context, iosb, status, 0);
                 status
             }
+        }
+    }
+}
+
+/// Applies position and length changes to an open file.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NtSetInformationFile;
+
+impl KernelExport for NtSetInformationFile {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::NT_SET_INFORMATION_FILE
+    }
+
+    fn name(&self) -> &'static str {
+        "NtSetInformationFile"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        20
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
+        //                      Length, FileInformationClass).
+        let (Some(handle), Some(iosb), Some(info_in), Some(length), Some(class)) = (
+            stack_argument(context, 0),
+            stack_argument(context, 1),
+            stack_argument(context, 2),
+            stack_argument(context, 3),
+            stack_argument(context, 4),
+        ) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        tracing::debug!(class, length, "NtSetInformationFile");
+        if length < 8 {
+            return buffer_too_small(context, iosb);
+        }
+        let low = context.memory.read_u32(GuestVa(info_in)).unwrap_or(0);
+        let high = context.memory.read_u32(GuestVa(info_in.wrapping_add(4))).unwrap_or(0);
+        let value = u64::from(low) | (u64::from(high) << 32);
+
+        let outcome = match class {
+            // FilePositionInformation: CurrentByteOffset.
+            FILE_POSITION_INFORMATION => context.services.set_file_position(handle, value),
+            // (19 = FileAllocationInformation, 20 = FileEndOfFileInformation)
+            // FileAllocationInformation / FileEndOfFileInformation both set
+            // the on-disk size on the host filesystem.
+            19 | 20 => context.services.set_file_length(handle, value),
+            _ => return buffer_too_small(context, iosb),
+        };
+        match outcome {
+            Ok(()) => {
+                write_io_status(context, iosb, KernelStatus::SUCCESS, 0);
+                KernelStatus::SUCCESS
+            }
+            Err(KernelServiceError::InvalidHandle) => KernelStatus::INVALID_HANDLE,
+            Err(_) => KernelStatus::ACCESS_DENIED,
         }
     }
 }

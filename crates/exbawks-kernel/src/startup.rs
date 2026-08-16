@@ -39,6 +39,8 @@ pub mod ordinal {
     pub const KE_QUERY_SYSTEM_TIME: u16 = 128;
     /// `KeRaiseIrqlToDpcLevel`.
     pub const KE_RAISE_IRQL_TO_DPC_LEVEL: u16 = 129;
+    /// `KeStallExecutionProcessor`.
+    pub const KE_STALL_EXECUTION_PROCESSOR: u16 = 151;
     /// `KfRaiseIrql`.
     pub const KF_RAISE_IRQL: u16 = 160;
     /// `KfLowerIrql`.
@@ -55,6 +57,8 @@ pub mod ordinal {
     pub const MM_GET_PHYSICAL_ADDRESS: u16 = 173;
     /// `MmPersistContiguousMemory`.
     pub const MM_PERSIST_CONTIGUOUS_MEMORY: u16 = 178;
+    /// `MmQueryAllocationSize`.
+    pub const MM_QUERY_ALLOCATION_SIZE: u16 = 180;
     /// `MmQueryStatistics`.
     pub const MM_QUERY_STATISTICS: u16 = 181;
     /// `NtAllocateVirtualMemory`.
@@ -83,6 +87,8 @@ pub mod ordinal {
     pub const NT_READ_FILE: u16 = 219;
     /// `NtSetEvent`.
     pub const NT_SET_EVENT: u16 = 225;
+    /// `NtSetInformationFile`.
+    pub const NT_SET_INFORMATION_FILE: u16 = 226;
     /// `NtWriteFile`.
     pub const NT_WRITE_FILE: u16 = 236;
     /// `PsCreateSystemThreadEx`.
@@ -115,8 +121,11 @@ const STARTUP_STUBS: [(u16, &str); 2] = [
 
 /// Benign exports that succeed as no-ops on the boot path:
 /// (ordinal, name, stdcall argument bytes).
-const BENIGN_SUCCESS: [(u16, &str, u16); 1] =
-    [(ordinal::HAL_REGISTER_SHUTDOWN_NOTIFICATION, "HalRegisterShutdownNotification", 8)];
+const BENIGN_SUCCESS: [(u16, &str, u16); 2] = [
+    (ordinal::HAL_REGISTER_SHUTDOWN_NOTIFICATION, "HalRegisterShutdownNotification", 8),
+    // A calibrated busy-wait; HLE time passes through the virtual clock.
+    (ordinal::KE_STALL_EXECUTION_PROCESSOR, "KeStallExecutionProcessor", 4),
+];
 
 /// Registers the startup export set for one synthetic guest thread.
 pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelError> {
@@ -463,7 +472,7 @@ mod tests {
         // five Ex executive exports, four IRQL exports, one Nt virtual-memory export, seven Nt
         // file exports, six Mm exports, four symbolic-link exports, two Xe
         // section exports, one benign success export, and two startup stubs.
-        assert_eq!(registry.len(), 49);
+        assert_eq!(registry.len(), 52);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,

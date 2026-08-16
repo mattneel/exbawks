@@ -626,6 +626,14 @@ impl KernelServices for ThreadManager {
         Ok(range.start())
     }
 
+    fn set_file_position(&mut self, handle: u32, offset: u64) -> Result<(), KernelServiceError> {
+        self.files.set_position(handle, offset)
+    }
+
+    fn set_file_length(&mut self, handle: u32, length: u64) -> Result<(), KernelServiceError> {
+        self.files.set_length(handle, length)
+    }
+
     fn pool_block_size(&mut self, address: u32) -> Result<u32, KernelServiceError> {
         self.pool_sizes.get(&address).copied().ok_or(KernelServiceError::NotFound)
     }

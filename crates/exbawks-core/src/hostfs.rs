@@ -251,6 +251,28 @@ impl HostFileSystem {
     }
 
     /// Writes bytes at an explicit offset or the file pointer (ADR 0016).
+    /// Moves one file's pointer to an absolute offset.
+    pub(crate) fn set_position(
+        &mut self,
+        handle: u32,
+        offset: u64,
+    ) -> Result<(), KernelServiceError> {
+        let entry = self.files.get_mut(&handle).ok_or(KernelServiceError::InvalidHandle)?;
+        entry.position = offset;
+        Ok(())
+    }
+
+    /// Sets one file's length; refused for directories and devices.
+    pub(crate) fn set_length(
+        &mut self,
+        handle: u32,
+        length: u64,
+    ) -> Result<(), KernelServiceError> {
+        let entry = self.files.get_mut(&handle).ok_or(KernelServiceError::InvalidHandle)?;
+        let file = entry.file.as_mut().ok_or(KernelServiceError::AccessDenied)?;
+        file.set_len(length).map_err(|_| KernelServiceError::AccessDenied)
+    }
+
     pub(crate) fn write(
         &mut self,
         handle: u32,
