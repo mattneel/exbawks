@@ -76,6 +76,7 @@ exbawks-types
     +-- exbawks-gpu
 
 exbawks-memory --> exbawks-platform
+exbawks-cpu    --> exbawks-memory (the ADR 0008 interpreter steps over guest memory)
 exbawks-jit    --> exbawks-cpu + exbawks-memory + exbawks-platform + exbawks-debug
 exbawks-kernel --> exbawks-cpu + exbawks-memory
 exbawks-core   --> all subsystem crates

@@ -167,6 +167,7 @@ dependencies = [
 name = "exbawks-cpu"
 version = "0.1.0"
 dependencies = [
+ "exbawks-memory",
  "exbawks-types",
  "iced-x86",
  "serde",

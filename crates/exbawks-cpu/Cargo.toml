@@ -10,6 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+exbawks-memory.workspace = true
 exbawks-types.workspace = true
 iced-x86.workspace = true
 serde.workspace = true

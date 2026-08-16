@@ -10,6 +10,8 @@ pub const AUXILIARY: u32 = 1 << 4;
 pub const ZERO: u32 = 1 << 6;
 /// The sign flag.
 pub const SIGN: u32 = 1 << 7;
+/// The direction flag.
+pub const DIRECTION: u32 = 1 << 10;
 /// The overflow flag.
 pub const OVERFLOW: u32 = 1 << 11;
 

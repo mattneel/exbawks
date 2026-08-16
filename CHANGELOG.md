@@ -52,6 +52,10 @@ The project follows Keep a Changelog structure before its first release.
   --trace-filter kernel,stop` restricts JSON Lines records to selected event
   kinds, kernel-call records carry verified export names, and kernel-related
   stop reasons print their export name (`DBG-002`).
+- The tier-0 interpreter's first stage (ADR 0008): `exbawks_cpu::step`
+  executes memory-operand and integer-ALU instructions at 8, 16, and 32-bit
+  widths over checked guest memory with architectural flag semantics and
+  typed faults (`CPU-001`).
 
 ### Fixed
 
