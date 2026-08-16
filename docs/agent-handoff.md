@@ -180,17 +180,28 @@ Two active threads:
    setup, not a clean next wall). So `0x2661BC` is the game's launch-info flag
    that XAPI's launch-data consumption sets on a real soft reboot.
 
-   **Next: make XAPI recognize the preserved launch data.** On boot 2 the game
-   reads the kernel `LaunchDataPage` (it reuses the page, skipping alloc 165)
-   but never sets `[0x2661BC]`, so DC3's statically-linked `XapiInitProcess`
-   isn't treating the (correctly preserved) page as consumable launch data.
-   Find why: likely a `dwLaunchDataType`/checksum check, `XGetLaunchInfo`, or a
-   second "this was a soft reboot" kernel signal the title expects and we do
-   not provide. Do *not* just force `0x2661BC` (DC3-specific, and it faults
-   past the gate) — set it up properly so the launch-data path runs. This is
-   deep XAPI work and converges with the broader XAPI/graphics HLE (only
-   `NullGraphicsBackend` exists), which the screenshot/frame-dump command also
-   hangs off. Tools: block-EIP ring buffer in `run_blocks` (print on `Reboot`,
+   **Next: make XAPI recognize the preserved launch data (deep, needs a
+   reference).** On boot 2 the game reads the kernel `LaunchDataPage` (it
+   reuses the page, skipping alloc 165) but never sets `[0x2661BC]`, so DC3's
+   statically-linked `XapiInitProcess` isn't treating the (correctly
+   preserved) page as consumable launch data. Facts gathered so far: the
+   `LaunchDataPage` import slot is `0x25058C` (patched to the ordinal-164 cell
+   `0x8010_0080`, verified restored to the page); the consume-and-free path is
+   at `0x1A64A7` (`mov eax,[0x25058C]; mov ecx,[eax]; and [eax],0; push ecx;
+   call [0x250590]` — `0x250590` is `MmFreeContiguousMemory`); there are 14
+   references to `0x25058C`, four of them *outside* the launch function
+   (`~0x1AA54A`, `~0x1AA580`, `~0x1AACC8`, `~0x1AADB0`) that are the likely
+   early `XapiInitProcess` consume; and `[0x2661BC]` is **never written via
+   its address anywhere in the image** (`.data+0x7C`, zero in the file), so it
+   is set only by a memcpy of launch data over `.data` or a computed pointer —
+   not a simple store. This is past the point where blind disassembly pays
+   off; the productive path is to compare against an XAPI reference
+   (Cxbx-Reloaded / xemu / nxdk `XapiInitProcess`/`XGetLaunchInfo`) to learn
+   what a correct environment provides that we do not, then implement it. It
+   converges with the broader XAPI/graphics HLE (only `NullGraphicsBackend`
+   exists), which the screenshot/frame-dump command also hangs off. Do *not*
+   just force `0x2661BC` (DC3-specific, and it faults at `0x8023_0000` past the
+   gate). Tools: block-EIP ring buffer in `run_blocks` (print on `Reboot`,
    then revert); `decode --hex <bytes> --ip <va>` with `.text` file offset
    `0x1000 + (va - 0x11000)`; `run --trace <f> --trace-filter kernel,stop`
    split at each `HalReturnToFirmware` (49).
