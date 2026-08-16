@@ -107,7 +107,7 @@ oracle/golden tier and the hand-written JIT track dropped. `exbawks-whp` has
 begun (capability doctor; `exbawks doctor` confirms WHP is usable on the
 build host). `docs/whp-notes.md` holds the full partition/boot/exit API
 reference. Diagnostics: `exbawks coverage` reports the implemented/stub/
-missing burndown across CPU/kernel/GPU surfaces (DC3: 5/7/140 of 152 imports).
+missing burndown across CPU/kernel/GPU surfaces (DC3: 24/4/124 of 152 imports).
 
 Two active threads:
 
@@ -125,28 +125,35 @@ Two active threads:
    attribute bits.
 
 2. **Kernel HLE burndown** (substrate-independent, needed under either
-   engine). Done this session: `KRN-002` (data exports), the boot-thread
-   null-return exit, the Rtl critical-section family (`HLE-007` first slice:
-   277/291/294 as recursion-counted no-ops on the guest `RTL_CRITICAL_SECTION`),
-   and the KPCR `Prcb` pointer (`fs:[0x20]` → embedded KPRCB →
-   `CurrentThread`). DC3's game thread now runs its whole XAPI/CRT init prefix.
+   engine). Done this session, in order the retail image demanded them:
+   `CORE-004` (gate dispatch when EIP *enters* the gate region, for the
+   `mov reg,[slot]; call reg` and `jmp [slot]` forms, not only a decoded
+   `call [slot]`); `ExQueryNonVolatileSetting` (a synthetic NTSC-U EEPROM
+   profile); `RtlNtStatusToDosError`; `KeInitializeDpc`/`KeInitializeTimerEx`/
+   `KeSetTimer` (dispatcher objects; timers do not fire yet);
+   `NtAllocateVirtualMemory` (the user-range reserve/commit allocator — the
+   Mm/physical-memory model the earlier wall needed, `HLE-003`); the host file
+   device (ADR 0014: `NtOpenFile`/`NtCreateFile`/`NtReadFile`/
+   `NtQueryInformationFile` over a sandboxed read-only disc mount, `HLE-004`);
+   and the `Mm*` contiguous family (`MmAllocateContiguousMemory`(+`Ex`),
+   `MmGetPhysicalAddress`, `MmFreeContiguousMemory`, `MmPersistContiguousMemory`,
+   `HLE-009`). A directory/device object now opens as a zero-size marker so the
+   disc/HDD presence check passes. The retail image runs its **entire early
+   initialization** — EEPROM probe, heap allocation, disc/HDD presence check,
+   contiguous GPU-buffer allocation — with no reboot.
 
-   **Current DC3 wall: a physical-memory-window scan.** At guest `0x1AB874`
-   the game thread does `cmp dword ptr [eax], 0x54494E49` ("INIT") with
-   `eax = 0x8000FFF0`, scanning the cached physical window
-   (`0x8000_0000 | PA`) backward from `0x80010000` for an "INIT"-tagged
-   structure — and faults because we only map narrow kernel regions there
-   (kernel-vars at `0x8001_0000`, KPCR pages above it), not the physical RAM.
-   This is the **Mm / physical-memory model** (`MEM-006`/`MEM-007` +
-   `HLE-009`): the guest expects the whole physical RAM aliased into the
-   `0x8000_0000` window and expects to find kernel/pool structures tagged
-   there. This is a larger task than the per-export walls above — it needs the
-   physical allocator, the cached-window aliasing, and likely a synthesized
-   kernel/pool structure carrying the "INIT" tag the scan looks for. Expect
-   `NtAllocateVirtualMemory` (184) and the `Mm*` contiguous family nearby.
-   `KRN-003` (virtual clock, to tick the `KeTickCount` cell) is independent.
-   Use `exbawks coverage --surface kernel --xbe <dc3> --missing` for the live
-   gap list.
+   **Current DC3 wall: a disc device IOCTL.** The game thread calls
+   `NtDeviceIoControlFile` (ordinal 196) on the disc device handle — a media
+   detection / drive-geometry query. Implementing it needs a minimal disc
+   device: recognize the IoControlCode, return plausible geometry/media data
+   in the output buffer, set `IoStatusBlock`. After that the game should
+   `NtReadFile` real assets from the disc mount (the read path already works;
+   `read_file` returns bytes and the export copies them into guest memory).
+   Then the long pole is graphics HLE (only `NullGraphicsBackend` exists),
+   which is what the requested screenshot/frame-dump command ultimately hangs
+   off. `KRN-003` (virtual clock, to tick the `KeTickCount` cell) is
+   independent. Use `exbawks coverage --surface kernel --xbe <dc3> --missing`
+   for the live gap list.
 
 The retail image stays outside the repository; automated tests remain
 synthetic.
