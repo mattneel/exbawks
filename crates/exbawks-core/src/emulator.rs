@@ -78,6 +78,18 @@ const GUEST_STACK_BYTES: u32 = 64 * 1024;
 /// The scratch bytes kept above the initial stack pointer.
 const GUEST_STACK_SCRATCH: u32 = 16;
 
+/// The guest address of the global descriptor table.
+///
+/// It sits on the second physical page, inside the low range the loader
+/// reserves for the emulator's own structures (ADR 0010), addressed through
+/// the cached physical window; guest-linear equals guest-physical with
+/// paging off, so this is the address the processor loads descriptors from.
+const GDT_WINDOW_VA: u32 = 0x8000_1000;
+/// The descriptor table's byte size: null, code, data, and `fs` entries.
+const GDT_BYTES: u16 = 4 * 8;
+/// The selector naming the `fs` descriptor (index 3).
+const GDT_FS_SELECTOR: u16 = 0x18;
+
 /// A decoded and compiled plan for the current XBE entry block.
 #[derive(Debug, Clone)]
 pub struct EntryBlockPlan {
@@ -426,6 +438,25 @@ impl Emulator {
         caller: GuestVa,
     ) -> Result<GateAssist, CoreError> {
         tracing::trace!(ordinal, name = export.name(), "dispatching kernel gate call");
+        // A named ordinal's call frame, for tracking a value (an HRESULT, a
+        // handle) through guest code that never stores it to memory.
+        if std::env::var("EXBAWKS_GATE_FRAME").is_ok_and(|value| {
+            value.split(',').any(|wanted| wanted.trim().parse::<u16>() == Ok(ordinal))
+        }) {
+            let esp = self.cpu.gpr[4];
+            let mut stack = String::new();
+            for slot in 0..24_u32 {
+                let value = self.memory.read_u32(GuestVa(esp + slot * 4)).unwrap_or(0);
+                stack.push_str(&format!("{value:#010x} "));
+            }
+            tracing::info!(
+                ordinal,
+                name = export.name(),
+                registers = format_args!("{:08x?}", self.cpu.gpr),
+                %stack,
+                "kernel gate frame"
+            );
+        }
         self.trace.record(TraceEvent::KernelCall {
             ordinal,
             name: exbawks_kernel::kernel_ordinal_info(ordinal).map(|info| info.name.to_owned()),
@@ -1113,6 +1144,25 @@ impl Emulator {
                                 .is_some_and(ThreadManager::active_exits_on_null_return);
                         if fault_va == THREAD_EXIT_SENTINEL.0 || null_exit {
                             self.whp_read_cpu(&mut machine)?;
+                            // The exiting thread's stack residue: the return
+                            // addresses just popped name the unwind path.
+                            if tracing::enabled!(tracing::Level::DEBUG) {
+                                let esp = self.cpu.gpr[4];
+                                let mut stack = String::new();
+                                // Below the pointer: frames the return path
+                                // already popped (most recent last).
+                                for slot in (1..=24_u32).rev() {
+                                    let at = esp.wrapping_sub(slot * 4);
+                                    let value = self.memory.read_u32(GuestVa(at)).unwrap_or(0);
+                                    stack.push_str(&format!("{value:#010x} "));
+                                }
+                                tracing::debug!(
+                                    esp = format_args!("{esp:#010x}"),
+                                    eax = format_args!("{:#010x}", self.cpu.gpr[0]),
+                                    %stack,
+                                    "thread exit"
+                                );
+                            }
                             if let Some(stop) = self.exit_current_thread(self.cpu.gpr[0]) {
                                 return Ok(stop);
                             }
@@ -1159,6 +1209,12 @@ impl Emulator {
                                 return Ok(StopReason::GuestFault { address });
                             }
                             Err(ExecError::Memory(error)) => {
+                                tracing::debug!(
+                                    eip = format_args!("{:#010x}", self.cpu.eip),
+                                    gpa = format_args!("{gpa:#010x}"),
+                                    %error,
+                                    "the device step faulted"
+                                );
                                 let address =
                                     memory_fault_address(&error).unwrap_or(GuestVa(self.cpu.eip));
                                 return Ok(StopReason::GuestFault { address });
@@ -1195,6 +1251,12 @@ impl Emulator {
                             gva_valid = access.gva_valid,
                             "unhandled memory-access exit"
                         );
+                        if let Some(threads) = &self.threads {
+                            tracing::debug!(
+                                threads = %threads.describe_threads(),
+                                "thread states at fault"
+                            );
+                        }
                         return Ok(StopReason::GuestFault { address: GuestVa(fault_va) });
                     };
 
@@ -1275,6 +1337,12 @@ impl Emulator {
                 exbawks_whp::WhpExit::Exception(exception) => {
                     self.whp_read_cpu(&mut machine)?;
                     let rip = u32::try_from(exit_rip).unwrap_or(u32::MAX);
+                    tracing::debug!(
+                        vector = exception.vector,
+                        parameter = format_args!("{:#x}", exception.parameter),
+                        rip = format_args!("{rip:#010x}"),
+                        "guest exception exit"
+                    );
                     return Ok(match exception.vector {
                         // #UD: the instruction itself is the story.
                         6 => StopReason::UnsupportedInstruction { address: GuestVa(rip) },
@@ -1298,6 +1366,11 @@ impl Emulator {
                 }
                 exbawks_whp::WhpExit::UnrecoverableException => {
                     self.whp_read_cpu(&mut machine)?;
+                    tracing::debug!(
+                        rip = format_args!("{:#010x}", self.cpu.eip),
+                        esp = format_args!("{:#010x}", self.cpu.gpr[4]),
+                        "unrecoverable guest exception"
+                    );
                     return Ok(StopReason::GuestFault {
                         address: GuestVa(u32::try_from(exit_rip).unwrap_or(u32::MAX)),
                     });
@@ -1320,8 +1393,49 @@ impl Emulator {
         machine
             .set_boot_state_32(self.cpu.eip, self.cpu.gpr[4])
             .map_err(|error| CoreError::Hypervisor(error.to_string()))?;
+        self.write_descriptor_table();
+        machine
+            .set_gdt(GDT_WINDOW_VA, GDT_BYTES - 1)
+            .map_err(|error| CoreError::Hypervisor(error.to_string()))?;
         self.whp_write_cpu(&mut machine)?;
         Ok(machine)
+    }
+
+    /// Writes the guest's global descriptor table.
+    ///
+    /// Four entries: the null descriptor, the flat code and data segments
+    /// the boot state loads, and the `fs` descriptor carrying the running
+    /// thread's KPCR base — so a guest that reloads `fs` from its selector
+    /// keeps reaching its own processor block.
+    fn write_descriptor_table(&self) {
+        /// A present, 32-bit, page-granular descriptor's high dword for a
+        /// base of zero: limit 0xFFFFF with the type in bits 8..12.
+        fn descriptor(base: u32, limit: u32, access: u32) -> (u32, u32) {
+            let low = (limit & 0xFFFF) | (base << 16);
+            let high = ((base >> 16) & 0xFF)
+                | (access << 8)
+                | (limit & 0x000F_0000)
+                | 0x00C0_0000
+                | (base & 0xFF00_0000);
+            (low, high)
+        }
+        /// Present, ring 0, code segment: execute/read.
+        const CODE_ACCESS: u32 = 0x9B;
+        /// Present, ring 0, data segment: read/write.
+        const DATA_ACCESS: u32 = 0x93;
+
+        let fs_base = self.cpu.segments[exbawks_cpu::Segment::Fs as usize].base;
+        let entries = [
+            (0, 0),
+            descriptor(0, 0xF_FFFF, CODE_ACCESS),
+            descriptor(0, 0xF_FFFF, DATA_ACCESS),
+            descriptor(fs_base, 0xF_FFFF, DATA_ACCESS),
+        ];
+        for (index, (low, high)) in entries.iter().enumerate() {
+            let at = GDT_WINDOW_VA + index as u32 * 8;
+            let _ = self.memory.write_u32(GuestVa(at), *low);
+            let _ = self.memory.write_u32(GuestVa(at + 4), *high);
+        }
     }
 
     /// Mirrors the software page table into the partition's GPA space.
@@ -1391,6 +1505,9 @@ impl Emulator {
         use exbawks_whp::{Register, RegisterValue};
 
         let fs_base = u64::from(self.cpu.segments[exbawks_cpu::Segment::Fs as usize].base);
+        // The descriptor the `fs` selector names must agree with the base
+        // loaded here, or a guest segment reload would lose the KPCR.
+        self.write_descriptor_table();
         machine
             .set_registers(&[
                 (Register::Rax, RegisterValue::scalar(u64::from(self.cpu.gpr[0]))),
@@ -1404,7 +1521,10 @@ impl Emulator {
                 (Register::Rip, RegisterValue::scalar(u64::from(self.cpu.eip))),
                 (Register::Rflags, RegisterValue::scalar(u64::from(self.cpu.eflags | 0x2))),
                 // The flat data segment with the thread's KPCR base.
-                (Register::Fs, RegisterValue::segment(fs_base, 0xFFFF_FFFF, 0x10, 0xC093)),
+                (
+                    Register::Fs,
+                    RegisterValue::segment(fs_base, 0xFFFF_FFFF, GDT_FS_SELECTOR, 0xC093),
+                ),
             ])
             .map_err(|error| CoreError::Hypervisor(error.to_string()))
     }

@@ -106,6 +106,13 @@ impl RegisterValue {
             high: (limit as u64) | ((selector as u64) << 32) | ((attributes as u64) << 48),
         }
     }
+
+    /// A `WHV_X64_TABLE_REGISTER` value: three padding words then the byte
+    /// limit fill the low quadword; the table's base fills the high one.
+    #[must_use]
+    pub const fn table(base: u64, limit: u16) -> Self {
+        Self { low: (limit as u64) << 48, high: base }
+    }
 }
 
 /// `WHV_VP_EXIT_CONTEXT`: the per-exit processor snapshot.
@@ -547,6 +554,16 @@ impl Machine {
             (Register::Rip, RegisterValue::scalar(u64::from(entry))),
             (Register::Rsp, RegisterValue::scalar(u64::from(stack_pointer))),
         ])
+    }
+
+    /// Points the global descriptor table at guest memory.
+    ///
+    /// The boot state loads segment registers with their descriptors
+    /// already cached, which is enough to execute — but any guest segment
+    /// load (`pop es`, `mov ds, ax`) re-reads the descriptor from this
+    /// table, and faults with `#GP` when it is empty.
+    pub fn set_gdt(&mut self, base: u32, limit: u16) -> Result<(), WhpError> {
+        self.set_registers(&[(Register::Gdtr, RegisterValue::table(u64::from(base), limit))])
     }
 
     /// Runs the processor until the next exit and decodes it.
