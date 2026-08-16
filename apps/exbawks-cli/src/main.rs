@@ -223,12 +223,14 @@ struct DoctorReport {
     #[serde(flatten)]
     capabilities: HostCapabilities,
     memory: Option<SystemMemoryInfo>,
+    whp: exbawks_whp::WhpAvailability,
 }
 
 fn doctor(json: bool) -> Result<()> {
     let report = DoctorReport {
         capabilities: probe_host_capabilities(),
         memory: query_system_memory_info().ok(),
+        whp: exbawks_whp::probe_whp(),
     };
 
     if json {
@@ -241,6 +243,9 @@ fn doctor(json: bool) -> Result<()> {
     println!("Windows x86-64 target:  {}", yes_no(capabilities.supported_runtime_target));
     println!("Placeholder views:      {}", yes_no(capabilities.placeholder_views));
     println!("FSGSBASE available:     {}", yes_no(capabilities.fsgsbase));
+    println!("WHP library present:    {}", yes_no(report.whp.library_present));
+    println!("WHP hypervisor present: {}", yes_no(report.whp.hypervisor_present));
+    println!("WHP execution tier:     {}", yes_no(report.whp.usable()));
     match report.memory {
         Some(memory) => {
             println!("Host page size:         {} bytes", memory.page_size);
@@ -555,9 +560,10 @@ fn diagnose_stop(emulator: &exbawks_core::Emulator, stop: &StopReason) -> Option
             (
                 "kernel HLE surface reached an unimplemented export".to_owned(),
                 format!("calls {name} (ordinal {ordinal}) — {state}"),
-                Some(format!(
+                Some(
                     "burndown: run `exbawks coverage --surface kernel --missing` for the gap list"
-                )),
+                        .to_owned(),
+                ),
             )
         }
         StopReason::UnsupportedInstruction { .. } => (

@@ -19,6 +19,7 @@ exbawks-cpu.workspace = true
 exbawks-debug.workspace = true
 exbawks-kernel.workspace = true
 exbawks-memory.workspace = true
+exbawks-whp.workspace = true
 miette = { workspace = true, features = ["fancy"] }
 exbawks-platform.workspace = true
 exbawks-types.workspace = true

@@ -11,6 +11,7 @@ members = [
     "crates/exbawks-memory",
     "crates/exbawks-platform",
     "crates/exbawks-types",
+    "crates/exbawks-whp",
     "crates/exbawks-xbe",
     "xtask",
 ]
@@ -46,6 +47,7 @@ exbawks-kernel = { path = "crates/exbawks-kernel" }
 exbawks-memory = { path = "crates/exbawks-memory" }
 exbawks-platform = { path = "crates/exbawks-platform" }
 exbawks-types = { path = "crates/exbawks-types" }
+exbawks-whp = { path = "crates/exbawks-whp" }
 exbawks-xbe = { path = "crates/exbawks-xbe" }
 
 [workspace.lints.rust]

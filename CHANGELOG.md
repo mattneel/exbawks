@@ -85,6 +85,10 @@ The project follows Keep a Changelog structure before its first release.
   (with `--xbe` to scope the kernel surface to one image's imports), and a
   run that stops at a coverage gap renders an ariadne-annotated call site
   with miette-style diagnostics.
+- The `exbawks-whp` crate begins the WHP execution tier (ADR 0013): a
+  capability doctor that dynamically loads `WinHvPlatform.dll` and reports
+  library/hypervisor/tier availability without breaking the CLI on hosts
+  without WHP. `exbawks doctor` now reports WHP status.
 
 ### Fixed
 
