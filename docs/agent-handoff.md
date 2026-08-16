@@ -166,31 +166,34 @@ Two active threads:
    not satisfy. The loop detector (identical persisted data → stop) ends the
    run at `Reboot { routine: 2 }` after one relaunch instead of spinning.
 
-   **What the disassembly shows (partial).** The launch-data setup at guest
-   `0x1A6462` walks an XAPI registration list through the global at
-   `ds:[0x25058C]` (with a callback fn-ptr at `ds:[0x250590]`) and, per entry,
-   compares `entry[+4]` against `[[0x10118]+8]` — a process/identity field of
-   an XAPI global rooted at `0x10118` (an image-header-region global). So the
-   relaunch is gated by **XAPI boot state** (a registration walk + an
-   identity match), not the simple video value earlier suspected; DC3's known
-   video/vblank sensitivity may still matter downstream, but this decision is
-   XAPI infrastructure. The *top-level* "should I relaunch" test is further up
-   the call chain (above the launch helper at `0x1A6381`, called from
-   `0x1A64F9`) and is not yet pinned down.
+   **The relaunch gate is a single global: `[0x2661BC]`.** A block-EIP ring
+   buffer over `run_blocks` (temporary, reverted) pinned the exact path. The
+   deciding function `Q` at guest `0x1A633F` (called with `(0, &buf)` from
+   `0x1AA173`) tests `cmp [0x2661BC], 0` at `0x1A6355` and `jne 0x1A6372`: when
+   `[0x2661BC] == 0` it falls through and calls `XLaunchNewImage`
+   (`P` at `0x1AB046`, which with a null image-path arg calls the launch
+   routine `H` at `0x1A64E5`, which builds the `LAUNCH_DATA_PAGE` and reboots
+   at `0x1A651B`). `[0x2661BC]` stays 0 in our environment, so it relaunches
+   every boot. Confirmed by experiment: forcing `[0x2661BC]` non-zero after the
+   relaunch makes the second boot skip the relaunch and proceed — to a new
+   `GuestFault` at `0x8023_0000` (likely an artifact of bypassing the proper
+   setup, not a clean next wall). So `0x2661BC` is the game's launch-info flag
+   that XAPI's launch-data consumption sets on a real soft reboot.
 
-   **Next: pin the upstream relaunch condition.** Ring-buffer the block EIPs in
-   `run_blocks` (print on the `Reboot` stop, then revert) to capture the exact
-   path into the launch helper, then disassemble the deciding branch. Likely
-   it needs more XAPI environment fidelity (the `0x25058C` registration list,
-   the `0x10118` process globals, or a notification/callback the title
-   registers) rather than one canned value. This converges with the broader
-   XAPI/graphics HLE work (only `NullGraphicsBackend` exists), which the
-   requested screenshot/frame-dump command also hangs off. Once past it the
-   game should `NtReadFile` real assets (the read path already works).
-   `KRN-003` (virtual clock) is independent. Disassemble with `decode --hex
-   <bytes> --ip <va>` after slicing `.text` at file offset `0x1000 + (va -
-   0x11000)`; trace boots with `run --trace <f> --trace-filter kernel,stop`
-   and split at each `HalReturnToFirmware` (ordinal 49).
+   **Next: make XAPI recognize the preserved launch data.** On boot 2 the game
+   reads the kernel `LaunchDataPage` (it reuses the page, skipping alloc 165)
+   but never sets `[0x2661BC]`, so DC3's statically-linked `XapiInitProcess`
+   isn't treating the (correctly preserved) page as consumable launch data.
+   Find why: likely a `dwLaunchDataType`/checksum check, `XGetLaunchInfo`, or a
+   second "this was a soft reboot" kernel signal the title expects and we do
+   not provide. Do *not* just force `0x2661BC` (DC3-specific, and it faults
+   past the gate) — set it up properly so the launch-data path runs. This is
+   deep XAPI work and converges with the broader XAPI/graphics HLE (only
+   `NullGraphicsBackend` exists), which the screenshot/frame-dump command also
+   hangs off. Tools: block-EIP ring buffer in `run_blocks` (print on `Reboot`,
+   then revert); `decode --hex <bytes> --ip <va>` with `.text` file offset
+   `0x1000 + (va - 0x11000)`; `run --trace <f> --trace-filter kernel,stop`
+   split at each `HalReturnToFirmware` (49).
 
 The retail image stays outside the repository; automated tests remain
 synthetic.
