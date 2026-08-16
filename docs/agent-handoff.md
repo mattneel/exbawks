@@ -180,31 +180,34 @@ Two active threads:
    setup, not a clean next wall). So `0x2661BC` is the game's launch-info flag
    that XAPI's launch-data consumption sets on a real soft reboot.
 
-   **Next: make XAPI recognize the preserved launch data (deep, needs a
-   reference).** On boot 2 the game reads the kernel `LaunchDataPage` (it
-   reuses the page, skipping alloc 165) but never sets `[0x2661BC]`, so DC3's
-   statically-linked `XapiInitProcess` isn't treating the (correctly
-   preserved) page as consumable launch data. Facts gathered so far: the
-   `LaunchDataPage` import slot is `0x25058C` (patched to the ordinal-164 cell
-   `0x8010_0080`, verified restored to the page); the consume-and-free path is
-   at `0x1A64A7` (`mov eax,[0x25058C]; mov ecx,[eax]; and [eax],0; push ecx;
-   call [0x250590]` — `0x250590` is `MmFreeContiguousMemory`); there are 14
-   references to `0x25058C`, four of them *outside* the launch function
-   (`~0x1AA54A`, `~0x1AA580`, `~0x1AACC8`, `~0x1AADB0`) that are the likely
-   early `XapiInitProcess` consume; and `[0x2661BC]` is **never written via
-   its address anywhere in the image** (`.data+0x7C`, zero in the file), so it
-   is set only by a memcpy of launch data over `.data` or a computed pointer —
-   not a simple store. This is past the point where blind disassembly pays
-   off; the productive path is to compare against an XAPI reference
-   (Cxbx-Reloaded / xemu / nxdk `XapiInitProcess`/`XGetLaunchInfo`) to learn
-   what a correct environment provides that we do not, then implement it. It
-   converges with the broader XAPI/graphics HLE (only `NullGraphicsBackend`
-   exists), which the screenshot/frame-dump command also hangs off. Do *not*
-   just force `0x2661BC` (DC3-specific, and it faults at `0x8023_0000` past the
-   gate). Tools: block-EIP ring buffer in `run_blocks` (print on `Reboot`,
-   then revert); `decode --hex <bytes> --ip <va>` with `.text` file offset
-   `0x1000 + (va - 0x11000)`; `run --trace <f> --trace-filter kernel,stop`
-   split at each `HalReturnToFirmware` (49).
+   **Reference pass done; the gate is NOT launch-data-driven.** Per
+   xboxdevwiki `Kernel/LaunchDataPage` the launch-data types are: 0
+   switch-to-title, 1 switch-to-dashboard, 2 switch-**from**-dashboard, 3
+   debugger, 4/6 title update, `0xFFFFFFFF` none. DC3's page is type **1**. The
+   hypothesis "DC3 bails because it wasn't launched *from* the dashboard" was
+   tested by injecting a synthetic type-2 `LaunchDataPage` on cold boot —
+   **no effect**, DC3 relaunched identically. So `[0x2661BC]` is independent of
+   the `LaunchDataPage`. It is a slot in a tiny section `[0x2661BC, 0x2661C0)`
+   (`.data+0x7C`, zero in the file) that is **never written via its address**;
+   the only code touching that structure is a CRT/XAPI-init-style iterator loop
+   at `0x1B66xx` (it references `0x2661A8`–`0x2661B8` and `0x62CCB0`). The slot
+   is an *unregistered* init entry — on real hardware something registers it (a
+   `__declspec(allocate)` section item or a runtime registration our
+   environment never triggers). Forcing `0x2661BC` non-zero confirms it gates
+   run-vs-reboot but then faults at `0x8023_0000`, so the real init sets up
+   other state too: this is a broad XAPI/CRT-init gap, not one value.
+
+   **Recommended next step (multi-session, pick one):** (a) *scout ahead* —
+   force past the gate **and** handle the `0x8023_0000` access — to map the
+   real remaining walls and size the graphics work before committing to it; or
+   (b) *diff DC3's early init against a reference* (Cxbx-Reloaded HLE
+   `EmuXapi`/`EmuKrnl*`, or a live xemu execution trace) to find what registers
+   the `0x1B66xx` init entry. Both converge with the broader XAPI/graphics HLE
+   (only `NullGraphicsBackend` exists), which the screenshot/frame-dump command
+   also needs. Tools: block-EIP ring buffer in `run_blocks` (print on `Reboot`,
+   revert); `decode --hex <bytes> --ip <va>` with `.text` file offset `0x1000 +
+   (va - 0x11000)`; `run --trace <f> --trace-filter kernel,stop` split at each
+   `HalReturnToFirmware` (49).
 
 The retail image stays outside the repository; automated tests remain
 synthetic.
