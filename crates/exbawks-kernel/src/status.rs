@@ -14,6 +14,8 @@ impl KernelStatus {
     pub const ACCESS_VIOLATION: Self = Self(0xC000_0005);
     /// Insufficient guest resources exist to complete the request.
     pub const INSUFFICIENT_RESOURCES: Self = Self(0xC000_009A);
+    /// Not enough virtual memory or paging files exist for the request.
+    pub const NO_MEMORY: Self = Self(0xC000_0017);
     /// A handle value does not name an open object.
     pub const INVALID_HANDLE: Self = Self(0xC000_0008);
     /// The caller's buffer is too small for the returned data.

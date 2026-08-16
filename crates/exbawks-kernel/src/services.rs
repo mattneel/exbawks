@@ -34,6 +34,32 @@ pub struct ThreadCreated {
     pub kthread: GuestVa,
 }
 
+/// A request to reserve and/or commit guest virtual memory.
+///
+/// Field meanings follow `NtAllocateVirtualMemory`. The raw Win32
+/// `AllocationType` and `Protect` flags travel unchanged so the emulator
+/// side owns their mapping to guest page permissions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualAllocRequest {
+    /// The requested base address, or zero for kernel-chosen placement.
+    pub base: u32,
+    /// The requested region size in bytes.
+    pub size: u32,
+    /// The Win32 `MEM_*` allocation-type flags.
+    pub allocation_type: u32,
+    /// The Win32 `PAGE_*` protection flags.
+    pub protect: u32,
+}
+
+/// The placement one allocation received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualAllocation {
+    /// The page-aligned base the allocation received.
+    pub base: GuestVa,
+    /// The page-rounded region size in bytes.
+    pub size: u32,
+}
+
 /// A kernel service failure.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum KernelServiceError {
@@ -66,6 +92,17 @@ pub trait KernelServices {
     /// Returns `true` when the handle was open, `false` for an unknown
     /// handle so the caller can report `STATUS_INVALID_HANDLE`.
     fn close_handle(&mut self, handle: u32) -> bool;
+
+    /// Reserves and/or commits a guest virtual-memory region.
+    ///
+    /// Returns the placement the request received. Commit maps physical
+    /// pages; a reserve-only request records the address range without
+    /// backing it. `ResourceExhausted` reports either address-space or
+    /// physical-memory exhaustion.
+    fn allocate_virtual_memory(
+        &mut self,
+        request: VirtualAllocRequest,
+    ) -> Result<VirtualAllocation, KernelServiceError>;
 }
 
 /// A services implementation for contexts without an emulator.
@@ -84,5 +121,12 @@ impl KernelServices for UnsupportedServices {
 
     fn close_handle(&mut self, _handle: u32) -> bool {
         false
+    }
+
+    fn allocate_virtual_memory(
+        &mut self,
+        _request: VirtualAllocRequest,
+    ) -> Result<VirtualAllocation, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
     }
 }

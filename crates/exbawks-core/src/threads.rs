@@ -4,7 +4,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use exbawks_cpu::{CpuState, Segment, SegmentState};
-use exbawks_kernel::{KernelServiceError, KernelServices, ThreadCreateRequest, ThreadCreated};
+use exbawks_kernel::{
+    KernelServiceError, KernelServices, ThreadCreateRequest, ThreadCreated, VirtualAllocRequest,
+    VirtualAllocation,
+};
 use exbawks_memory::{GuestMemory, MemoryError, SoftwareAddressSpace};
 use exbawks_types::{GUEST_PAGE_SIZE, GuestRange, GuestVa, MemoryPermissions};
 
@@ -24,6 +27,21 @@ pub(crate) const THREAD_EXIT_SENTINEL: GuestVa = GuestVa(0xFFBF_FFF4);
 /// synthetic kernel image (which the guest accesses at its fixed
 /// `0x8001_0000` base) so the two never collide.
 const KERNEL_REGION_BASE: u32 = 0x8010_0000;
+
+/// The first virtual address the user-space allocator hands out (ADR 0010).
+///
+/// `NtAllocateVirtualMemory` results live in the user range
+/// (`0x0001_0000`–`0x7FFF_FFFF`). This base sits above the mapped image and
+/// boot stack (which reach into the low 64 MiB) and well below the kernel
+/// region, so kernel-chosen allocations never collide with either.
+const USER_ALLOC_BASE: u32 = 0x1000_0000;
+
+/// One past the last address the user allocator may hand out, leaving
+/// headroom below the `0x8000_0000` kernel boundary.
+const USER_ALLOC_END: u32 = 0x7F00_0000;
+
+/// The Win32 `MEM_COMMIT` allocation-type flag: back the range with pages.
+const MEM_COMMIT: u32 = 0x0000_1000;
 
 /// The KTHREAD block offset inside each thread's KPCR page.
 const KTHREAD_OFFSET: u32 = 0x200;
@@ -90,6 +108,10 @@ pub(crate) struct ThreadManager {
     pending: Option<PendingAction>,
     kernel_cursor: u32,
     kernel_region_end: u32,
+    /// The next free user-space address `NtAllocateVirtualMemory` hands out
+    /// for a kernel-chosen (`BaseAddress == 0`) allocation. A forward bump
+    /// until the real VA region map lands (MEM-007).
+    user_cursor: u32,
     /// Open guest handles (minimal object table; the full object manager is
     /// HLE-005). Thread creation registers its handle here.
     handles: HashSet<u32>,
@@ -109,6 +131,7 @@ impl ThreadManager {
             pending: None,
             kernel_cursor: KERNEL_REGION_BASE,
             kernel_region_end,
+            user_cursor: USER_ALLOC_BASE,
             handles: HashSet::new(),
         }
     }
@@ -357,5 +380,135 @@ impl KernelServices for ThreadManager {
 
     fn close_handle(&mut self, handle: u32) -> bool {
         self.handles.remove(&handle)
+    }
+
+    fn allocate_virtual_memory(
+        &mut self,
+        request: VirtualAllocRequest,
+    ) -> Result<VirtualAllocation, KernelServiceError> {
+        let page = GUEST_PAGE_SIZE;
+        // Round the base down to its page and the size up to cover the whole
+        // requested span from that page, matching the kernel's own rounding.
+        let offset = request.base % page;
+        let span = request.size.saturating_add(offset);
+        let rounded = span.max(1).div_ceil(page).saturating_mul(page);
+
+        let base = if request.base == 0 {
+            let start = self.user_cursor;
+            let end = start
+                .checked_add(rounded)
+                .filter(|end| *end <= USER_ALLOC_END)
+                .ok_or(KernelServiceError::ResourceExhausted)?;
+            self.user_cursor = end;
+            start
+        } else {
+            request.base - offset
+        };
+
+        // Commit maps physical pages now; a reserve-only request leaves the
+        // range unbacked (the real reserve/commit region map is MEM-007), so
+        // an access before a later commit faults as it should.
+        if request.allocation_type & MEM_COMMIT != 0 {
+            let range = GuestRange::new(GuestVa(base), u64::from(rounded))
+                .map_err(|_| KernelServiceError::ResourceExhausted)?;
+            let permissions = protect_to_permissions(request.protect);
+            if self.memory.map_anonymous(range, permissions).is_err() {
+                // A range already committed by an earlier call: re-apply the
+                // protection rather than double-mapping.
+                self.memory
+                    .protect(range, permissions)
+                    .map_err(|_| KernelServiceError::ResourceExhausted)?;
+            }
+        }
+
+        Ok(VirtualAllocation { base: GuestVa(base), size: rounded })
+    }
+}
+
+/// Maps Win32 `PAGE_*` protection flags to guest page permissions.
+///
+/// Only the low protection byte selects the access mode; the modifier bits
+/// (`PAGE_GUARD`, `PAGE_NOCACHE`, `PAGE_WRITECOMBINE`) do not change guest
+/// permissions here. An unrecognized value falls back to read/write.
+fn protect_to_permissions(protect: u32) -> MemoryPermissions {
+    match protect & 0xFF {
+        0x01 => MemoryPermissions::empty(),     // PAGE_NOACCESS
+        0x02 | 0x08 => MemoryPermissions::READ, // READONLY, WRITECOPY
+        0x10 => MemoryPermissions::EXECUTE,     // PAGE_EXECUTE
+        0x20 => MemoryPermissions::READ | MemoryPermissions::EXECUTE, // EXECUTE_READ
+        0x40 | 0x80 => {
+            MemoryPermissions::READ | MemoryPermissions::WRITE | MemoryPermissions::EXECUTE
+        } // EXECUTE_READWRITE, EXECUTE_WRITECOPY
+        _ => MemoryPermissions::READ | MemoryPermissions::WRITE, // READWRITE and the default
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Win32 allocation-type and protection flags used by the tests.
+    const MEM_RESERVE: u32 = 0x0000_2000;
+    const PAGE_READWRITE: u32 = 0x0000_0004;
+
+    fn manager() -> ThreadManager {
+        let memory = Arc::new(SoftwareAddressSpace::new(4 * 1024 * 1024).expect("memory is valid"));
+        ThreadManager::new(memory)
+    }
+
+    #[test]
+    fn commit_places_writable_user_memory() {
+        let mut threads = manager();
+        let request = VirtualAllocRequest {
+            base: 0,
+            size: 0x1234,
+            allocation_type: MEM_COMMIT | MEM_RESERVE,
+            protect: PAGE_READWRITE,
+        };
+        let allocation = threads.allocate_virtual_memory(request).expect("allocation succeeds");
+
+        assert!(
+            (USER_ALLOC_BASE..USER_ALLOC_END).contains(&allocation.base.0),
+            "the base sits in the user range"
+        );
+        assert_eq!(allocation.size, 0x2000, "the size rounds up to whole pages");
+        // The committed region is mapped read/write.
+        threads
+            .memory
+            .write_u32(allocation.base, 0xDEAD_BEEF)
+            .expect("committed memory is writable");
+        assert_eq!(threads.memory.read_u32(allocation.base).unwrap(), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn reserve_only_leaves_the_range_unbacked() {
+        let mut threads = manager();
+        let request = VirtualAllocRequest {
+            base: 0,
+            size: 0x1000,
+            allocation_type: MEM_RESERVE,
+            protect: PAGE_READWRITE,
+        };
+        let allocation = threads.allocate_virtual_memory(request).expect("reservation succeeds");
+        // A reserve-only request records the range but backs no pages, so an
+        // access faults until a later commit.
+        assert!(
+            threads.memory.write_u32(allocation.base, 1).is_err(),
+            "reserved-only memory is not accessible"
+        );
+    }
+
+    #[test]
+    fn kernel_chosen_bases_do_not_overlap() {
+        let mut threads = manager();
+        let request = VirtualAllocRequest {
+            base: 0,
+            size: 0x1000,
+            allocation_type: MEM_COMMIT,
+            protect: PAGE_READWRITE,
+        };
+        let first = threads.allocate_virtual_memory(request).expect("first allocation");
+        let second = threads.allocate_virtual_memory(request).expect("second allocation");
+        assert_eq!(second.base.0, first.base.0 + 0x1000, "the cursor advances past the first");
     }
 }

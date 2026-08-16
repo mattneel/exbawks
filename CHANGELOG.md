@@ -122,6 +122,14 @@ The project follows Keep a Changelog structure before its first release.
   the timer does not fire yet — the firing machinery is later work — so a
   title that arms fire-and-forget timers proceeds. The retail image advances
   to `NtAllocateVirtualMemory` (`HLE-007`).
+- `NtAllocateVirtualMemory` reserves and commits guest virtual memory through
+  a new `KernelServices::allocate_virtual_memory` seam backed by a user-range
+  allocator: commit maps physical pages with the requested `PAGE_*`
+  protection, a reserve-only request records the range without backing it,
+  and kernel-chosen (`BaseAddress == 0`) placements bump a user-space cursor
+  in the `0x1000_0000`–`0x7F00_0000` window (ADR 0010). The real reserve/
+  commit region map and page reclamation remain later work (MEM-006/007). The
+  retail image allocates its heap and advances to `NtOpenFile` (`HLE-003`).
 - Implementation-burndown diagnostics: `exbawks coverage` reports
   implemented/stub/missing counts across the CPU, kernel, and GPU surfaces
   (with `--xbe` to scope the kernel surface to one image's imports), and a

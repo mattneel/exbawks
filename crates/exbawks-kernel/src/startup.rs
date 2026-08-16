@@ -49,10 +49,9 @@ pub mod ordinal {
     pub const RTL_NT_STATUS_TO_DOS_ERROR: u16 = 301;
 }
 
-/// The startup stubs for virtual memory, events, timers, and files.
-const STARTUP_STUBS: [(u16, &str); 6] = [
+/// The startup stubs for events, timers, and files.
+const STARTUP_STUBS: [(u16, &str); 5] = [
     (ordinal::KE_DELAY_EXECUTION_THREAD, "KeDelayExecutionThread"),
-    (ordinal::NT_ALLOCATE_VIRTUAL_MEMORY, "NtAllocateVirtualMemory"),
     (ordinal::NT_CREATE_EVENT, "NtCreateEvent"),
     (ordinal::NT_CREATE_FILE, "NtCreateFile"),
     (ordinal::NT_FREE_VIRTUAL_MEMORY, "NtFreeVirtualMemory"),
@@ -74,6 +73,7 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     crate::rtl::register_rtl_exports(registry)?;
     crate::ke::register_ke_exports(registry)?;
     crate::ex::register_ex_exports(registry)?;
+    crate::vm::register_vm_exports(registry)?;
     for (ordinal, name, stack_bytes) in BENIGN_SUCCESS {
         registry.register(SuccessExport::new(ordinal, name, stack_bytes))?;
     }
@@ -316,8 +316,8 @@ mod tests {
         register_startup_exports(&registry).expect("registration succeeds");
 
         // Five thread/handle exports, four Rtl and three Ke dispatcher
-        // exports, one Ex executive export, one benign success export, and
-        // six startup stubs.
+        // exports, one Ex executive export, one Nt virtual-memory export, one
+        // benign success export, and five startup stubs.
         assert_eq!(registry.len(), 20);
         for ordinal in [
             ordinal::DBG_PRINT,
@@ -390,6 +390,13 @@ mod tests {
 
         fn close_handle(&mut self, handle: u32) -> bool {
             handle == 0xE004
+        }
+
+        fn allocate_virtual_memory(
+            &mut self,
+            _request: crate::VirtualAllocRequest,
+        ) -> Result<crate::VirtualAllocation, crate::KernelServiceError> {
+            Err(crate::KernelServiceError::Unsupported)
         }
     }
 
