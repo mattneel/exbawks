@@ -43,6 +43,8 @@ pub(crate) fn register_file_exports(registry: &KernelRegistry) -> Result<(), Ker
     registry.register(NtCreateFile)?;
     registry.register(NtReadFile)?;
     registry.register(NtQueryInformationFile)?;
+    registry.register(NtDeviceIoControlFile)?;
+    registry.register(NtQueryVolumeInformationFile)?;
     Ok(())
 }
 
@@ -329,6 +331,139 @@ impl KernelExport for NtQueryInformationFile {
     }
 }
 
+/// Issues a device I/O control request.
+///
+/// There is no real disc device yet, so this reports success with a zeroed
+/// output buffer: titles issue disc IOCTLs (media detection, drive geometry)
+/// during startup and a benign success lets them proceed. The specific
+/// control codes get real answers as walls demand them.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NtDeviceIoControlFile;
+
+impl KernelExport for NtDeviceIoControlFile {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::NT_DEVICE_IO_CONTROL_FILE
+    }
+
+    fn name(&self) -> &'static str {
+        "NtDeviceIoControlFile"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        40
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // NtDeviceIoControlFile(FileHandle, Event, ApcRoutine, ApcContext,
+        //   IoStatusBlock, IoControlCode, InputBuffer, InputBufferLength,
+        //   OutputBuffer, OutputBufferLength).
+        let iosb = stack_argument(context, 4).unwrap_or(0);
+        let control_code = stack_argument(context, 5).unwrap_or(0);
+        let output = stack_argument(context, 8).unwrap_or(0);
+        let output_len = stack_argument(context, 9).unwrap_or(0);
+        tracing::debug!(
+            control_code = format_args!("{control_code:#010x}"),
+            output_len,
+            "NtDeviceIoControlFile"
+        );
+
+        // Zero the output buffer so the caller reads a defined (empty) result.
+        if output != 0 {
+            let zeros = vec![0_u8; (output_len as usize).min(4096)];
+            let _ = context.memory.write(GuestVa(output), &zeros);
+        }
+        write_io_status(context, iosb, KernelStatus::SUCCESS, output_len);
+        KernelStatus::SUCCESS
+    }
+}
+
+/// `FileFsSizeInformation` class ordinal.
+const FILE_FS_SIZE_INFORMATION: u32 = 3;
+/// `FileFsDeviceInformation` class ordinal.
+const FILE_FS_DEVICE_INFORMATION: u32 = 4;
+
+/// The emulated disc geometry: a 2 KiB-sector DVD.
+const DISC_BYTES_PER_SECTOR: u32 = 2048;
+/// Total allocation units for a ~4.7 GB DVD at one sector per unit.
+const DISC_TOTAL_UNITS: u64 = 0x0023_0000;
+/// Free allocation units reported for a volume (~2 GB), so a title that
+/// checks the HDD partition for save space proceeds instead of rebooting.
+const VOLUME_FREE_UNITS: u64 = 0x0010_0000;
+/// `FILE_DEVICE_CD_ROM`.
+const FILE_DEVICE_CD_ROM: u32 = 0x0000_0002;
+/// `FILE_REMOVABLE_MEDIA | FILE_READ_ONLY_DEVICE`.
+const DISC_CHARACTERISTICS: u32 = 0x0000_0001 | 0x0000_0002;
+
+/// Answers volume (disc) metadata queries.
+///
+/// The disc is a read-only 2 KiB-sector DVD; titles read its geometry and
+/// device characteristics to size sector reads. Unknown classes get a zeroed,
+/// successful answer so a probe proceeds.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NtQueryVolumeInformationFile;
+
+impl KernelExport for NtQueryVolumeInformationFile {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::NT_QUERY_VOLUME_INFORMATION_FILE
+    }
+
+    fn name(&self) -> &'static str {
+        "NtQueryVolumeInformationFile"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        20
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // NtQueryVolumeInformationFile(FileHandle, IoStatusBlock,
+        //   FsInformation, Length, FsInformationClass).
+        let (Some(iosb), Some(info_out), Some(length), Some(class)) = (
+            stack_argument(context, 1),
+            stack_argument(context, 2),
+            stack_argument(context, 3),
+            stack_argument(context, 4),
+        ) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+
+        let written = match class {
+            FILE_FS_SIZE_INFORMATION => {
+                // TotalAllocationUnits(8), AvailableAllocationUnits(8),
+                // SectorsPerAllocationUnit(4), BytesPerSector(4).
+                if length < 24 {
+                    return buffer_too_small(context, iosb);
+                }
+                write_u64(context, info_out, DISC_TOTAL_UNITS);
+                write_u64(context, info_out + 8, VOLUME_FREE_UNITS); // free space
+                let _ = context.memory.write_u32(GuestVa(info_out + 16), 1);
+                let _ = context.memory.write_u32(GuestVa(info_out + 20), DISC_BYTES_PER_SECTOR);
+                24
+            }
+            FILE_FS_DEVICE_INFORMATION => {
+                // DeviceType(4), Characteristics(4).
+                if length < 8 {
+                    return buffer_too_small(context, iosb);
+                }
+                let _ = context.memory.write_u32(GuestVa(info_out), FILE_DEVICE_CD_ROM);
+                let _ = context.memory.write_u32(GuestVa(info_out + 4), DISC_CHARACTERISTICS);
+                8
+            }
+            _ => {
+                // A defined, empty answer for classes not modeled yet.
+                if info_out != 0 {
+                    let zeros = vec![0_u8; (length as usize).min(256)];
+                    let _ = context.memory.write(GuestVa(info_out), &zeros);
+                }
+                length.min(256)
+            }
+        };
+
+        write_io_status(context, iosb, KernelStatus::SUCCESS, written);
+        KernelStatus::SUCCESS
+    }
+}
+
 /// Writes a little-endian u64 to guest memory, best effort.
 fn write_u64(context: &mut KernelCallContext<'_>, address: u32, value: u64) {
     let _ = context.memory.write_u32(GuestVa(address), value as u32);
@@ -468,6 +603,53 @@ mod tests {
         let mut files = FakeFiles::default();
         let status = run_open(0x4000_0000 /* GENERIC_WRITE */, "", &mut files, &memory);
         assert_eq!(status, KernelStatus::ACCESS_DENIED);
+    }
+
+    #[test]
+    fn volume_size_information_reports_disc_geometry() {
+        let memory = memory_with_object_name("x");
+        let mut files = FakeFiles::default();
+        // NtQueryVolumeInformationFile(FileHandle, IOSB, FsInformation,
+        // Length, FsInformationClass = FileFsSizeInformation).
+        let args = [0x0104_u32, 0x5010, 0x5100, 24, FILE_FS_SIZE_INFORMATION];
+        for (slot, value) in args.iter().enumerate() {
+            memory.write_u32(GuestVa(0x2004 + slot as u32 * 4), *value).expect("write");
+        }
+        let mut cpu = CpuState::default();
+        cpu.gpr[4] = 0x2000;
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut files,
+            stop_request: None,
+        };
+        assert_eq!(NtQueryVolumeInformationFile.call(&mut context), KernelStatus::SUCCESS);
+        // BytesPerSector is the last DWORD of FILE_FS_SIZE_INFORMATION.
+        assert_eq!(memory.read_u32(GuestVa(0x5100 + 20)).unwrap(), DISC_BYTES_PER_SECTOR);
+        // Free space is nonzero so a save-space check passes.
+        assert_ne!(memory.read_u32(GuestVa(0x5100 + 8)).unwrap(), 0);
+    }
+
+    #[test]
+    fn device_io_control_succeeds_benignly() {
+        let memory = memory_with_object_name("x");
+        let mut files = FakeFiles::default();
+        // Ten arguments; a media-probe IOCTL with no output buffer.
+        let args = [0x0104_u32, 0, 0, 0, 0x5010, 0x0004_d014, 0, 0, 0, 0];
+        for (slot, value) in args.iter().enumerate() {
+            memory.write_u32(GuestVa(0x2004 + slot as u32 * 4), *value).expect("write");
+        }
+        let mut cpu = CpuState::default();
+        cpu.gpr[4] = 0x2000;
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut files,
+            stop_request: None,
+        };
+        assert_eq!(NtDeviceIoControlFile.call(&mut context), KernelStatus::SUCCESS);
+        // IO_STATUS_BLOCK.Status is success.
+        assert_eq!(memory.read_u32(GuestVa(0x5010)).unwrap(), KernelStatus::SUCCESS.0);
     }
 
     #[test]

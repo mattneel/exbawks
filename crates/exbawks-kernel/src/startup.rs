@@ -41,12 +41,16 @@ pub mod ordinal {
     pub const NT_CREATE_EVENT: u16 = 189;
     /// `NtCreateFile`.
     pub const NT_CREATE_FILE: u16 = 190;
+    /// `NtDeviceIoControlFile`.
+    pub const NT_DEVICE_IO_CONTROL_FILE: u16 = 196;
     /// `NtFreeVirtualMemory`.
     pub const NT_FREE_VIRTUAL_MEMORY: u16 = 199;
     /// `NtOpenFile`.
     pub const NT_OPEN_FILE: u16 = 202;
     /// `NtQueryInformationFile`.
     pub const NT_QUERY_INFORMATION_FILE: u16 = 211;
+    /// `NtQueryVolumeInformationFile`.
+    pub const NT_QUERY_VOLUME_INFORMATION_FILE: u16 = 218;
     /// `NtReadFile`.
     pub const NT_READ_FILE: u16 = 219;
     /// `NtSetEvent`.
@@ -336,10 +340,10 @@ mod tests {
         register_startup_exports(&registry).expect("registration succeeds");
 
         // Five thread/handle exports, four Rtl and three Ke dispatcher
-        // exports, one Ex executive export, one Nt virtual-memory export, four
+        // exports, one Ex executive export, one Nt virtual-memory export, six
         // Nt file exports, four Mm contiguous exports, two benign success
         // exports, and four startup stubs.
-        assert_eq!(registry.len(), 28);
+        assert_eq!(registry.len(), 30);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,

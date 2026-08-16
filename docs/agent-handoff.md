@@ -142,18 +142,38 @@ Two active threads:
    initialization** — EEPROM probe, heap allocation, disc/HDD presence check,
    contiguous GPU-buffer allocation — with no reboot.
 
-   **Current DC3 wall: a disc device IOCTL.** The game thread calls
-   `NtDeviceIoControlFile` (ordinal 196) on the disc device handle — a media
-   detection / drive-geometry query. Implementing it needs a minimal disc
-   device: recognize the IoControlCode, return plausible geometry/media data
-   in the output buffer, set `IoStatusBlock`. After that the game should
-   `NtReadFile` real assets from the disc mount (the read path already works;
-   `read_file` returns bytes and the export copies them into guest memory).
-   Then the long pole is graphics HLE (only `NullGraphicsBackend` exists),
-   which is what the requested screenshot/frame-dump command ultimately hangs
-   off. `KRN-003` (virtual clock, to tick the `KeTickCount` cell) is
+   Also landed the disc-metadata exports (`NtDeviceIoControlFile` benign media
+   probe; `NtQueryVolumeInformationFile` DVD geometry + nonzero free space +
+   CD-ROM characteristics), so the game completes its disc and HDD-partition
+   probe.
+
+   **Current DC3 wall: an intended startup self-relaunch.** After the disc/HDD
+   probe the game calls a launch helper at guest `0x1A6381` (via `0x1A64F9`)
+   that `MmAllocateContiguousMemory` → `MmPersistContiguousMemory` →
+   `HalReturnToFirmware(2)` (quick-reboot). Disassembly confirms this is an
+   *unconditional* relaunch, not a validation failure: the helper never
+   returns (it reboots), and the `jl 0x1A6521` after the call site is dead
+   code. This is `XLaunchNewImage`-style: the title reboots to relaunch a
+   target XBE, carrying a persisted `LAUNCH_DATA_PAGE`. (A probe at
+   `MmPersistContiguousMemory` time saw the launch header still zeroed — the
+   game fills `szLaunchPath` *after* the persist, so read it at
+   `HalReturnToFirmware` time, not persist time.)
+
+   **Next milestone: implement the quick-reboot relaunch (core-level).** On
+   `HalReturnToFirmware` with a reboot routine, capture the `LAUNCH_DATA_PAGE`
+   (the persisted contiguous buffer and/or the `LaunchDataPage` kernel global,
+   ordinal 164), read `LAUNCH_DATA_HEADER.szLaunchPath`, `Emulator::reset()`
+   (already exists, emulator.rs), re-load the target XBE (resolve the launch
+   path through the disc mount — likely the same `default.xbe`), restore the
+   launch data so the relaunched title reads it, and re-run. On the second
+   boot the title should find launch data present and proceed to the game
+   proper instead of relaunching again. After that the game should
+   `NtReadFile` real assets (the read path already works), then the long pole
+   is graphics HLE (only `NullGraphicsBackend` exists), which the requested
+   screenshot/frame-dump command hangs off. `KRN-003` (virtual clock) is
    independent. Use `exbawks coverage --surface kernel --xbe <dc3> --missing`
-   for the live gap list.
+   for the live gap list; disassemble with `decode --hex <bytes> --ip <va>`
+   after slicing `.text` at file offset `0x1000 + (va - 0x11000)`.
 
 The retail image stays outside the repository; automated tests remain
 synthetic.

@@ -169,6 +169,16 @@ The project follows Keep a Changelog structure before its first release.
   switches to the game's created thread, so the retail image advances past
   its bootstrap to `RtlEnterCriticalSection`.
 
+### Added
+
+- Disc device metadata exports (`HLE-004`): `NtDeviceIoControlFile` answers a
+  title's disc IOCTLs (media detection) with a benign success, and
+  `NtQueryVolumeInformationFile` reports a read-only 2 KiB-sector DVD's
+  geometry, nonzero free space, and CD-ROM device characteristics. The retail
+  image completes its disc and HDD-partition probe and reaches its startup
+  self-relaunch (a `HalReturnToFirmware` quick-reboot through a launch-data
+  helper, the next milestone).
+
 ### Fixed
 
 - The host file device opens a directory or device object (the disc root, an
