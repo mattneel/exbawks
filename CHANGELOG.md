@@ -40,6 +40,9 @@ The project follows Keep a Changelog structure before its first release.
 - `exbawks plan` now reports `translated_instructions` and `static_exit`, so
   an `Executable` artifact that translates only a prefix of the block is
   visible instead of reading as full coverage (`CORE-001`).
+- A verified kernel export ordinal table (371 entries: name, function or data
+  kind, calling convention, gate stack bytes) generated from the vendored
+  CC0-licensed nxdk def file, with pinned decode-rule tests (`KRN-001`).
 
 ### Fixed
 
