@@ -1158,11 +1158,15 @@ mod tests {
 
     /// A boot thread that returns off its stack (to a null return address)
     /// exits cleanly instead of faulting at address zero.
+    ///
+    /// The entry is a bare `ret`, which the interpreter tier executes on any
+    /// host (a register-only entry would classify as translatable and reach
+    /// no executable off Windows). The boot thread starts with zeroed
+    /// registers, so it exits with code 0 through its unset return slot.
     #[test]
     fn boot_thread_returning_to_null_exits() {
-        // `xor eax, eax; ret` — the entry returns 0 with an unset return slot.
         let mut emulator = Emulator::new().expect("emulator must initialize");
-        emulator.load_xbe(synthetic_xbe_with(&[0x31, 0xC0, 0xC3], &[])).expect("image must load");
+        emulator.load_xbe(synthetic_xbe_with(&[0xC3], &[])).expect("image must load");
         let stop = emulator.run(64).expect("run must complete");
         assert_eq!(stop, StopReason::GuestExit { code: 0 });
     }
