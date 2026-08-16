@@ -260,6 +260,31 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- GPU-M0: the NV2A pushbuffer engine (`exbawks-gpu::PushbufferEngine`).
+  When the guest advances a channel's `DMA_PUT`, the engine replays the
+  hardware DMA pusher over guest RAM: method headers (increasing and
+  non-increasing), jumps, calls, and returns; per-method accounting; object
+  binding; and `RAMHT` resolution of DMA objects from instance memory so
+  the back-end semaphore release writes fence values into guest memory —
+  the readbacks Direct3D waits on. Pure logic over a physical-memory trait,
+  unit-tested with a flat fake (walks, RAMHT-resolved semaphore release,
+  call/return, bad-word abandonment); the emulator adapts it through the
+  cached window and consumes submissions while the vCPU is parked.
+- The Direct3D bring-up burndown continued, each wall named by the retail
+  image: interrupt-status registers are write-1-to-clear, so they read
+  clear rather than latching the guest's ACK (phantom `NV_PGRAPH_INTR`
+  bits sent D3D looping through its exception handler into a crash); the
+  PFIFO status family answers as idle hardware (empty marks set, DMA
+  pusher enabled and drained) so the FIFO drain loop exits; the `Av*`
+  family is real (`AvSendTVEncoderOption` answers a synthetic NTSC
+  profile, `AvSetDisplayMode` logs and accepts the mode — the retail image
+  sets its display mode); `KeDisconnectInterrupt` reports TRUE;
+  `NtFreeVirtualMemory` validates and acknowledges (the region leaks until
+  MEM-006); and the X:/Y:/Z: cache drive letters mount as writable
+  per-title scratch under the HDD directory — the title was crashing on an
+  unchecked `fopen(Z:\DATA\Ini.itk)` failure. The retail image now sets
+  its display mode and loads title-screen assets (`us_font.xtx`,
+  `BG.itk`, `pack_00.itk`) from the disc.
 - The cached physical window is real (ADR 0010): virtual
   `[0x8000_0000, 0x8000_0000 + ram)` aliases physical `[0, ram)`, kernel
   blocks are physical allocations whose virtual address is the window

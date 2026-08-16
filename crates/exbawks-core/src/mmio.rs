@@ -77,6 +77,9 @@ pub struct DeviceSpace {
     pramin: Mutex<Option<(u32, u32)>>,
     /// Latched I/O port values (VGA CRTC and friends).
     ports: Mutex<std::collections::HashMap<u16, u32>>,
+    /// Pushbuffer submissions observed and not yet consumed:
+    /// (channel base, get at submission, put).
+    submissions: Mutex<Vec<(u32, u32, u32)>>,
 }
 
 /// The NV2A `PRAMIN` window: the GPU instance-memory aperture.
@@ -126,6 +129,16 @@ impl DeviceSpace {
         // bounded timeout, and a timeout fails `DirectSoundCreate` — which
         // the retail image never checks, crashing on the null device.
         const READY_OVERRIDES: [u32; 2] = [0xFE82_0010, 0xFEC0_0130];
+        // Registers that read as a fixed idle-hardware value: the PFIFO
+        // status family reports an empty FIFO (`LOW_MARK`, bit 4) and an
+        // enabled, drained DMA pusher — zeros read as "busy forever" and
+        // Direct3D's drain loop never exits.
+        const VALUE_OVERRIDES: [(u32, u32); 4] = [
+            (0xFD00_2080, 0x0000_0010), // NV_PFIFO_RUNOUT_STATUS: empty
+            (0xFD00_2400, 0x0000_0010), // NV_PFIFO_CACHE0 status: empty
+            (0xFD00_3214, 0x0000_0010), // NV_PFIFO_CACHE1_STATUS: low mark
+            (0xFD00_3220, 0x0000_0101), // CACHE1_DMA_PUSH: enabled + empty
+        ];
         // Self-clearing command registers: the guest writes a reset bit and
         // spins until it reads back clear; real hardware clears it
         // immediately, so latching the write would spin forever. The AC'97
@@ -136,9 +149,23 @@ impl DeviceSpace {
             (0xFEC0_0100..=0xFEC0_01FF).contains(&address) && address & 0xF == 0xB;
         // `0xFD10_0410`: an NV2A PFB (memory controller) register D3D
         // writes a trigger bit into and polls until it self-clears.
-        const SELF_CLEAR: [u32; 1] = [0xFD10_0410];
+        //
+        // Interrupt-status registers are write-1-to-clear: the guest ACKs
+        // by writing all-ones, so a latch would report every interrupt
+        // pending forever — Direct3D then loops through its PGRAPH
+        // exception handler on phantom errors. With no interrupt sources
+        // modeled, status reads back clear: PMC `0xFD00_0100`, PFIFO
+        // `0xFD00_2100`, PTIMER `0xFD00_9100`, PGRAPH `0xFD40_0100`, and
+        // PCRTC `0xFD60_0100`.
+        const SELF_CLEAR: [u32; 6] =
+            [0xFD10_0410, 0xFD00_0100, 0xFD00_2100, 0xFD00_9100, 0xFD40_0100, 0xFD60_0100];
         if READY_OVERRIDES.contains(&address) {
             output.fill(0xFF);
+        } else if let Some((_, value)) = VALUE_OVERRIDES.iter().find(|(fixed, _)| *fixed == address)
+        {
+            let bytes = value.to_le_bytes();
+            let take = output.len().min(4);
+            output[..take].copy_from_slice(&bytes[..take]);
         } else if ac97_channel_control || SELF_CLEAR.contains(&address) {
             // Already zero-filled: the command completed instantly.
         } else {
@@ -169,12 +196,22 @@ impl DeviceSpace {
         // guest RAM for the graphics frontend to consume once it exists.
         if (NV_USER_START..NV_USER_END).contains(&address) && address & 0xFFFF == 0x40 {
             let get_register = address + 4;
-            self.registers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(get_register, value);
+            let mut registers =
+                self.registers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The walk starts wherever GET last pointed (the guest programs
+            // it at channel setup); the engine consumes [get, put) and the
+            // readback then reports the infinitely fast GPU caught up.
+            let get_before = registers.get(&get_register).copied().unwrap_or(value);
+            registers.insert(get_register, value);
+            drop(registers);
+            self.submissions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((
+                address & !0xFFFF,
+                get_before,
+                value,
+            ));
             tracing::debug!(
                 put = format_args!("{value:#010x}"),
+                get = format_args!("{get_before:#010x}"),
                 channel = format_args!("{:#010x}", address & !0xFFFF),
                 "pushbuffer submitted"
             );
@@ -243,6 +280,27 @@ impl DeviceSpace {
         } else {
             None
         }
+    }
+
+    /// Drains the pushbuffer submissions observed since the last call.
+    pub fn take_submissions(&self) -> Vec<(u32, u32, u32)> {
+        std::mem::take(
+            &mut self.submissions.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// The latched value of one device register, when the guest wrote it.
+    pub fn register_value(&self, address: u32) -> Option<u32> {
+        self.registers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&address)
+            .copied()
+    }
+
+    /// The GPU instance region backing `PRAMIN`: (window VA, size).
+    pub fn pramin_region(&self) -> Option<(u32, u32)> {
+        *self.pramin.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The identified DSP mailbox pages.

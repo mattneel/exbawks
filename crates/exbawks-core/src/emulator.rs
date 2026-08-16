@@ -149,6 +149,7 @@ impl EmulatorBuilder {
             disc_root: None,
             hdd_root: None,
             devices: crate::mmio::DeviceSpace::default(),
+            gpu_pusher: exbawks_gpu::PushbufferEngine::default(),
             pending_persist_reservations: Vec::new(),
             last_relaunch_data: None,
         })
@@ -180,6 +181,9 @@ pub struct Emulator {
     hdd_root: Option<PathBuf>,
     /// The device model behind unmapped hardware register blocks (WHP-M2).
     devices: crate::mmio::DeviceSpace,
+    /// The NV2A pushbuffer engine consuming submitted command streams
+    /// (GPU-M0).
+    gpu_pusher: exbawks_gpu::PushbufferEngine,
     /// Physical ranges (base, len) the next `load_xbe` must keep the
     /// allocator away from: soft-reboot persisted regions live at fixed
     /// window addresses, so their physical pages are reserved before the
@@ -1137,6 +1141,11 @@ impl Emulator {
                                     &mut mailboxes_applied,
                                     false,
                                 )?;
+                                // A DMA_PUT write queued a pushbuffer range:
+                                // walk it now, with the vCPU parked, so the
+                                // GET readback truthfully reports the work
+                                // consumed (GPU-M0).
+                                self.consume_gpu_submissions();
                                 self.whp_write_cpu(&mut machine)?;
                                 continue;
                             }
@@ -1160,6 +1169,24 @@ impl Emulator {
                     let gate = gate_ordinal(GuestVa(fault_va)).filter(|_| access.access_type == 2);
                     let Some(ordinal) = gate else {
                         self.whp_read_cpu(&mut machine)?;
+                        // The faulting frame's stack top: return addresses and
+                        // spilled arguments identify the caller without a
+                        // debugger attached.
+                        let esp = self.cpu.gpr[4];
+                        let mut stack = String::new();
+                        for slot in 0..10_u32 {
+                            let value = self.memory.read_u32(GuestVa(esp + slot * 4)).unwrap_or(0);
+                            stack.push_str(&format!("{value:#010x} "));
+                        }
+                        let fs_base = self.cpu.segments[exbawks_cpu::Segment::Fs as usize].base;
+                        tracing::debug!(
+                            esp = format_args!("{esp:#010x}"),
+                            fs = format_args!("{fs_base:#010x}"),
+                            ebx = format_args!("{:#010x}", self.cpu.gpr[3]),
+                            ebp = format_args!("{:#010x}", self.cpu.gpr[5]),
+                            %stack,
+                            "fault stack"
+                        );
                         tracing::debug!(
                             gpa = format_args!("{:#010x}", access.gpa),
                             gva = format_args!("{:#010x}", access.gva),
@@ -1411,6 +1438,51 @@ impl Emulator {
 }
 
 impl Emulator {
+    /// Walks any pushbuffer ranges submitted since the last call (GPU-M0).
+    #[cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
+    fn consume_gpu_submissions(&mut self) {
+        /// Guest physical memory through the cached window (ADR 0010).
+        struct WindowMemory<'a>(&'a SoftwareAddressSpace);
+        impl exbawks_gpu::Nv2aMemory for WindowMemory<'_> {
+            fn read_dword(&self, physical: u32) -> Option<u32> {
+                if physical >= 0x2000_0000 {
+                    return None;
+                }
+                self.0.read_u32(GuestVa(0x8000_0000 | physical)).ok()
+            }
+
+            fn write_dword(&self, physical: u32, value: u32) -> bool {
+                physical < 0x2000_0000
+                    && self.0.write_u32(GuestVa(0x8000_0000 | physical), value).is_ok()
+            }
+        }
+
+        /// `NV_PFIFO_RAMHT`: the object hash table's location register.
+        const PFIFO_RAMHT: u32 = 0xFD00_2210;
+
+        let submissions = self.devices.take_submissions();
+        if submissions.is_empty() {
+            return;
+        }
+        let ramht_raw = self.devices.register_value(PFIFO_RAMHT).unwrap_or(0);
+        let pramin =
+            self.devices.pramin_region().map(|(base_va, _)| base_va & 0x1FFF_FFFF).unwrap_or(0);
+        let memory = self.memory.clone();
+        let view = WindowMemory(&memory);
+        for (channel, get, put) in submissions {
+            let end = self.gpu_pusher.submit(&view, channel, pramin, ramht_raw, get, put);
+            let stats = self.gpu_pusher.stats();
+            tracing::debug!(
+                channel = format_args!("{channel:#010x}"),
+                end = format_args!("{end:#010x}"),
+                methods = stats.method_dwords,
+                releases = stats.semaphore_releases,
+                aborted = stats.aborted,
+                "pushbuffer walked"
+            );
+        }
+    }
+
     fn reset_inner(&mut self) -> Result<(), CoreError> {
         self.memory = Arc::new(SoftwareAddressSpace::new(self.config.physical_memory_bytes)?);
         self.cpu = CpuState::default();

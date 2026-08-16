@@ -208,15 +208,41 @@ Two active threads:
    `DMA_GET`; the stub GPU snaps GET to PUT ("infinitely fast") and logs
    `pushbuffer submitted put=... channel=...`.
 
-   **Current DC3 wall (WHP tier): D3D's post-submission path** — fault at
-   `0x1D426C` (`mov eax,[ecx+eax*4+0x138]`-shape with a garbage arg): D3D
-   proceeded past "GPU idle" and is consuming results only a real
-   command-stream consumer produces. **Next: the graphics frontier proper**
-   — consume the submitted pushbuffer (commands live in guest RAM at the
-   logged physical PUT addresses; NV2A method encoding: header
-   `count<<18 | subchannel<<13 | method`, then count dwords), feed decoded
-   methods into `GraphicsFrontend`, and model enough PGRAPH state for D3D's
-   readbacks. That path ends at the framebuffer and the screenshot command.
+   **GPU-M0 landed: the NV2A pushbuffer engine**
+   (`exbawks-gpu/src/nv2a.rs`): DMA_PUT submissions replay through the
+   hardware pusher rules (methods, jumps/calls/returns), objects resolve
+   via `RAMHT` in instance memory, and `BACK_END_WRITE_SEMAPHORE_RELEASE`
+   writes fence values into guest RAM. Consumed in `run_whp` after the
+   MMIO step that observed the PUT write (`consume_gpu_submissions`).
+   The semaphore method numbering is provisional (`0x1A4`/`0x1D6C`/
+   `0x1D70`) — verify against the live stream once real submissions flow
+   (`engine.top_methods`).
+
+   After it, the D3D bring-up burndown continued: W1C interrupt-status
+   registers (a latched `NV_PGRAPH_INTR` ACK read as phantom errors —
+   D3D's exception handler crashed on them), idle-FIFO status answers
+   (`0xFD002080/2400/3214 = 0x10`, `0xFD003220 = 0x101` — the drain loop
+   at `0x1CFACC` needs low-marks SET and the push busy bit CLEAR), the
+   `Av*` family (the image now SETS ITS DISPLAY MODE — watch for the
+   `display mode set` info line), `KeDisconnectInterrupt`,
+   `NtFreeVirtualMemory` (leaking), and X:/Y:/Z: cache-drive mounts (an
+   unchecked `fopen(Z:\DATA\Ini.itk)` NULL crashed fread). **The title
+   now loads its title-screen assets**: `us_font.xtx`, `BG.itk`,
+   `pack_00.itk`.
+
+   **Current DC3 wall (WHP tier): the D3D device is created then
+   RELEASED.** Game code calls a D3D API through the device global
+   `[0x1E14B8]`, which is NULL because the device's destructor ran
+   (`0x1C1150`: refcount at `[device+0x934]` hit zero → `rep stosd` clears
+   the object and NULLs the global). Something released the device —
+   either cleanup after a failed step the game ignored, or a
+   release/recreate pair whose recreate failed. Next: find the Release
+   caller (breakpoint-equivalent: log RIPs that reach `0x1C1130` via the
+   cancel sampler, or trace `call 0x1CD9B0` sites), and check whether
+   `Direct3D_CreateDevice`'s second run fails on a stub answer. After the
+   device survives, D3D draws into the pushbuffer for real and the
+   `GraphicsFrontend`/framebuffer/screenshot path opens.
+
    The interpreter tier remains the deterministic oracle (frontier: `movss`
    at `0x1685A0`).
 
