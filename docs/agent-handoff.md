@@ -72,10 +72,16 @@ and `HLE-002` are complete. The first execution milestone passes on
 Windows 11 x86-64.
 
 Active program: boot a retail Dino Crisis 3 image to its title screen with a
-deterministic screenshot command. Read [the boot plan](dc3-boot-plan.md), then
-select the next milestone-M0 task: `CORE-001`, `KRN-001`, `CLI-001`, `DBG-002`,
-or `CLI-002`. The retail image stays outside the repository; automated tests
-remain synthetic.
+deterministic screenshot command. Read [the boot plan](dc3-boot-plan.md).
+Milestone M0 is complete: `CORE-001`, `KRN-001`, `CLI-001`, `CLI-002`, and
+`DBG-002` landed, ADR 0008 accepted the interpreter execution tier, and the
+M0 checkpoint passes (`plan` reports 0 of 6 translated on the retail entry
+block; `thunks --check-registry` reports 2 implemented, 10 stubs, 140
+missing, all named). Select the next milestone-M1 task: `CPU-001` (interpreter
+memory operands and ALU with the differential harness), then `CPU-002`,
+`CPU-003`, `CORE-002`, `CORE-003`. The `nonleaf-block-abi` and
+`kernel-guest-map` ADRs are still unwritten M1 work. The retail image stays
+outside the repository; automated tests remain synthetic.
 
 Do not start runtime graphics work before memory operands translate. The
 portable pure-logic graphics subset (`GPU-001` command vocabulary, `GPU-002`
