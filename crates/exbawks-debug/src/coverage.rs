@@ -115,7 +115,6 @@ impl SurfaceCoverage {
     }
 
     /// Returns the missing items, which are what a burndown targets next.
-    #[must_use]
     pub fn missing(&self) -> impl Iterator<Item = &CoverageItem> {
         self.items.iter().filter(|item| item.status == CoverageStatus::Missing)
     }
