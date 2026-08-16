@@ -125,19 +125,26 @@ Two active threads:
    attribute bits.
 
 2. **Kernel HLE burndown** (substrate-independent, needed under either
-   engine): `KRN-002` (data exports, ADR 0010) is **done** — the loader
-   builds a kernel-variables region and points each data-ordinal slot at a
-   live variable, and the boot thread now returns off its stack to a thread
-   exit so the scheduler switches to the game's created thread. The DC3 wall
-   moved from `GuestFault { 0 }` to
-   `MissingKernelExport { 277 } (RtlEnterCriticalSection)` — the game thread's
-   CRT/heap-init path needs the Rtl critical-section family
-   (`RtlEnterCriticalSection` 277, `RtlLeaveCriticalSection` 294,
-   `RtlInitializeCriticalSection` 291). Those want guest-memory-resident
-   `RTL_CRITICAL_SECTION` structs (HLE-007 in the boot plan); a single-thread
-   cooperative model can implement them as recursion-counted no-ops first.
-   After that expect the virtual-memory / heap exports (`NtAllocateVirtualMemory`
-   184) and `KRN-003` (virtual clock, to make the `KeTickCount` cell tick).
+   engine). Done this session: `KRN-002` (data exports), the boot-thread
+   null-return exit, the Rtl critical-section family (`HLE-007` first slice:
+   277/291/294 as recursion-counted no-ops on the guest `RTL_CRITICAL_SECTION`),
+   and the KPCR `Prcb` pointer (`fs:[0x20]` → embedded KPRCB →
+   `CurrentThread`). DC3's game thread now runs its whole XAPI/CRT init prefix.
+
+   **Current DC3 wall: a physical-memory-window scan.** At guest `0x1AB874`
+   the game thread does `cmp dword ptr [eax], 0x54494E49` ("INIT") with
+   `eax = 0x8000FFF0`, scanning the cached physical window
+   (`0x8000_0000 | PA`) backward from `0x80010000` for an "INIT"-tagged
+   structure — and faults because we only map narrow kernel regions there
+   (kernel-vars at `0x8001_0000`, KPCR pages above it), not the physical RAM.
+   This is the **Mm / physical-memory model** (`MEM-006`/`MEM-007` +
+   `HLE-009`): the guest expects the whole physical RAM aliased into the
+   `0x8000_0000` window and expects to find kernel/pool structures tagged
+   there. This is a larger task than the per-export walls above — it needs the
+   physical allocator, the cached-window aliasing, and likely a synthesized
+   kernel/pool structure carrying the "INIT" tag the scan looks for. Expect
+   `NtAllocateVirtualMemory` (184) and the `Mm*` contiguous family nearby.
+   `KRN-003` (virtual clock, to tick the `KeTickCount` cell) is independent.
    Use `exbawks coverage --surface kernel --xbe <dc3> --missing` for the live
    gap list.
 
