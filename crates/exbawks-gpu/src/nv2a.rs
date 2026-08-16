@@ -160,11 +160,12 @@ const METHOD_SET_OBJECT: u16 = 0x0000;
 const METHOD_SET_CONTEXT_DMA_COLOR: u16 = 0x0190;
 /// Kelvin `SET_CONTEXT_DMA_SEMAPHORE`.
 ///
-/// The numbering is read off the retail stream: the context-DMA block runs
-/// `NOTIFIES, A, B, STATE, COLOR, ZETA, VERTEX_A, VERTEX_B, SEMAPHORE,
-/// REPORT` from `0x0180`, and the title binds exactly one semaphore object
-/// here (`0x01A4`, the report object, is never bound).
-const METHOD_SET_CONTEXT_DMA_SEMAPHORE: u16 = 0x01A0;
+/// Confirmed against the retail stream by what the object *is*: the title
+/// binds a 32-byte object here whose base is the very block its pushbuffer
+/// wait polls for progress, while `0x01A0` (the report object) binds the
+/// whole of RAM. Writing fences to the report object instead leaves that
+/// wait spinning forever.
+const METHOD_SET_CONTEXT_DMA_SEMAPHORE: u16 = 0x01A4;
 /// Kelvin `SET_SURFACE_CLIP_HORIZONTAL`: left edge and width.
 const METHOD_SET_SURFACE_CLIP_HORIZONTAL: u16 = 0x0200;
 /// Kelvin `SET_SURFACE_CLIP_VERTICAL`: top edge and height.
@@ -354,7 +355,6 @@ impl PushbufferEngine {
             argument = format_args!("{argument:#010x}"),
             "nv2a method"
         );
-
         match method {
             METHOD_SET_OBJECT => {
                 state.subchannel_handles[subchannel & 7] = argument;

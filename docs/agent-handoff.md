@@ -257,12 +257,33 @@ Two active threads:
    `[0x3D6E14] = 1`), and drives tens of millions of pushbuffer methods with
    thousands of semaphore releases while the audio mixer runs.
 
+   **The graphics fence was the thing holding rendering back.** Direct3D's
+   pushbuffer wait spins on a counter in memory (`[device+0x30]` names the
+   block) until the GPU catches up. The fence writes were landing on the
+   report object — all of RAM at offset zero — instead of the semaphore
+   object, so the wait never finished and the title stalled after four
+   submissions. What each method *binds* settles the numbering better than
+   any table: `0x01A4` binds the 32-byte block the wait polls, `0x01A0`
+   binds the whole of RAM. With that fixed, two minutes of run time gives
+   72,853 pushbuffer submissions, 12,601 surface clears, and 66,164 fences.
+
    **`exbawks run --screenshot <file.png>` captures the scanned-out frame**
-   through the cached window. It is black today, and truthfully so: the
-   pusher walks methods but nothing rasterizes. That is the next frontier —
-   decode the method stream into `GraphicsCommand`s and draw. The current
-   stop is a null dereference at `0x1CE0FC` inside Direct3D, reached after
-   millions of exits; expect it to be another readback the device model owes.
+   through the cached window, and the clears now land in exactly the buffer
+   it reads (`0x040AC000`, pitch 2560). The image is black because the title
+   clears to opaque black and nothing rasterizes its geometry yet — the
+   capture path itself is proven. **That is the frontier: draw the method
+   stream.** The retail title's stream is legible through
+   `exbawks run --gpu-methods <n>`: a Kelvin object bound to subchannel 0,
+   matrices at `0x0480`/`0x0580`/`0x0680`, vertex formats at
+   `0x1760`-`0x179C`, `SET_BEGIN_END` at `0x17FC`, and geometry through
+   `ARRAY_ELEMENT16` (`0x1800`) and `INLINE_ARRAY` (`0x1818`).
+
+   Two techniques earned their keep and are worth reaching for again: the
+   cancel pump's RIP sampling (`RUST_LOG=exbawks_core::emulator=trace`,
+   which also reports `rax/rbx/rcx/rdx/rsi`) pinned the spin to three
+   instructions at `0x1CBC20`, and resolving *every* context-DMA bind to the
+   object it names identified the semaphore by what it pointed at rather
+   than by a constant anyone had written down.
 
       The interpreter tier remains the deterministic oracle (frontier: `movss`
    at `0x1685A0`).

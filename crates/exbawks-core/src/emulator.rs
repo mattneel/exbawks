@@ -1188,15 +1188,24 @@ impl Emulator {
                                 exbawks_whp::Register::Rax,
                                 exbawks_whp::Register::Rbx,
                                 exbawks_whp::Register::Fs,
+                                exbawks_whp::Register::Rcx,
+                                exbawks_whp::Register::Rdx,
+                                exbawks_whp::Register::Rsi,
                             ])
                             .unwrap_or_default();
                         let rax = sampled.first().map(|value| value.low).unwrap_or(0);
                         let rbx = sampled.get(1).map(|value| value.low).unwrap_or(0);
                         let fs_base = sampled.get(2).map(|value| value.low).unwrap_or(0);
+                        let rcx = sampled.get(3).map(|value| value.low).unwrap_or(0);
+                        let rdx = sampled.get(4).map(|value| value.low).unwrap_or(0);
+                        let rsi = sampled.get(5).map(|value| value.low).unwrap_or(0);
                         tracing::trace!(
                             rip = format_args!("{exit_rip:#010x}"),
                             rax = format_args!("{rax:#010x}"),
                             rbx = format_args!("{rbx:#010x}"),
+                            rcx = format_args!("{rcx:#010x}"),
+                            rdx = format_args!("{rdx:#010x}"),
+                            rsi = format_args!("{rsi:#010x}"),
                             fs = format_args!("{fs_base:#010x}"),
                             "whp cancel sample"
                         );

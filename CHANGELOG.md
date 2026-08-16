@@ -268,9 +268,15 @@ The project follows Keep a Changelog structure before its first release.
   the most-submitted methods, which is how the retail title's stream was
   read: it binds a Kelvin object, uploads matrices, sets vertex formats, and
   draws through inline arrays and 16-bit element indices.
-- The semaphore context-DMA method number was corrected from `0x01A4` (the
-  report object) to `0x01A0`, read off the live stream where the title binds
-  exactly one semaphore object.
+- **The graphics fence now lands where Direct3D reads it.** Its pushbuffer
+  wait polls a counter in memory and spins until the GPU catches up; the
+  fence writes were going to the report object (all of RAM, offset zero)
+  instead of the semaphore object, so the wait never completed and the title
+  stalled after four submissions. The object each method binds settles the
+  numbering: `0x01A4` binds the 32-byte block the wait polls, `0x01A0` binds
+  the whole of RAM. With fences landing there, a two-minute run goes from 4
+  pushbuffer submissions to 72,853, with 12,601 surface clears — the title
+  renders continuously.
 
 - Frame capture: `exbawks run --screenshot <file.png>` writes the frame the
   title programmed on the video encoder. `AvSetDisplayMode` now records the
