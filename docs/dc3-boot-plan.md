@@ -9,6 +9,14 @@ build 2003-08-04) to its title screen, and add a screenshot command that dumps
 deterministic frames for golden testing. The game image never enters the repository;
 all automated tests stay synthetic per [testing.md](testing.md) and `AGENTS.md`.
 
+**Execution-engine update ([ADR 0013](adr/0013-whp-execution-tier.md)):** the primary
+execution tier is now the Windows Hypervisor Platform (`exbawks-whp`, see
+[whp-notes.md](whp-notes.md)), which runs the 32-bit guest natively and deletes this
+plan's CPU-emulation and JIT tasks. The interpreter (CPU-001..006) is retained as the
+deterministic oracle/golden tier. The kernel HLE (M2–M4), graphics (M5–M6), and
+title-screen (M7) milestones below are substrate-independent and unchanged; only the
+CPU and JIT tracks are superseded.
+
 ## Measured baseline (2026-08-15)
 
 - `inspect`, `thunks`, and `plan` parse the retail XBE cleanly (ADR 0007 works on real data).

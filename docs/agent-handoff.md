@@ -101,16 +101,41 @@ worker thread and closing the handle — and stops with
 (last translated block at guest `0x1A6A5A`) transfers control to null, with
 no kernel call in between.
 
-Next task: `KRN-002` (data exports, per ADR 0010). XAPI reads the 19
-DATA-export slots, which the loader still patches with unmapped gate
-addresses; it must instead build a kernel-variables region (ticking
-`KeTickCount`, `KeTimeIncrement`, `LaunchDataPage` NULL, `XeImageFileName`
-ANSI string, zeroed synthetic keys, version/hardware structs, object-type
-placeholders) and patch DATA-ordinal slots with pointers into it while
-function slots keep gates (use `kernel_ordinal_info(ordinal).kind`). The
-null-jump fault is the expected symptom; verify KRN-002 clears it by running
-the image and reading the new wall. `KRN-003` (virtual clock) follows. The
-retail image stays outside the repository; automated tests remain synthetic.
+Execution-engine pivot: ADR 0013 makes the **Windows Hypervisor Platform the
+primary execution tier**, with the interpreter retained as the deterministic
+oracle/golden tier and the hand-written JIT track dropped. `exbawks-whp` has
+begun (capability doctor; `exbawks doctor` confirms WHP is usable on the
+build host). `docs/whp-notes.md` holds the full partition/boot/exit API
+reference. Diagnostics: `exbawks coverage` reports the implemented/stub/
+missing burndown across CPU/kernel/GPU surfaces (DC3: 5/7/140 of 152 imports).
+
+Two active threads:
+
+1. **WHP-M0 spike** (the make-or-break for the pivot): in `exbawks-whp`, add
+   a dynamically-loaded `WhpApi` (all partition/vcpu/memory/register
+   functions via `LoadLibrary`+`GetProcAddress` — never raw-dylib, or the CLI
+   stops launching on non-WHP hosts), RAII `Partition`/`Vcpu`, `map_gpa`, and
+   the 32-bit protected-mode boot register set from `docs/whp-notes.md`
+   (CS `0xC09B` / DS `0xC093`, CR0=PE, EFER=0, RFLAGS=2). First test: map a
+   page holding `HLT`, boot the vCPU at it, expect `WHvRunVpExitReasonX64Halt`.
+   Then the gate-trap: leave `0xFF80_0000+ord*4` unmapped, `call [slot]`,
+   expect a `MemoryAccess` exit whose GPA yields the ordinal. Guard tests
+   with `cfg(all(windows, target_arch="x86_64"))` and a runtime
+   `probe_whp().usable()` skip. Watch the XSAVE-size gotcha and the segment
+   attribute bits.
+
+2. **Kernel HLE burndown** (substrate-independent, needed under either
+   engine): `KRN-002` (data exports, ADR 0010) is the current DC3 wall. XAPI
+   reads the 19 DATA-export slots, still patched with unmapped gate addresses,
+   and jumps to null (`GuestFault { 0 }`). Build a kernel-variables region
+   (ticking `KeTickCount`, `KeTimeIncrement`, `LaunchDataPage` NULL,
+   `XeImageFileName` ANSI string, zeroed synthetic keys, version/hardware
+   structs, object-type placeholders) and patch DATA slots with pointers into
+   it while function slots keep gates (`kernel_ordinal_info(ordinal).kind`).
+   `KRN-003` (virtual clock) follows.
+
+The retail image stays outside the repository; automated tests remain
+synthetic.
 
 Do not start runtime graphics work before memory operands translate. The
 portable pure-logic graphics subset (`GPU-001` command vocabulary, `GPU-002`
