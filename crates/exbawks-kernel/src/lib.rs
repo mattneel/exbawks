@@ -5,6 +5,7 @@ mod context;
 mod error;
 mod ex;
 mod export;
+mod file;
 mod gate;
 mod ke;
 mod ordinals;
@@ -19,6 +20,7 @@ pub use context::KernelCallContext;
 pub use error::KernelError;
 pub use ex::ExQueryNonVolatileSetting;
 pub use export::{KernelExport, StubExport, SuccessExport};
+pub use file::{NtCreateFile, NtOpenFile, NtQueryInformationFile, NtReadFile};
 pub use gate::{KERNEL_GATE_BASE, KERNEL_GATE_END, gate_address, gate_ordinal};
 pub use ke::KeInitializeDpc;
 pub use ordinals::{
@@ -30,8 +32,8 @@ pub use rtl::{
     RtlNtStatusToDosError,
 };
 pub use services::{
-    KernelServiceError, KernelServices, ThreadCreateRequest, ThreadCreated, UnsupportedServices,
-    VirtualAllocRequest, VirtualAllocation,
+    FileInfo, FileOpenRequest, FileOpened, KernelServiceError, KernelServices, ThreadCreateRequest,
+    ThreadCreated, UnsupportedServices, VirtualAllocRequest, VirtualAllocation,
 };
 pub use startup::{
     DbgPrint, HalReturnToFirmware, NtClose, PsCreateSystemThreadEx, PsTerminateSystemThread,

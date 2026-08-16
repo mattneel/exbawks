@@ -130,6 +130,16 @@ The project follows Keep a Changelog structure before its first release.
   in the `0x1000_0000`–`0x7F00_0000` window (ADR 0010). The real reserve/
   commit region map and page reclamation remain later work (MEM-006/007). The
   retail image allocates its heap and advances to `NtOpenFile` (`HLE-003`).
+- A host-backed file device (ADR 0014): `NtOpenFile`, `NtCreateFile`,
+  `NtReadFile`, and `NtQueryInformationFile` read the game's own files through
+  a new `KernelServices` file surface. The device mounts the image's directory
+  as the read-only game disc (`\Device\CdRom0\`, `\Device\Harddisk0\Partition1\`,
+  `D:`); guest paths resolve inside the mount only — a component-depth sandbox
+  rejects `..` escapes, absolute and UNC forms, and embedded NULs, with a
+  canonicalized containment re-check. No proprietary data enters the
+  repository (the mount is a runtime path; tests use synthetic files). The
+  retail image opens the disc device and advances to
+  `MmAllocateContiguousMemory` (`HLE-004`).
 - Implementation-burndown diagnostics: `exbawks coverage` reports
   implemented/stub/missing counts across the CPU, kernel, and GPU surfaces
   (with `--xbe` to scope the kernel surface to one image's imports), and a

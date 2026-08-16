@@ -33,6 +33,12 @@ pub mod ordinal {
     pub const NT_CREATE_FILE: u16 = 190;
     /// `NtFreeVirtualMemory`.
     pub const NT_FREE_VIRTUAL_MEMORY: u16 = 199;
+    /// `NtOpenFile`.
+    pub const NT_OPEN_FILE: u16 = 202;
+    /// `NtQueryInformationFile`.
+    pub const NT_QUERY_INFORMATION_FILE: u16 = 211;
+    /// `NtReadFile`.
+    pub const NT_READ_FILE: u16 = 219;
     /// `NtSetEvent`.
     pub const NT_SET_EVENT: u16 = 225;
     /// `PsCreateSystemThreadEx`.
@@ -49,11 +55,10 @@ pub mod ordinal {
     pub const RTL_NT_STATUS_TO_DOS_ERROR: u16 = 301;
 }
 
-/// The startup stubs for events, timers, and files.
-const STARTUP_STUBS: [(u16, &str); 5] = [
+/// The startup stubs for events and timers.
+const STARTUP_STUBS: [(u16, &str); 4] = [
     (ordinal::KE_DELAY_EXECUTION_THREAD, "KeDelayExecutionThread"),
     (ordinal::NT_CREATE_EVENT, "NtCreateEvent"),
-    (ordinal::NT_CREATE_FILE, "NtCreateFile"),
     (ordinal::NT_FREE_VIRTUAL_MEMORY, "NtFreeVirtualMemory"),
     (ordinal::NT_SET_EVENT, "NtSetEvent"),
 ];
@@ -74,6 +79,7 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     crate::ke::register_ke_exports(registry)?;
     crate::ex::register_ex_exports(registry)?;
     crate::vm::register_vm_exports(registry)?;
+    crate::file::register_file_exports(registry)?;
     for (ordinal, name, stack_bytes) in BENIGN_SUCCESS {
         registry.register(SuccessExport::new(ordinal, name, stack_bytes))?;
     }
@@ -316,9 +322,9 @@ mod tests {
         register_startup_exports(&registry).expect("registration succeeds");
 
         // Five thread/handle exports, four Rtl and three Ke dispatcher
-        // exports, one Ex executive export, one Nt virtual-memory export, one
-        // benign success export, and five startup stubs.
-        assert_eq!(registry.len(), 20);
+        // exports, one Ex executive export, one Nt virtual-memory export, four
+        // Nt file exports, one benign success export, and four startup stubs.
+        assert_eq!(registry.len(), 23);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,

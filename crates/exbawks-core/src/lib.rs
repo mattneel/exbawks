@@ -4,6 +4,7 @@
 mod config;
 mod emulator;
 mod error;
+mod hostfs;
 mod loaded;
 mod report;
 mod threads;

@@ -20,6 +20,12 @@ impl KernelStatus {
     pub const INVALID_HANDLE: Self = Self(0xC000_0008);
     /// The caller's buffer is too small for the returned data.
     pub const BUFFER_TOO_SMALL: Self = Self(0xC000_0023);
+    /// The requested access to the object was denied.
+    pub const ACCESS_DENIED: Self = Self(0xC000_0022);
+    /// The named file or object was not found.
+    pub const OBJECT_NAME_NOT_FOUND: Self = Self(0xC000_0034);
+    /// The end of the file was reached.
+    pub const END_OF_FILE: Self = Self(0xC000_0011);
 
     /// Returns true when the status represents success.
     #[must_use]

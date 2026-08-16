@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use exbawks_cpu::{
@@ -145,6 +146,7 @@ impl EmulatorBuilder {
             address_space_epoch: 0,
             loaded: None,
             threads: None,
+            disc_root: None,
         })
     }
 }
@@ -168,6 +170,8 @@ pub struct Emulator {
     address_space_epoch: u64,
     loaded: Option<Arc<LoadedImage>>,
     threads: Option<ThreadManager>,
+    /// The host directory mounted as the read-only game disc (ADR 0014).
+    disc_root: Option<PathBuf>,
 }
 
 impl Emulator {
@@ -186,6 +190,14 @@ impl Emulator {
     #[must_use]
     pub fn memory(&self) -> &SoftwareAddressSpace {
         &self.memory
+    }
+
+    /// Mounts a host directory as the read-only game disc (ADR 0014).
+    ///
+    /// Set before [`Emulator::load_xbe`]; the mount backs the guest
+    /// `Nt*File` exports. Guest file access is confined to this directory.
+    pub fn set_disc_root(&mut self, root: PathBuf) {
+        self.disc_root = Some(root);
     }
 
     /// Returns the guest CPU state.
@@ -243,7 +255,7 @@ impl Emulator {
         // The kernel-side state (thread table, object handles, and the
         // bump-allocated kernel region) is built before thunk patching so
         // DATA-export slots can point at real kernel variables (ADR 0010).
-        let mut threads = ThreadManager::new(memory.clone());
+        let mut threads = ThreadManager::new(memory.clone(), self.disc_root.clone());
         let data_ordinals: Vec<u16> = thunks
             .entries
             .iter()

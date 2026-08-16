@@ -514,6 +514,11 @@ fn run(
         builder = builder.trace(std::sync::Arc::new(sink));
     }
     let mut emulator = builder.build()?;
+    // Mount the image's own directory as the read-only game disc (ADR 0014),
+    // so the guest's file exports read the files shipped alongside the XBE.
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        emulator.set_disc_root(parent.to_path_buf());
+    }
     emulator.load_xbe(bytes).with_context(|| format!("failed to load {}", path.display()))?;
     let stop = emulator.run(max_blocks)?;
 

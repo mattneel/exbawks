@@ -76,7 +76,9 @@ impl KernelExport for NtAllocateVirtualMemory {
                 KernelStatus::SUCCESS
             }
             Err(KernelServiceError::ResourceExhausted) => KernelStatus::NO_MEMORY,
-            Err(KernelServiceError::Unsupported) => KernelStatus::INSUFFICIENT_RESOURCES,
+            // The allocator only ever reports exhaustion or an unsupported
+            // context; the file-oriented errors cannot arise here.
+            Err(_) => KernelStatus::INSUFFICIENT_RESOURCES,
         }
     }
 }

@@ -1,15 +1,18 @@
 //! The guest thread table and kernel service implementation (ADR 0011/0012).
 
 use std::collections::{BTreeMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use exbawks_cpu::{CpuState, Segment, SegmentState};
 use exbawks_kernel::{
-    KernelServiceError, KernelServices, ThreadCreateRequest, ThreadCreated, VirtualAllocRequest,
-    VirtualAllocation,
+    FileInfo, FileOpenRequest, FileOpened, KernelServiceError, KernelServices, ThreadCreateRequest,
+    ThreadCreated, VirtualAllocRequest, VirtualAllocation,
 };
 use exbawks_memory::{GuestMemory, MemoryError, SoftwareAddressSpace};
 use exbawks_types::{GUEST_PAGE_SIZE, GuestRange, GuestVa, MemoryPermissions};
+
+use crate::hostfs::HostFileSystem;
 
 /// The reserved return address for guest thread start routines.
 ///
@@ -115,10 +118,12 @@ pub(crate) struct ThreadManager {
     /// Open guest handles (minimal object table; the full object manager is
     /// HLE-005). Thread creation registers its handle here.
     handles: HashSet<u32>,
+    /// The host-backed file device (ADR 0014).
+    files: HostFileSystem,
 }
 
 impl ThreadManager {
-    pub(crate) fn new(memory: Arc<SoftwareAddressSpace>) -> Self {
+    pub(crate) fn new(memory: Arc<SoftwareAddressSpace>, disc_root: Option<PathBuf>) -> Self {
         // Kernel blocks stay inside the cached physical window
         // (`0x8000_0000 | PA`, ADR 0010) so they never stray into the
         // higher windows the ADR reserves.
@@ -133,6 +138,7 @@ impl ThreadManager {
             kernel_region_end,
             user_cursor: USER_ALLOC_BASE,
             handles: HashSet::new(),
+            files: HostFileSystem::new(disc_root),
         }
     }
 
@@ -379,7 +385,25 @@ impl KernelServices for ThreadManager {
     }
 
     fn close_handle(&mut self, handle: u32) -> bool {
-        self.handles.remove(&handle)
+        // Thread and file handles share one namespace but disjoint ranges.
+        self.handles.remove(&handle) || self.files.close(handle)
+    }
+
+    fn open_file(&mut self, request: FileOpenRequest) -> Result<FileOpened, KernelServiceError> {
+        self.files.open(&request)
+    }
+
+    fn read_file(
+        &mut self,
+        handle: u32,
+        offset: Option<u64>,
+        len: u32,
+    ) -> Result<Vec<u8>, KernelServiceError> {
+        self.files.read(handle, offset, len)
+    }
+
+    fn file_info(&mut self, handle: u32) -> Result<FileInfo, KernelServiceError> {
+        self.files.info(handle)
     }
 
     fn allocate_virtual_memory(
@@ -453,7 +477,7 @@ mod tests {
 
     fn manager() -> ThreadManager {
         let memory = Arc::new(SoftwareAddressSpace::new(4 * 1024 * 1024).expect("memory is valid"));
-        ThreadManager::new(memory)
+        ThreadManager::new(memory, None)
     }
 
     #[test]

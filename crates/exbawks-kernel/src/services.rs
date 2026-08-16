@@ -60,6 +60,34 @@ pub struct VirtualAllocation {
     pub size: u32,
 }
 
+/// A request to open a guest file through a host-backed device (ADR 0014).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileOpenRequest {
+    /// The raw NT object path the guest supplied (device-qualified).
+    pub path: String,
+    /// Whether the guest requested any write or create-modifying access.
+    pub write_access: bool,
+}
+
+/// The result of opening one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileOpened {
+    /// The guest handle naming the open file object.
+    pub handle: u32,
+    /// True when the open created a new file, false when it opened an
+    /// existing one (the `IoStatusBlock.Information` result).
+    pub created: bool,
+}
+
+/// Size and position facts about one open file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileInfo {
+    /// The file size in bytes.
+    pub size: u64,
+    /// The current byte offset of the file pointer.
+    pub position: u64,
+}
+
 /// A kernel service failure.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum KernelServiceError {
@@ -69,6 +97,15 @@ pub enum KernelServiceError {
     /// Guest resources were exhausted.
     #[error("guest resources are exhausted")]
     ResourceExhausted,
+    /// The named object was not found.
+    #[error("the named object was not found")]
+    NotFound,
+    /// The request was denied (e.g. a write to a read-only device).
+    #[error("the request was denied")]
+    AccessDenied,
+    /// A handle value does not name an open object.
+    #[error("the handle does not name an open object")]
+    InvalidHandle,
 }
 
 /// Emulator-provided services kernel exports call (ADR 0012).
@@ -103,6 +140,34 @@ pub trait KernelServices {
         &mut self,
         request: VirtualAllocRequest,
     ) -> Result<VirtualAllocation, KernelServiceError>;
+
+    /// Opens a file on a host-backed device (ADR 0014).
+    ///
+    /// Resolves the guest NT path within a mount, confined to the mount
+    /// root, and returns the guest handle. The default implementation reports
+    /// `Unsupported` for contexts without a device.
+    fn open_file(&mut self, _request: FileOpenRequest) -> Result<FileOpened, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
+    /// Reads bytes from one open file.
+    ///
+    /// `offset` reads at an explicit byte offset; `None` reads at the
+    /// maintained file pointer and advances it. Returns fewer bytes than
+    /// requested at end of file.
+    fn read_file(
+        &mut self,
+        _handle: u32,
+        _offset: Option<u64>,
+        _len: u32,
+    ) -> Result<Vec<u8>, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
+    /// Returns the size and current position of one open file.
+    fn file_info(&mut self, _handle: u32) -> Result<FileInfo, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
 }
 
 /// A services implementation for contexts without an emulator.
