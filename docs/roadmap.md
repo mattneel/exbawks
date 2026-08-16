@@ -1,5 +1,8 @@
 # Roadmap
 
+The title-screen program that sequences phases 3 through 7 against a concrete retail
+target lives in [the Dino Crisis 3 boot plan](dc3-boot-plan.md).
+
 ## Phase 0: Scaffold
 
 Status: complete.
@@ -13,7 +16,7 @@ Acceptance criteria:
 
 ## Phase 1: Windows address space
 
-Status: next.
+Status: complete (MEM-001 through MEM-005).
 
 Acceptance criteria:
 
@@ -26,6 +29,8 @@ Acceptance criteria:
 
 ## Phase 2: Executable direct backend
 
+Status: complete (JIT-001 through JIT-003, register-only subset per ADR 0006).
+
 Acceptance criteria:
 
 - Allocate code with separate write and execute phases.
@@ -36,6 +41,8 @@ Acceptance criteria:
 - Compare results against a small interpreter oracle.
 
 ## Phase 3: Guest memory operations
+
+Status: next (boot-plan milestones M1 and the JIT track).
 
 Acceptance criteria:
 
@@ -56,6 +63,9 @@ Acceptance criteria:
 - Preserve host and guest thread state.
 
 ## Phase 5: Kernel startup HLE
+
+Status: complete for the synthetic milestone (HLE-001, HLE-002); retail breadth
+continues in boot-plan milestones M2 through M4.
 
 Acceptance criteria:
 

@@ -62,7 +62,8 @@ Read [the validation report](../VALIDATION.md) before code changes.
 3. Read `docs/memory.md`.
 4. Read `docs/codegen-contract.md`.
 5. Read the accepted ADRs in `docs/adr`.
-6. Select one task from `docs/task-board.md`.
+6. Read `docs/dc3-boot-plan.md`.
+7. Select one task from `docs/task-board.md`.
 
 ## Immediate objective
 
@@ -70,11 +71,16 @@ Tasks `MEM-001` through `MEM-005`, `JIT-001` through `JIT-003`, `HLE-001`,
 and `HLE-002` are complete. The first execution milestone passes on
 Windows 11 x86-64.
 
-Select the next task from the board: `XBE-001` or `QA-001`.
-Memory operand rewriting and fault-site redirection follow per the
-`AGENTS.md` task sequence.
+Active program: boot a retail Dino Crisis 3 image to its title screen with a
+deterministic screenshot command. Read [the boot plan](dc3-boot-plan.md), then
+select the next milestone-M0 task: `CORE-001`, `KRN-001`, `CLI-001`, `DBG-002`,
+or `CLI-002`. The retail image stays outside the repository; automated tests
+remain synthetic.
 
-Do not start graphics work before memory operands translate.
+Do not start runtime graphics work before memory operands translate. The
+portable pure-logic graphics subset (`GPU-001` command vocabulary, `GPU-002`
+pushbuffer parser, `GPU-005` software rasterizer) may proceed once the
+`graphics-interception` ADR is accepted.
 
 ## First commands
 

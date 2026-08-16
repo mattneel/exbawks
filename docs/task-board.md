@@ -18,6 +18,26 @@ XBE-001 -> HLE-001 -> HLE-002 --------+
 DBG-001 ------------------------------+
 ```
 
+All tasks above are complete. Active work follows the
+[Dino Crisis 3 boot plan](dc3-boot-plan.md); its chain:
+
+```text
+M0: CORE-001, KRN-001 -> CLI-001, DBG-002, CLI-002
+M1: ADRs -> CPU-001 -> CPU-002/CPU-003 -> CORE-002 -> CORE-003
+M2: XBE-001a/b/c, KRN-002 -> KRN-003, CPU-004
+M3: MEM-006 -> MEM-007 -> KRN-004 -> HLE-003..010, MEM-008, CPU-005, CORE-004
+M4: KRN-005 -> KRN-006 -> KRN-007/KRN-008, CPU-006
+M5: MEM-009, XBE-001d -> HLE-009, GPU-001 -> GPU-002 -> GPU-003 -> GPU-004, SND-001
+M6: GPU-005 -> GPU-006 -> QA-002, QA-003, DBG-003
+M7: GPU-007, SND-002, INPUT-001, FMV ladder, pacing
+JIT track (parallel from M2): JIT-004 -> JIT-005 -> JIT-006 -> JIT-007 -> JIT-008
+                              -> JIT-009; JIT-010 + MEM-010 post-title-screen
+```
+
+Each milestone's task goals and acceptance sketches live in the plan document; expand
+them into full board entries (or issues) when a task starts. One task ID per pull
+request still applies.
+
 ## Phase 1: Windows address space
 
 ### MEM-001: Query host memory geometry
@@ -183,6 +203,10 @@ DBG-001 ------------------------------+
 ## Phase 3: XBE and kernel startup
 
 ### XBE-001: Expand checked XBE metadata
+
+Superseded: this umbrella splits into XBE-001a (certificate), XBE-001b (VA resolver +
+TLS directory), XBE-001c (library versions), and XBE-001d (section shared-page refcount
+addresses) per [the DC3 boot plan](dc3-boot-plan.md).
 
 **Goal:** Parse certificate, TLS, library, and debug metadata.
 
