@@ -157,57 +157,49 @@ Two active threads:
    run` now preserves the persisted regions and the `LaunchDataPage` pointer
    across a reset, reloads the same image, and continues (`relaunch_title`).
 
-   **Current DC3 wall: the game reboots on every boot.** The relaunch works —
-   boot 2 correctly reuses the preserved page (its kernel-call sequence is
-   identical to boot 1 *except* it skips `MmAllocateContiguousMemory` 165,
-   proving the page survived) — but it re-persists the same data and reboots
-   again. Boots differ only in that 165, so the relaunch decision is not
-   kernel-call-driven; it turns on register/memory state our environment does
-   not satisfy. The loop detector (identical persisted data → stop) ends the
-   run at `Reboot { routine: 2 }` after one relaunch instead of spinning.
+   **Reboot loop SOLVED: it was FATX volume geometry.** The decisive evidence
+   was the launch data itself, dumped at `HalReturnToFirmware` time: the
+   `LAUNCH_DATA_PAGE`'s data area (page + `0x400`) held
+   `LD_TO_DASHBOARD { dwReason=1, dwContext=0, dwParameter1=2 }` — reason 1 is
+   `XLD_LAUNCH_DASHBOARD_HARDDISK_CLEANUP`, "reboot to the dashboard and free
+   up 2 blocks". DC3 was not relaunching to apply settings; it was rebooting
+   to a dashboard *cleanup screen* we do not host, because its save-space
+   check on `\Device\Harddisk0\partition1\` computed **zero free blocks**.
+   Root cause: `NtQueryVolumeInformationFile` (class 3, the exact class DC3
+   passes) reported DVD geometry — 2 KiB clusters. Titles convert clusters to
+   16 KiB save blocks as `SectorsPerAllocationUnit * BytesPerSector / 16384`,
+   which is 0 at 2 KiB clusters, so free = `Avail * 0 = 0`. Reporting real
+   FATX geometry (512-byte sectors, 32 sectors/unit = 16 KiB clusters, 1 GiB
+   free) clears the check: DC3 now passes its first boot with **no relaunch at
+   all** and advances to drive-letter mounting.
 
-   **The relaunch gate is a single global: `[0x2661BC]`.** A block-EIP ring
-   buffer over `run_blocks` (temporary, reverted) pinned the exact path. The
-   deciding function `Q` at guest `0x1A633F` (called with `(0, &buf)` from
-   `0x1AA173`) tests `cmp [0x2661BC], 0` at `0x1A6355` and `jne 0x1A6372`: when
-   `[0x2661BC] == 0` it falls through and calls `XLaunchNewImage`
-   (`P` at `0x1AB046`, which with a null image-path arg calls the launch
-   routine `H` at `0x1A64E5`, which builds the `LAUNCH_DATA_PAGE` and reboots
-   at `0x1A651B`). `[0x2661BC]` stays 0 in our environment, so it relaunches
-   every boot. Confirmed by experiment: forcing `[0x2661BC]` non-zero after the
-   relaunch makes the second boot skip the relaunch and proceed — to a new
-   `GuestFault` at `0x8023_0000` (likely an artifact of bypassing the proper
-   setup, not a clean next wall). So `0x2661BC` is the game's launch-info flag
-   that XAPI's launch-data consumption sets on a real soft reboot.
+   Two earlier misreads, corrected for the record: (1) `[0x2661BC, 0x2661C0)`
+   is not a "relaunch gate" — it is `XLaunchNewImage`'s internal pre-launch
+   *hook table* (an empty linker-registration section; a non-zero slot is
+   **called as a function pointer**, which is why forcing it "past the gate"
+   really made XLaunchNewImage call the launch page as code and fault at
+   `0x8023_0000`). (2) The launch chain is: game code checks the volume →
+   builds a 3072-byte `LAUNCH_DATA` on the stack (`[ebp-0xC00]`) →
+   `XLaunchNewImage(NULL, &data)` at `0x1A633F` → worker `0x1AB046` → builder
+   `0x1A6381` copies the data to page+`0x400` (`add esi,400h; rep movsd`) →
+   reboot at `0x1A651B`. The ADR 0015 relaunch-with-persistence machinery is
+   correct and stays (it is how a *real* settings-style relaunch will work);
+   it simply no longer triggers on DC3's boot.
 
-   **Reference pass done; the gate is NOT launch-data-driven.** Per
-   xboxdevwiki `Kernel/LaunchDataPage` the launch-data types are: 0
-   switch-to-title, 1 switch-to-dashboard, 2 switch-**from**-dashboard, 3
-   debugger, 4/6 title update, `0xFFFFFFFF` none. DC3's page is type **1**. The
-   hypothesis "DC3 bails because it wasn't launched *from* the dashboard" was
-   tested by injecting a synthetic type-2 `LaunchDataPage` on cold boot —
-   **no effect**, DC3 relaunched identically. So `[0x2661BC]` is independent of
-   the `LaunchDataPage`. It is a slot in a tiny section `[0x2661BC, 0x2661C0)`
-   (`.data+0x7C`, zero in the file) that is **never written via its address**;
-   the only code touching that structure is a CRT/XAPI-init-style iterator loop
-   at `0x1B66xx` (it references `0x2661A8`–`0x2661B8` and `0x62CCB0`). The slot
-   is an *unregistered* init entry — on real hardware something registers it (a
-   `__declspec(allocate)` section item or a runtime registration our
-   environment never triggers). Forcing `0x2661BC` non-zero confirms it gates
-   run-vs-reboot but then faults at `0x8023_0000`, so the real init sets up
-   other state too: this is a broad XAPI/CRT-init gap, not one value.
-
-   **Recommended next step (multi-session, pick one):** (a) *scout ahead* —
-   force past the gate **and** handle the `0x8023_0000` access — to map the
-   real remaining walls and size the graphics work before committing to it; or
-   (b) *diff DC3's early init against a reference* (Cxbx-Reloaded HLE
-   `EmuXapi`/`EmuKrnl*`, or a live xemu execution trace) to find what registers
-   the `0x1B66xx` init entry. Both converge with the broader XAPI/graphics HLE
-   (only `NullGraphicsBackend` exists), which the screenshot/frame-dump command
-   also needs. Tools: block-EIP ring buffer in `run_blocks` (print on `Reboot`,
-   revert); `decode --hex <bytes> --ip <va>` with `.text` file offset `0x1000 +
-   (va - 0x11000)`; `run --trace <f> --trace-filter kernel,stop` split at each
-   `HalReturnToFirmware` (49).
+   **Current DC3 wall: `IoCreateSymbolicLink` (ordinal 67).** DC3 is mounting
+   its drive letters (`D:` → `\Device\CdRom0`, `T:`/`U:` → title/user data on
+   the HDD) through the object namespace. Next: implement
+   `IoCreateSymbolicLink`/`IoDeleteSymbolicLink` (HLE-005 slice) — record the
+   link name → target string in a table the host file device consults during
+   path resolution, so guest opens through `\??\D:` etc. resolve through the
+   game's own links rather than the hard-coded prefix list in `hostfs.rs`.
+   T:/U: (save/title data) need a writable mount decision (ADR 0014 is
+   read-only; likely a git-ignored scratch directory per title). After that
+   the game should `NtReadFile` real assets, then the long pole is graphics
+   HLE (only `NullGraphicsBackend` exists), which the screenshot/frame-dump
+   command hangs off. Debug recipe that cracked this wall, for reuse: dump
+   the `LAUNCH_DATA_PAGE` **data area** (+`0x400`), not just the header — the
+   dashboard reason code names the failing subsystem precisely.
 
 The retail image stays outside the repository; automated tests remain
 synthetic.

@@ -382,23 +382,31 @@ const FILE_FS_SIZE_INFORMATION: u32 = 3;
 /// `FileFsDeviceInformation` class ordinal.
 const FILE_FS_DEVICE_INFORMATION: u32 = 4;
 
-/// The emulated disc geometry: a 2 KiB-sector DVD.
-const DISC_BYTES_PER_SECTOR: u32 = 2048;
-/// Total allocation units for a ~4.7 GB DVD at one sector per unit.
-const DISC_TOTAL_UNITS: u64 = 0x0023_0000;
-/// Free allocation units reported for a volume (~2 GB), so a title that
-/// checks the HDD partition for save space proceeds instead of rebooting.
-const VOLUME_FREE_UNITS: u64 = 0x0010_0000;
+/// The emulated volume geometry is FATX (the Xbox hard disk): 512-byte
+/// sectors, 32 sectors per allocation unit — 16 KiB clusters. Titles convert
+/// clusters to 16 KiB save-game "blocks" as `SectorsPerAllocationUnit *
+/// BytesPerSector / 16384`, which must not truncate to zero: a smaller
+/// cluster (say a DVD's 2 KiB sector at one per unit) reads as zero blocks
+/// per cluster, so every free-space check sees an empty disk and the title
+/// reboots to the dashboard for a "hard disk cleanup".
+const VOLUME_BYTES_PER_SECTOR: u32 = 512;
+/// Sectors per allocation unit (16 KiB clusters).
+const VOLUME_SECTORS_PER_UNIT: u32 = 32;
+/// Total clusters: ~4.9 GB at 16 KiB per cluster.
+const VOLUME_TOTAL_UNITS: u64 = 0x0004_B000;
+/// Free clusters: 1 GiB free, comfortably positive in any signed 32-bit
+/// byte count a title might compute.
+const VOLUME_FREE_UNITS: u64 = 0x0001_0000;
 /// `FILE_DEVICE_CD_ROM`.
 const FILE_DEVICE_CD_ROM: u32 = 0x0000_0002;
 /// `FILE_REMOVABLE_MEDIA | FILE_READ_ONLY_DEVICE`.
 const DISC_CHARACTERISTICS: u32 = 0x0000_0001 | 0x0000_0002;
 
-/// Answers volume (disc) metadata queries.
+/// Answers volume metadata queries.
 ///
-/// The disc is a read-only 2 KiB-sector DVD; titles read its geometry and
-/// device characteristics to size sector reads. Unknown classes get a zeroed,
-/// successful answer so a probe proceeds.
+/// Size queries report FATX hard-disk geometry (16 KiB clusters) with free
+/// space, so save-space checks pass; device queries report a CD-ROM. Unknown
+/// classes get a zeroed, successful answer so a probe proceeds.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NtQueryVolumeInformationFile;
 
@@ -426,6 +434,7 @@ impl KernelExport for NtQueryVolumeInformationFile {
         ) else {
             return KernelStatus::INVALID_PARAMETER;
         };
+        tracing::debug!(class, length, "NtQueryVolumeInformationFile");
 
         let written = match class {
             FILE_FS_SIZE_INFORMATION => {
@@ -434,10 +443,10 @@ impl KernelExport for NtQueryVolumeInformationFile {
                 if length < 24 {
                     return buffer_too_small(context, iosb);
                 }
-                write_u64(context, info_out, DISC_TOTAL_UNITS);
+                write_u64(context, info_out, VOLUME_TOTAL_UNITS);
                 write_u64(context, info_out + 8, VOLUME_FREE_UNITS); // free space
-                let _ = context.memory.write_u32(GuestVa(info_out + 16), 1);
-                let _ = context.memory.write_u32(GuestVa(info_out + 20), DISC_BYTES_PER_SECTOR);
+                let _ = context.memory.write_u32(GuestVa(info_out + 16), VOLUME_SECTORS_PER_UNIT);
+                let _ = context.memory.write_u32(GuestVa(info_out + 20), VOLUME_BYTES_PER_SECTOR);
                 24
             }
             FILE_FS_DEVICE_INFORMATION => {
@@ -624,8 +633,13 @@ mod tests {
             stop_request: None,
         };
         assert_eq!(NtQueryVolumeInformationFile.call(&mut context), KernelStatus::SUCCESS);
-        // BytesPerSector is the last DWORD of FILE_FS_SIZE_INFORMATION.
-        assert_eq!(memory.read_u32(GuestVa(0x5100 + 20)).unwrap(), DISC_BYTES_PER_SECTOR);
+        // SectorsPerAllocationUnit and BytesPerSector close the struct; the
+        // cluster must be at least one 16 KiB save block, or a title's
+        // clusters-to-blocks conversion truncates to zero and it reboots to
+        // the dashboard for a disk cleanup.
+        let sectors = memory.read_u32(GuestVa(0x5100 + 16)).unwrap();
+        let bytes = memory.read_u32(GuestVa(0x5100 + 20)).unwrap();
+        assert!(sectors * bytes >= 16384, "one cluster holds at least one save block");
         // Free space is nonzero so a save-space check passes.
         assert_ne!(memory.read_u32(GuestVa(0x5100 + 8)).unwrap(), 0);
     }

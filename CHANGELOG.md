@@ -194,6 +194,17 @@ The project follows Keep a Changelog structure before its first release.
 
 ### Fixed
 
+- `NtQueryVolumeInformationFile` size queries now report FATX hard-disk
+  geometry (512-byte sectors, 32 sectors per unit — 16 KiB clusters) instead
+  of DVD geometry. Titles convert clusters to 16 KiB save blocks as
+  `SectorsPerAllocationUnit * BytesPerSector / 16384`, which truncated to
+  zero at 2 KiB clusters, so every free-space check saw an empty disk. This
+  was the retail image's reboot loop: its launch data was
+  `LDT_TO_DASHBOARD` reason 1 (hard-disk cleanup, 2 blocks needed) — it was
+  rebooting to a dashboard cleanup screen we do not host. With real
+  geometry the retail image passes its save-space check on the first boot,
+  never relaunches, and advances to drive-letter mounting
+  (`IoCreateSymbolicLink`).
 - The host file device opens a directory or device object (the disc root, an
   HDD partition) as a zero-size marker instead of reporting "not found", so a
   title's disc/HDD presence check passes. The retail image now clears its
