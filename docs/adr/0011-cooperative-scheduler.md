@@ -33,10 +33,10 @@ The ready queue is FIFO in thread-creation order. No host-time input ever
 reaches a scheduling decision.
 
 A thread start routine returns to the reserved sentinel address
-`0xFFBF_FFF4` inside the kernel gate region (no valid ordinal gate maps
-there). The run loop treats execution reaching the sentinel as an implicit
-`PsTerminateSystemThread` whose exit status is the routine's EAX return
-value.
+`0xFFBF_FFF4`, which sits in the reserved region above the kernel gate range
+so `gate_ordinal` never resolves it to an export. The run loop treats
+execution reaching the sentinel as an implicit `PsTerminateSystemThread`
+whose exit status is the routine's EAX return value.
 
 Kernel exports never switch directly: a service call records a pending
 scheduling action, and the run loop applies it after the export returns, so

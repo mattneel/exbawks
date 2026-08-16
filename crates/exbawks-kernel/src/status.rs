@@ -12,6 +12,8 @@ impl KernelStatus {
     pub const INVALID_PARAMETER: Self = Self(0xC000_000D);
     /// One guest address is invalid.
     pub const ACCESS_VIOLATION: Self = Self(0xC000_0005);
+    /// Insufficient guest resources exist to complete the request.
+    pub const INSUFFICIENT_RESOURCES: Self = Self(0xC000_009A);
 
     /// Returns true when the status represents success.
     #[must_use]

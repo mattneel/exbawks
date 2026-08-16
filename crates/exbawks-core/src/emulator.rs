@@ -22,6 +22,7 @@ use exbawks_types::{
 };
 use exbawks_xbe::{XbeImage, XbeSectionFlags};
 
+use crate::threads::{PendingAction, THREAD_EXIT_SENTINEL, ThreadManager};
 use crate::{BootPlanReport, CoreError, EmulatorConfig, KernelThunkTable, LoadedImage};
 
 /// The outcome of one kernel gate call attempt at the current guest EIP.
@@ -143,6 +144,7 @@ impl EmulatorBuilder {
             trace: self.trace,
             address_space_epoch: 0,
             loaded: None,
+            threads: None,
         })
     }
 }
@@ -165,6 +167,7 @@ pub struct Emulator {
     trace: Arc<dyn TraceSink>,
     address_space_epoch: u64,
     loaded: Option<Arc<LoadedImage>>,
+    threads: Option<ThreadManager>,
 }
 
 impl Emulator {
@@ -237,15 +240,33 @@ impl Emulator {
         )?;
         patch_kernel_thunks(&memory, &thunks)?;
 
-        // The first synthetic guest thread receives one mapped stack.
-        let stack = GuestRange::page_aligned(GUEST_STACK_BASE, u64::from(GUEST_STACK_BYTES))
+        // The boot thread's stack is sized from the XBE header, page-rounded
+        // and clamped to a working minimum (ADR 0010).
+        let stack_bytes = image
+            .header
+            .stack_size
+            .max(GUEST_STACK_BYTES)
+            .div_ceil(GUEST_PAGE_SIZE)
+            .saturating_mul(GUEST_PAGE_SIZE);
+        let stack = GuestRange::page_aligned(GUEST_STACK_BASE, u64::from(stack_bytes))
             .map_err(MemoryError::from)?;
         memory.map_anonymous(stack, MemoryPermissions::READ | MemoryPermissions::WRITE)?;
-        let stack_top = GUEST_STACK_BASE.0 + GUEST_STACK_BYTES - GUEST_STACK_SCRATCH;
+        let stack_top =
+            GUEST_STACK_BASE.0.saturating_add(stack_bytes).saturating_sub(GUEST_STACK_SCRATCH);
+
+        // Build the boot thread's KPCR/KTHREAD pages and wire the fs base so
+        // XAPI startup can read its TIB and current-thread pointers.
+        let mut threads = ThreadManager::new(memory.clone());
+        let kpcr = threads.create_boot_environment(GUEST_STACK_BASE, stack_bytes)?;
 
         self.cpu = CpuState { eip: image.header.entry_point.0, ..CpuState::default() };
         self.cpu.gpr[4] = stack_top;
+        self.cpu.set_segment(
+            exbawks_cpu::Segment::Fs,
+            exbawks_cpu::SegmentState { base: kpcr.0, ..exbawks_cpu::SegmentState::default() },
+        );
         self.memory = memory;
+        self.threads = Some(threads);
         self.code_cache.clear();
         self.address_space_epoch = self.address_space_epoch.wrapping_add(1);
 
@@ -297,8 +318,17 @@ impl Emulator {
         memory.write_u32(GuestVa(pushed_esp), resume.0)?;
         self.cpu.gpr[4] = pushed_esp;
 
-        let mut context =
-            KernelCallContext { cpu: &mut self.cpu, memory: memory.as_ref(), stop_request: None };
+        let mut fallback = exbawks_kernel::UnsupportedServices;
+        let services: &mut dyn exbawks_kernel::KernelServices = match self.threads.as_mut() {
+            Some(threads) => threads,
+            None => &mut fallback,
+        };
+        let mut context = KernelCallContext {
+            cpu: &mut self.cpu,
+            memory: memory.as_ref(),
+            services,
+            stop_request: None,
+        };
         let status = export.call(&mut context);
         let stop = context.stop_request;
 
@@ -355,6 +385,14 @@ impl Emulator {
 
         for _ in 0..max_blocks {
             let start = GuestVa(self.cpu.eip);
+            if start == THREAD_EXIT_SENTINEL {
+                // A guest thread's start routine returned (ADR 0011). Exit it
+                // with its EAX status and switch to the next ready thread.
+                if let Some(stop) = self.exit_current_thread(self.cpu.gpr[0]) {
+                    return Ok(stop);
+                }
+                continue;
+            }
             match self.classify_entry(start) {
                 EntryClass::Translatable => {
                     let (_, compiled) = self.compiled_block_at(start)?;
@@ -433,12 +471,28 @@ impl Emulator {
             {
                 Ok(Some(StopReason::UnimplementedKernelExport { ordinal }))
             }
-            GateAssist::Dispatched { .. } => Ok(None),
+            GateAssist::Dispatched { .. } => Ok(self.apply_pending_scheduling()),
             GateAssist::MissingExport { ordinal } => {
                 Ok(Some(StopReason::MissingKernelExport { ordinal }))
             }
             GateAssist::NotAGateCall => self.interpret_step(),
         }
+    }
+
+    /// Applies the scheduling action the last kernel call recorded (ADR 0011).
+    fn apply_pending_scheduling(&mut self) -> Option<StopReason> {
+        let action = self.threads.as_mut().and_then(ThreadManager::take_pending)?;
+        match action {
+            PendingAction::Exit { status } => self.exit_current_thread(status),
+        }
+    }
+
+    /// Terminates the active thread and switches to the next ready one, or
+    /// stops with a guest exit when none remain.
+    fn exit_current_thread(&mut self, status: u32) -> Option<StopReason> {
+        let cpu = &mut self.cpu;
+        let switched = self.threads.as_mut().is_some_and(|threads| threads.exit_active(cpu));
+        if switched { None } else { Some(StopReason::GuestExit { code: status }) }
     }
 
     /// Executes one instruction through the tier-0 interpreter (ADR 0008),
@@ -500,6 +554,7 @@ impl Emulator {
         self.memory = Arc::new(SoftwareAddressSpace::new(self.config.physical_memory_bytes)?);
         self.cpu = CpuState::default();
         self.loaded = None;
+        self.threads = None;
         self.code_cache.clear();
         self.address_space_epoch = self.address_space_epoch.wrapping_add(1);
         Ok(())
@@ -939,6 +994,96 @@ mod tests {
         assert_eq!(stop, StopReason::GuestExit { code: 0 });
         assert_eq!(emulator.cpu().gpr[1], 0x0001_0000, "the interpreted load must land");
         assert!(emulator.cpu().tsc > 0, "interpreted instructions must advance the counter");
+    }
+
+    /// Loading an image builds a KPCR the guest can read through fs, and the
+    /// boot stack honors the XBE-declared size.
+    #[test]
+    fn load_builds_the_boot_thread_environment() {
+        let mut emulator = Emulator::new().expect("emulator must initialize");
+        emulator.load_xbe(synthetic_xbe()).expect("image must load");
+
+        let fs_base = emulator.cpu().segment(exbawks_cpu::Segment::Fs).base;
+        assert!(fs_base >= 0x8000_0000, "the KPCR must live in kernel space");
+        // fs:[0x1C] is the self pointer; fs:[0x28] points at the KTHREAD.
+        let self_pointer = emulator.memory().read_u32(GuestVa(fs_base + 0x1C)).expect("read");
+        assert_eq!(self_pointer, fs_base);
+        let kthread = emulator.memory().read_u32(GuestVa(fs_base + 0x28)).expect("read");
+        assert_eq!(kthread, fs_base + 0x200);
+    }
+
+    /// PsCreateSystemThreadEx succeeds through the service, and a thread that
+    /// returns to the exit sentinel switches to the next ready thread.
+    #[test]
+    fn thread_creation_and_exit_drive_the_scheduler() {
+        use exbawks_kernel::{KernelServices, ThreadCreateRequest};
+
+        let mut emulator = Emulator::new().expect("emulator must initialize");
+        emulator.load_xbe(synthetic_xbe()).expect("image must load");
+        let threads = emulator.threads.as_mut().expect("threads exist");
+        assert_eq!(threads.live_threads(), 1);
+
+        let created = threads
+            .create_thread(ThreadCreateRequest {
+                thread_extension_size: 0,
+                kernel_stack_size: 0,
+                tls_data_size: 0,
+                start_routine: GuestVa(0x0002_0000),
+                start_context1: 0,
+                start_context2: 0,
+                create_suspended: false,
+            })
+            .expect("thread creates");
+        assert!(created.handle >= 0xE000);
+        assert_eq!(emulator.threads.as_ref().unwrap().live_threads(), 2);
+
+        // The boot thread reaching the sentinel exits and resumes the child.
+        emulator.cpu.eip = THREAD_EXIT_SENTINEL.0;
+        emulator.cpu.gpr[0] = 0;
+        let stop = emulator.exit_current_thread(0);
+        assert_eq!(stop, None, "a ready child keeps execution alive");
+        assert_eq!(emulator.cpu().eip, 0x0002_0000, "the child's context is now active");
+
+        // The child exiting with no remaining threads stops the run.
+        let stop = emulator.exit_current_thread(7);
+        assert_eq!(stop, Some(StopReason::GuestExit { code: 7 }));
+    }
+
+    /// A new thread's stack has an unmapped guard page below its limit, and
+    /// the guest time-stamp counter never moves backward across a switch.
+    #[test]
+    fn thread_switch_guards_stacks_and_preserves_the_counter() {
+        use exbawks_kernel::{KernelServices, ThreadCreateRequest};
+
+        let mut emulator = Emulator::new().expect("emulator must initialize");
+        emulator.load_xbe(synthetic_xbe()).expect("image must load");
+        let created = emulator
+            .threads
+            .as_mut()
+            .unwrap()
+            .create_thread(ThreadCreateRequest {
+                thread_extension_size: 0,
+                kernel_stack_size: 16 * 1024,
+                tls_data_size: 0,
+                start_routine: GuestVa(0x0002_0000),
+                start_context1: 0,
+                start_context2: 0,
+                create_suspended: false,
+            })
+            .expect("thread creates");
+
+        // The KTHREAD records the child's stack limit; the page below it is
+        // unmapped (a write there faults).
+        let stack_limit =
+            emulator.memory().read_u32(GuestVa(created.kthread.0 + 0x20)).expect("read");
+        let error = emulator.memory().write_u32(GuestVa(stack_limit - 4), 0);
+        assert!(error.is_err(), "the guard page below the stack must be unmapped");
+
+        // A boot thread that has run instructions exits into the child; the
+        // counter carries across rather than resetting to the child default.
+        emulator.cpu.tsc = 5_000;
+        emulator.exit_current_thread(0);
+        assert_eq!(emulator.cpu().tsc, 5_000, "the counter must not move backward");
     }
 
     /// Register-only blocks run through the JIT while everything between

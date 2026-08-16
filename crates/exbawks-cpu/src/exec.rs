@@ -2332,7 +2332,7 @@ mod tests {
     /// Malformed input must produce typed errors, never a panic.
     #[test]
     fn random_byte_soup_never_panics() {
-        let (mut state, memory) = machine();
+        let (_, memory) = machine();
         let mut seed = 0xDEAD_4EED_u32;
         let mut bytes = [0_u8; 15];
         for _ in 0..2_000 {
@@ -2340,7 +2340,7 @@ mod tests {
                 seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                 *byte = (seed >> 24) as u8;
             }
-            state = CpuState { eip: CODE, ..CpuState::default() };
+            let mut state = CpuState { eip: CODE, ..CpuState::default() };
             memory.write(GuestVa(CODE), &bytes).expect("code writes");
             let _ = step(&mut state, &memory);
         }

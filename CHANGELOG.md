@@ -71,6 +71,11 @@ The project follows Keep a Changelog structure before its first release.
   `StopReason::GuestFault`. The retail Dino Crisis 3 image now executes its
   XAPI entry path and stops at its first real kernel wall,
   `PsCreateSystemThreadEx` (`CORE-002`).
+- The boot thread receives a KPCR/TIB and KTHREAD page (fs base wired for
+  XAPI startup) and a stack sized from the XBE header (`CORE-003`); a
+  `KernelServices` context (ADR 0012), a cooperative thread table (ADR 0011),
+  and real `PsCreateSystemThreadEx`/`PsTerminateSystemThread` exports let the
+  retail image create its worker thread and advance to `NtClose` (`KRN-005`).
 
 ### Fixed
 

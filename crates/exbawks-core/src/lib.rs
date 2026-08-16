@@ -6,6 +6,7 @@ mod emulator;
 mod error;
 mod loaded;
 mod report;
+mod threads;
 mod thunk;
 
 pub use config::EmulatorConfig;

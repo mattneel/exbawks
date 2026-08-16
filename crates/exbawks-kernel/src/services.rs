@@ -1,0 +1,78 @@
+use exbawks_types::GuestVa;
+use thiserror::Error;
+
+/// A request to create one guest thread (ADR 0011, ADR 0012).
+///
+/// Field meanings follow `PsCreateSystemThreadEx`; sizes are byte counts the
+/// implementation rounds to pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadCreateRequest {
+    /// Extension bytes reserved alongside the thread object.
+    pub thread_extension_size: u32,
+    /// The requested stack size in bytes.
+    pub kernel_stack_size: u32,
+    /// The thread-local-storage block size in bytes.
+    pub tls_data_size: u32,
+    /// The guest routine the thread starts at.
+    pub start_routine: GuestVa,
+    /// The first start-routine argument.
+    pub start_context1: u32,
+    /// The second start-routine argument.
+    pub start_context2: u32,
+    /// Whether the thread starts suspended.
+    pub create_suspended: bool,
+}
+
+/// The guest-visible identity of one created thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadCreated {
+    /// The guest handle value.
+    pub handle: u32,
+    /// The thread identifier.
+    pub thread_id: u32,
+    /// The guest address of the synthetic KTHREAD block.
+    pub kthread: GuestVa,
+}
+
+/// A kernel service failure.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum KernelServiceError {
+    /// The running context provides no implementation of this service.
+    #[error("the running context does not provide this kernel service")]
+    Unsupported,
+    /// Guest resources were exhausted.
+    #[error("guest resources are exhausted")]
+    ResourceExhausted,
+}
+
+/// Emulator-provided services kernel exports call (ADR 0012).
+///
+/// Methods are narrow, typed request/response operations. Implementations
+/// must not switch guest threads directly; scheduling effects are recorded
+/// as pending actions the run loop applies after the export returns
+/// (ADR 0011).
+pub trait KernelServices {
+    /// Creates one guest thread and returns its identity.
+    fn create_thread(
+        &mut self,
+        request: ThreadCreateRequest,
+    ) -> Result<ThreadCreated, KernelServiceError>;
+
+    /// Records the pending termination of the calling thread.
+    fn exit_current_thread(&mut self, status: u32);
+}
+
+/// A services implementation for contexts without an emulator.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UnsupportedServices;
+
+impl KernelServices for UnsupportedServices {
+    fn create_thread(
+        &mut self,
+        _request: ThreadCreateRequest,
+    ) -> Result<ThreadCreated, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
+    fn exit_current_thread(&mut self, _status: u32) {}
+}

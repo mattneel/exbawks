@@ -2,6 +2,7 @@ use exbawks_types::{GuestVa, StopReason};
 
 use crate::{
     KernelCallContext, KernelError, KernelExport, KernelRegistry, KernelStatus, StubExport,
+    ThreadCreateRequest,
 };
 
 /// Xbox kernel export ordinals from the public XboxDev export table.
@@ -32,8 +33,8 @@ pub mod ordinal {
     pub const PS_TERMINATE_SYSTEM_THREAD: u16 = 258;
 }
 
-/// The startup stubs for virtual memory, threads, events, timers, and files.
-const STARTUP_STUBS: [(u16, &str); 10] = [
+/// The startup stubs for virtual memory, events, timers, and files.
+const STARTUP_STUBS: [(u16, &str); 8] = [
     (ordinal::KE_DELAY_EXECUTION_THREAD, "KeDelayExecutionThread"),
     (ordinal::KE_SET_TIMER, "KeSetTimer"),
     (ordinal::NT_ALLOCATE_VIRTUAL_MEMORY, "NtAllocateVirtualMemory"),
@@ -42,14 +43,14 @@ const STARTUP_STUBS: [(u16, &str); 10] = [
     (ordinal::NT_CREATE_FILE, "NtCreateFile"),
     (ordinal::NT_FREE_VIRTUAL_MEMORY, "NtFreeVirtualMemory"),
     (ordinal::NT_SET_EVENT, "NtSetEvent"),
-    (ordinal::PS_CREATE_SYSTEM_THREAD_EX, "PsCreateSystemThreadEx"),
-    (ordinal::PS_TERMINATE_SYSTEM_THREAD, "PsTerminateSystemThread"),
 ];
 
 /// Registers the startup export set for one synthetic guest thread.
 pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register(DbgPrint)?;
     registry.register(HalReturnToFirmware)?;
+    registry.register(PsCreateSystemThreadEx)?;
+    registry.register(PsTerminateSystemThread)?;
     for (ordinal, name) in STARTUP_STUBS {
         registry.register(StubExport::new(ordinal, name))?;
     }
@@ -105,6 +106,107 @@ impl KernelExport for HalReturnToFirmware {
     fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
         let routine = stack_argument(context, 0).unwrap_or(0);
         context.stop_request = Some(StopReason::GuestExit { code: routine });
+        KernelStatus::SUCCESS
+    }
+}
+
+/// Creates one guest thread through the kernel services (ADR 0011/0012).
+///
+/// Arguments follow the public `PsCreateSystemThreadEx` shape: handle out,
+/// extension size, stack size, TLS size, optional thread-id out, two start
+/// contexts, create-suspended, debugger flag (ignored), start routine.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PsCreateSystemThreadEx;
+
+impl KernelExport for PsCreateSystemThreadEx {
+    fn ordinal(&self) -> u16 {
+        ordinal::PS_CREATE_SYSTEM_THREAD_EX
+    }
+
+    fn name(&self) -> &'static str {
+        "PsCreateSystemThreadEx"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        40
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        let mut arguments = [0_u32; 10];
+        for (index, slot) in arguments.iter_mut().enumerate() {
+            let Some(value) = stack_argument(context, index as u32) else {
+                return KernelStatus::INVALID_PARAMETER;
+            };
+            *slot = value;
+        }
+        let [
+            handle_out,
+            extension,
+            stack_size,
+            tls_size,
+            id_out,
+            context1,
+            context2,
+            suspended,
+            _debugger,
+            routine,
+        ] = arguments;
+
+        // Probe the out-parameters before creating anything, so a bad
+        // pointer fails without leaking a thread.
+        if context.memory.write_u32(GuestVa(handle_out), 0).is_err() {
+            return KernelStatus::INVALID_PARAMETER;
+        }
+        if id_out != 0 && context.memory.write_u32(GuestVa(id_out), 0).is_err() {
+            return KernelStatus::INVALID_PARAMETER;
+        }
+
+        let request = ThreadCreateRequest {
+            thread_extension_size: extension,
+            kernel_stack_size: stack_size,
+            tls_data_size: tls_size,
+            start_routine: GuestVa(routine),
+            start_context1: context1,
+            start_context2: context2,
+            create_suspended: suspended != 0,
+        };
+        let Ok(created) = context.services.create_thread(request) else {
+            return KernelStatus::INSUFFICIENT_RESOURCES;
+        };
+
+        if context.memory.write_u32(GuestVa(handle_out), created.handle).is_err() {
+            return KernelStatus::INVALID_PARAMETER;
+        }
+        if id_out != 0 && context.memory.write_u32(GuestVa(id_out), created.thread_id).is_err() {
+            return KernelStatus::INVALID_PARAMETER;
+        }
+        KernelStatus::SUCCESS
+    }
+}
+
+/// Terminates the calling guest thread (ADR 0011).
+///
+/// The termination is recorded as a pending action; the run loop performs
+/// the switch after this call returns.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PsTerminateSystemThread;
+
+impl KernelExport for PsTerminateSystemThread {
+    fn ordinal(&self) -> u16 {
+        ordinal::PS_TERMINATE_SYSTEM_THREAD
+    }
+
+    fn name(&self) -> &'static str {
+        "PsTerminateSystemThread"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        4
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        let status = stack_argument(context, 0).unwrap_or(0);
+        context.services.exit_current_thread(status);
         KernelStatus::SUCCESS
     }
 }
@@ -181,7 +283,13 @@ mod tests {
 
         let mut cpu = CpuState::default();
         cpu.gpr[4] = 0x2000;
-        let mut context = KernelCallContext { cpu: &mut cpu, memory: &memory, stop_request: None };
+        let mut services = crate::UnsupportedServices;
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut services,
+            stop_request: None,
+        };
         assert_eq!(DbgPrint.call(&mut context), KernelStatus::SUCCESS);
     }
 
@@ -192,8 +300,78 @@ mod tests {
 
         let mut cpu = CpuState::default();
         cpu.gpr[4] = 0x2000;
-        let mut context = KernelCallContext { cpu: &mut cpu, memory: &memory, stop_request: None };
+        let mut services = crate::UnsupportedServices;
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut services,
+            stop_request: None,
+        };
         assert_eq!(DbgPrint.call(&mut context), KernelStatus::INVALID_PARAMETER);
+    }
+
+    #[derive(Default)]
+    struct RecordingServices {
+        last_request: Option<crate::ThreadCreateRequest>,
+        exited: Option<u32>,
+    }
+
+    impl crate::KernelServices for RecordingServices {
+        fn create_thread(
+            &mut self,
+            request: crate::ThreadCreateRequest,
+        ) -> Result<crate::ThreadCreated, crate::KernelServiceError> {
+            self.last_request = Some(request);
+            Ok(crate::ThreadCreated { handle: 0xE004, thread_id: 2, kthread: GuestVa(0x8001_0200) })
+        }
+
+        fn exit_current_thread(&mut self, status: u32) {
+            self.exited = Some(status);
+        }
+    }
+
+    #[test]
+    fn create_thread_parses_arguments_and_writes_outputs() {
+        let memory = memory_with_stack();
+        // Ten stdcall arguments above the return-address slot at ESP+4.
+        let arguments = [0x1200_u32, 0, 0x4000, 0, 0x1204, 0xAA, 0xBB, 0, 0, 0x1A00];
+        for (index, value) in arguments.iter().enumerate() {
+            memory.write_u32(GuestVa(0x2004 + index as u32 * 4), *value).expect("write");
+        }
+        let mut cpu = CpuState::default();
+        cpu.gpr[4] = 0x2000;
+        let mut services = RecordingServices::default();
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut services,
+            stop_request: None,
+        };
+        assert_eq!(PsCreateSystemThreadEx.call(&mut context), KernelStatus::SUCCESS);
+
+        let request = services.last_request.expect("a request was made");
+        assert_eq!(request.start_routine, GuestVa(0x1A00));
+        assert_eq!(request.kernel_stack_size, 0x4000);
+        assert_eq!(request.start_context1, 0xAA);
+        assert_eq!(memory.read_u32(GuestVa(0x1200)).expect("handle out"), 0xE004);
+        assert_eq!(memory.read_u32(GuestVa(0x1204)).expect("id out"), 2);
+    }
+
+    #[test]
+    fn terminate_thread_records_the_exit_status() {
+        let memory = memory_with_stack();
+        memory.write_u32(GuestVa(0x2004), 0x42).expect("write");
+        let mut cpu = CpuState::default();
+        cpu.gpr[4] = 0x2000;
+        let mut services = RecordingServices::default();
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut services,
+            stop_request: None,
+        };
+        assert_eq!(PsTerminateSystemThread.call(&mut context), KernelStatus::SUCCESS);
+        assert_eq!(services.exited, Some(0x42));
     }
 
     #[test]
@@ -203,7 +381,13 @@ mod tests {
 
         let mut cpu = CpuState::default();
         cpu.gpr[4] = 0x2000;
-        let mut context = KernelCallContext { cpu: &mut cpu, memory: &memory, stop_request: None };
+        let mut services = crate::UnsupportedServices;
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut services,
+            stop_request: None,
+        };
         assert_eq!(HalReturnToFirmware.call(&mut context), KernelStatus::SUCCESS);
         assert_eq!(context.stop_request, Some(StopReason::GuestExit { code: 2 }));
     }
