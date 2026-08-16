@@ -43,6 +43,9 @@ The project follows Keep a Changelog structure before its first release.
 - A verified kernel export ordinal table (371 entries: name, function or data
   kind, calling convention, gate stack bytes) generated from the vendored
   CC0-licensed nxdk def file, with pinned decode-rule tests (`KRN-001`).
+- `exbawks thunks --check-registry` names every imported ordinal and reports
+  it as implemented, stub, or missing with summary counts — the standing
+  triage tool for kernel HLE burn-down (`CLI-001`).
 
 ### Fixed
 

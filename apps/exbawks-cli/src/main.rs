@@ -69,6 +69,9 @@ enum Command {
         /// The maximum entry count.
         #[arg(long, default_value_t = 4096)]
         limit: usize,
+        /// Annotates each ordinal with its name and registry status.
+        #[arg(long)]
+        check_registry: bool,
     },
     /// Loads and executes one XBE until a controlled stop reason.
     Run {
@@ -130,7 +133,9 @@ fn main() -> Result<()> {
             let report = plan(&path, backend.into(), ram_mib)?;
             print_plan(&report, cli.json)
         }
-        Command::Thunks { path, limit } => thunks(&path, limit, cli.json),
+        Command::Thunks { path, limit, check_registry } => {
+            thunks(&path, limit, check_registry, cli.json)
+        }
         Command::Run { path, ram_mib, trace, trace_host_paths } => {
             run(&path, ram_mib, trace.as_deref(), trace_host_paths, cli.json)
         }
@@ -298,7 +303,7 @@ fn print_plan(report: &BootPlanReport, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn thunks(path: &Path, limit: usize, json: bool) -> Result<()> {
+fn thunks(path: &Path, limit: usize, check_registry: bool, json: bool) -> Result<()> {
     let bytes = read_file(path)?;
     let config = EmulatorConfig { max_kernel_thunks: limit, ..EmulatorConfig::default() };
     let mut emulator = EmulatorBuilder::new().config(config).build()?;
@@ -306,6 +311,15 @@ fn thunks(path: &Path, limit: usize, json: bool) -> Result<()> {
         emulator.load_xbe(bytes).with_context(|| format!("failed to load {}", path.display()))?;
     let start = loaded.image().header.kernel_thunk_address;
     let table = loaded.kernel_thunks();
+
+    if check_registry {
+        let report = annotate_thunks(start, &table.entries, emulator.kernel());
+        if json {
+            return print_json(&report);
+        }
+        print_thunk_registry(&report);
+        return Ok(());
+    }
 
     if json {
         return print_json(table);
@@ -317,6 +331,83 @@ fn thunks(path: &Path, limit: usize, json: bool) -> Result<()> {
         println!("{}  ordinal {}", thunk.slot, thunk.ordinal);
     }
     Ok(())
+}
+
+/// One annotated kernel import for registry triage.
+#[derive(Debug, Serialize)]
+struct ThunkRegistryEntry {
+    slot: GuestVa,
+    ordinal: u16,
+    name: String,
+    kind: &'static str,
+    status: &'static str,
+}
+
+/// A registry-coverage summary for one thunk table.
+#[derive(Debug, Serialize)]
+struct ThunkRegistryReport {
+    start: GuestVa,
+    implemented: usize,
+    stubs: usize,
+    missing: usize,
+    entries: Vec<ThunkRegistryEntry>,
+}
+
+fn annotate_thunks(
+    start: GuestVa,
+    entries: &[exbawks_core::KernelThunk],
+    registry: &exbawks_kernel::KernelRegistry,
+) -> ThunkRegistryReport {
+    let mut report =
+        ThunkRegistryReport { start, implemented: 0, stubs: 0, missing: 0, entries: Vec::new() };
+
+    for thunk in entries {
+        let info = exbawks_kernel::kernel_ordinal_info(thunk.ordinal);
+        let name =
+            info.map_or_else(|| format!("ordinal-{}", thunk.ordinal), |info| info.name.to_owned());
+        let kind = match info.map(|info| info.kind) {
+            Some(exbawks_kernel::ExportKind::Function) => "function",
+            Some(exbawks_kernel::ExportKind::Data) => "data",
+            None => "unknown",
+        };
+        let status = match registry.get(thunk.ordinal) {
+            Some(export) if export.is_stub() => {
+                report.stubs += 1;
+                "stub"
+            }
+            Some(_) => {
+                report.implemented += 1;
+                "implemented"
+            }
+            None => {
+                report.missing += 1;
+                "missing"
+            }
+        };
+        report.entries.push(ThunkRegistryEntry {
+            slot: thunk.slot,
+            ordinal: thunk.ordinal,
+            name,
+            kind,
+            status,
+        });
+    }
+
+    report
+}
+
+fn print_thunk_registry(report: &ThunkRegistryReport) {
+    println!("Kernel thunk table: {}", report.start);
+    println!("Entries:            {}", report.entries.len());
+    println!("Implemented:        {}", report.implemented);
+    println!("Stubs:              {}", report.stubs);
+    println!("Missing:            {}", report.missing);
+    for entry in &report.entries {
+        println!(
+            "{}  ordinal {:>3}  {:<32} {:<8} {}",
+            entry.slot, entry.ordinal, entry.name, entry.kind, entry.status
+        );
+    }
 }
 
 fn run(
@@ -444,5 +535,34 @@ mod tests {
     #[test]
     fn integer_parser_accepts_hexadecimal() {
         assert_eq!(parse_u32("0x1000"), Ok(4096));
+    }
+
+    #[test]
+    fn thunk_annotation_reports_all_three_registry_states() {
+        use exbawks_core::KernelThunk;
+        use exbawks_kernel::{DbgPrint, KernelRegistry, StubExport, ordinal};
+
+        let registry = KernelRegistry::new();
+        registry.register(DbgPrint).expect("DbgPrint must register");
+        registry
+            .register(StubExport::new(ordinal::NT_CREATE_FILE, "NtCreateFile"))
+            .expect("stub must register");
+
+        let entries = [
+            KernelThunk { slot: GuestVa(0x1000), ordinal: ordinal::DBG_PRINT },
+            KernelThunk { slot: GuestVa(0x1004), ordinal: ordinal::NT_CREATE_FILE },
+            KernelThunk { slot: GuestVa(0x1008), ordinal: 156 },
+        ];
+        let report = annotate_thunks(GuestVa(0x1000), &entries, &registry);
+
+        assert_eq!(report.implemented, 1);
+        assert_eq!(report.stubs, 1);
+        assert_eq!(report.missing, 1);
+        assert_eq!(report.entries[0].name, "DbgPrint");
+        assert_eq!(report.entries[0].status, "implemented");
+        assert_eq!(report.entries[1].status, "stub");
+        assert_eq!(report.entries[2].name, "KeTickCount");
+        assert_eq!(report.entries[2].kind, "data");
+        assert_eq!(report.entries[2].status, "missing");
     }
 }

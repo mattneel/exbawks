@@ -17,6 +17,7 @@ clap.workspace = true
 exbawks-core.workspace = true
 exbawks-cpu.workspace = true
 exbawks-debug.workspace = true
+exbawks-kernel.workspace = true
 exbawks-platform.workspace = true
 exbawks-types.workspace = true
 exbawks-xbe.workspace = true

@@ -13,6 +13,11 @@ pub trait KernelExport: Send + Sync {
         0
     }
 
+    /// Returns true when the export is a named placeholder without semantics.
+    fn is_stub(&self) -> bool {
+        false
+    }
+
     /// Executes the export against checked guest state.
     fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus;
 }
@@ -39,6 +44,10 @@ impl KernelExport for StubExport {
 
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    fn is_stub(&self) -> bool {
+        true
     }
 
     fn call(&self, _context: &mut KernelCallContext<'_>) -> KernelStatus {

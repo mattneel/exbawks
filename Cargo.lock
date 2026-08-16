@@ -137,6 +137,7 @@ dependencies = [
  "exbawks-core",
  "exbawks-cpu",
  "exbawks-debug",
+ "exbawks-kernel",
  "exbawks-platform",
  "exbawks-types",
  "exbawks-xbe",
