@@ -28,8 +28,13 @@ const DISC_PREFIXES: [&str; 5] =
     ["\\Device\\CdRom0", "\\Device\\Harddisk0\\Partition1", "\\??\\D:", "\\??\\CdRom0:", "D:"];
 
 /// One open guest file object.
+///
+/// A `None` handle names a directory or device object (the disc root, a
+/// partition): titles open these to probe that the disc and HDD exist. Reads
+/// on a directory return nothing and its size is zero, which is enough for a
+/// presence check to pass.
 struct OpenFile {
-    file: File,
+    file: Option<File>,
     position: u64,
 }
 
@@ -95,15 +100,22 @@ impl HostFileSystem {
             return Err(KernelServiceError::AccessDenied);
         }
         let resolved = self.resolve(&request.path).ok_or(KernelServiceError::NotFound)?;
-        if !resolved.is_file() {
+        // A regular file opens for reading; a directory or device object
+        // (the disc root, a partition) opens as a marker so presence checks
+        // pass. Anything else does not exist.
+        let file = if resolved.is_file() {
+            Some(File::open(&resolved).map_err(|_| KernelServiceError::NotFound)?)
+        } else if resolved.is_dir() {
+            None
+        } else {
             return Err(KernelServiceError::NotFound);
-        }
-        let file = File::open(&resolved).map_err(|_| KernelServiceError::NotFound)?;
+        };
 
+        let is_directory = file.is_none();
         let handle = self.next_handle;
         self.next_handle = self.next_handle.wrapping_add(FILE_HANDLE_STEP);
         self.files.insert(handle, OpenFile { file, position: 0 });
-        tracing::debug!(path = %request.path, handle, "opened guest file");
+        tracing::debug!(path = %request.path, handle, is_directory, "opened guest object");
         Ok(FileOpened { handle, created: false })
     }
 
@@ -115,14 +127,18 @@ impl HostFileSystem {
         len: u32,
     ) -> Result<Vec<u8>, KernelServiceError> {
         let entry = self.files.get_mut(&handle).ok_or(KernelServiceError::InvalidHandle)?;
+        // A directory or device object has no byte stream to read.
+        let Some(file) = entry.file.as_mut() else {
+            return Ok(Vec::new());
+        };
         let start = offset.unwrap_or(entry.position);
-        entry.file.seek(SeekFrom::Start(start)).map_err(|_| KernelServiceError::AccessDenied)?;
+        file.seek(SeekFrom::Start(start)).map_err(|_| KernelServiceError::AccessDenied)?;
 
         let want = (len as usize).min(MAX_READ_BYTES);
         let mut buffer = vec![0_u8; want];
         let mut filled = 0;
         while filled < want {
-            match entry.file.read(&mut buffer[filled..]) {
+            match file.read(&mut buffer[filled..]) {
                 Ok(0) => break,
                 Ok(read) => filled += read,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -137,7 +153,11 @@ impl HostFileSystem {
     /// Returns the size and file-pointer position of one open file.
     pub(crate) fn info(&self, handle: u32) -> Result<FileInfo, KernelServiceError> {
         let entry = self.files.get(&handle).ok_or(KernelServiceError::InvalidHandle)?;
-        let size = entry.file.metadata().map_err(|_| KernelServiceError::AccessDenied)?.len();
+        // A directory or device object reports a zero size.
+        let size = match entry.file.as_ref() {
+            Some(file) => file.metadata().map_err(|_| KernelServiceError::AccessDenied)?.len(),
+            None => 0,
+        };
         Ok(FileInfo { size, position: entry.position })
     }
 
@@ -218,5 +238,99 @@ mod tests {
         assert!(fs.mount_for("\\Device\\Harddisk0\\Partition2\\x").is_none());
         // A device name must end at a separator, never mid-name.
         assert!(fs.mount_for("D:extra\\x").is_none());
+    }
+
+    /// A self-cleaning temporary directory for the filesystem-backed tests.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("exbawks-hostfs-{tag}-{}-{unique}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("create scratch dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn opens_read_and_close_a_real_file() {
+        let scratch = ScratchDir::new("file");
+        std::fs::write(scratch.0.join("data.bin"), b"HELLO-DISC").expect("write file");
+        let mut fs = HostFileSystem::new(Some(scratch.0.clone()));
+
+        let opened = fs
+            .open(&FileOpenRequest {
+                path: "\\Device\\CdRom0\\data.bin".to_owned(),
+                write_access: false,
+            })
+            .expect("open succeeds");
+        assert_eq!(fs.info(opened.handle).unwrap().size, 10, "the file size is reported");
+        assert_eq!(fs.read(opened.handle, Some(0), 5).unwrap(), b"HELLO");
+        // The file pointer advanced past the explicit read's end.
+        assert_eq!(fs.read(opened.handle, None, 5).unwrap(), b"-DISC");
+        assert!(fs.close(opened.handle), "the handle closes");
+        assert!(!fs.close(opened.handle), "a closed handle is unknown");
+    }
+
+    #[test]
+    fn opens_a_device_directory_as_a_zero_size_object() {
+        let scratch = ScratchDir::new("dir");
+        let mut fs = HostFileSystem::new(Some(scratch.0.clone()));
+        // Opening the bare device (the mount root, a directory) succeeds so a
+        // disc/HDD presence check passes.
+        let opened = fs
+            .open(&FileOpenRequest { path: "\\Device\\CdRom0".to_owned(), write_access: false })
+            .expect("device open succeeds");
+        assert_eq!(fs.info(opened.handle).unwrap().size, 0, "a directory has no size");
+        assert!(fs.read(opened.handle, None, 16).unwrap().is_empty(), "a directory reads empty");
+    }
+
+    #[test]
+    fn a_write_open_and_a_missing_file_are_refused() {
+        let scratch = ScratchDir::new("deny");
+        let mut fs = HostFileSystem::new(Some(scratch.0.clone()));
+        assert_eq!(
+            fs.open(&FileOpenRequest {
+                path: "\\Device\\CdRom0\\x".to_owned(),
+                write_access: true
+            }),
+            Err(KernelServiceError::AccessDenied),
+            "the disc is read-only"
+        );
+        assert_eq!(
+            fs.open(&FileOpenRequest {
+                path: "\\Device\\CdRom0\\nope.bin".to_owned(),
+                write_access: false
+            }),
+            Err(KernelServiceError::NotFound),
+            "a missing file is not found"
+        );
+    }
+
+    #[test]
+    fn an_escape_attempt_is_confined() {
+        let scratch = ScratchDir::new("escape");
+        // A secret one level above the mount root.
+        std::fs::write(scratch.0.join("outside.txt"), b"secret").expect("write");
+        let inside = scratch.0.join("disc");
+        std::fs::create_dir_all(&inside).expect("create mount");
+        let mut fs = HostFileSystem::new(Some(inside));
+        assert_eq!(
+            fs.open(&FileOpenRequest {
+                path: "\\Device\\CdRom0\\..\\outside.txt".to_owned(),
+                write_access: false
+            }),
+            Err(KernelServiceError::NotFound),
+            "a `..` escape never reaches the parent directory"
+        );
     }
 }

@@ -171,6 +171,11 @@ The project follows Keep a Changelog structure before its first release.
 
 ### Fixed
 
+- The host file device opens a directory or device object (the disc root, an
+  HDD partition) as a zero-size marker instead of reporting "not found", so a
+  title's disc/HDD presence check passes. The retail image now clears its
+  presence check — no longer taking the `HalReturnToFirmware` reboot — and
+  advances to a disc device IOCTL (`NtDeviceIoControlFile`).
 - The loader validates every header and section range against the declared
   image window in 64-bit arithmetic, so a malformed XBE with a high base
   address or an oversized image returns a typed error instead of panicking
