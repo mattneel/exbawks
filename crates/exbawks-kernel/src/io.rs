@@ -14,10 +14,12 @@ use crate::{KernelCallContext, KernelError, KernelExport, KernelRegistry, Kernel
 /// The longest ANSI string the exports read from guest memory.
 const MAX_STRING_BYTES: usize = 512;
 
-/// Registers the Io* symbolic-link exports.
+/// Registers the Io* and symbolic-link-object exports.
 pub(crate) fn register_io_exports(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register(IoCreateSymbolicLink)?;
     registry.register(IoDeleteSymbolicLink)?;
+    registry.register(NtOpenSymbolicLinkObject)?;
+    registry.register(NtQuerySymbolicLinkObject)?;
     Ok(())
 }
 
@@ -102,6 +104,105 @@ impl KernelExport for IoDeleteSymbolicLink {
         } else {
             KernelStatus::OBJECT_NAME_NOT_FOUND
         }
+    }
+}
+
+/// Opens a handle to an existing symbolic-link object.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NtOpenSymbolicLinkObject;
+
+impl KernelExport for NtOpenSymbolicLinkObject {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::NT_OPEN_SYMBOLIC_LINK_OBJECT
+    }
+
+    fn name(&self) -> &'static str {
+        "NtOpenSymbolicLinkObject"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        8
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // NtOpenSymbolicLinkObject(LinkHandle, ObjectAttributes). The name
+        // comes from OBJECT_ATTRIBUTES.ObjectName (PANSI_STRING at +4).
+        let (Some(handle_out), Some(attributes)) =
+            (stack_argument(context, 0), stack_argument(context, 1))
+        else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        if handle_out == 0 || attributes == 0 {
+            return KernelStatus::INVALID_PARAMETER;
+        }
+        let Ok(name_pointer) = context.memory.read_u32(GuestVa(attributes + 4)) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        let Some(name) = ansi_string(context, name_pointer) else {
+            return KernelStatus::OBJECT_NAME_NOT_FOUND;
+        };
+        match context.services.open_symbolic_link(&name) {
+            Ok(handle) => {
+                let _ = context.memory.write_u32(GuestVa(handle_out), handle);
+                KernelStatus::SUCCESS
+            }
+            Err(_) => KernelStatus::OBJECT_NAME_NOT_FOUND,
+        }
+    }
+}
+
+/// Reads the target string of an open symbolic-link handle.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NtQuerySymbolicLinkObject;
+
+impl KernelExport for NtQuerySymbolicLinkObject {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::NT_QUERY_SYMBOLIC_LINK_OBJECT
+    }
+
+    fn name(&self) -> &'static str {
+        "NtQuerySymbolicLinkObject"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        12
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // NtQuerySymbolicLinkObject(LinkHandle, LinkTarget: PANSI_STRING,
+        //                           ReturnedLength: PULONG optional).
+        let (Some(handle), Some(target_out)) =
+            (stack_argument(context, 0), stack_argument(context, 1))
+        else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        let returned_out = stack_argument(context, 2).unwrap_or(0);
+        let target = match context.services.query_symbolic_link(handle) {
+            Ok(target) => target,
+            Err(_) => return KernelStatus::INVALID_HANDLE,
+        };
+        if returned_out != 0 {
+            let _ = context.memory.write_u32(GuestVa(returned_out), target.len() as u32);
+        }
+        // Fill the caller's ANSI_STRING: Length@0 (u16), MaximumLength@2,
+        // Buffer@4. A short buffer takes a truncated copy and reports it.
+        let Ok(packed) = context.memory.read_u32(GuestVa(target_out)) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        let maximum = (packed >> 16) & 0xFFFF;
+        let Ok(buffer) = context.memory.read_u32(GuestVa(target_out + 4)) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        let copy = target.len().min(maximum as usize);
+        if buffer != 0 && copy > 0 {
+            let _ = context.memory.write(GuestVa(buffer), &target.as_bytes()[..copy]);
+        }
+        let repacked = (copy as u32 & 0xFFFF) | (maximum << 16);
+        let _ = context.memory.write_u32(GuestVa(target_out), repacked);
+        if copy < target.len() {
+            return KernelStatus::BUFFER_TOO_SMALL;
+        }
+        KernelStatus::SUCCESS
     }
 }
 

@@ -1,6 +1,6 @@
 //! The guest thread table and kernel service implementation (ADR 0011/0012).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -48,6 +48,27 @@ const MEM_COMMIT: u32 = 0x0000_1000;
 
 /// The KTHREAD block offset inside each thread's KPCR page.
 const KTHREAD_OFFSET: u32 = 0x200;
+/// The largest TLS template or zero-fill the loader honors; the sizes are
+/// guest-controlled header fields, so they are bounded.
+const MAX_TLS_BYTES: u32 = 1024 * 1024;
+
+/// The image's `IMAGE_TLS_DIRECTORY` contents (ADR 0010 thread layout).
+///
+/// On the Xbox, thread-local storage lives at the **top of each thread's
+/// stack**: the XDK CRT computes `_tls_index = -(aligned_tls_size / 4)` and
+/// reads its block through `[fs:[4] + _tls_index * 4]`, i.e. at a negative
+/// offset below `NtTib.StackBase`. XAPI's own guest code claims and fills
+/// that region; the emulator's job is to keep the initial stack pointer
+/// *below* it so ordinary pushes never clobber it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TlsTemplate {
+    /// The guest VA of the initialized TLS data's first byte.
+    pub raw_start: u32,
+    /// One past the initialized TLS data's last byte.
+    pub raw_end: u32,
+    /// Zero bytes appended after the initialized data.
+    pub zero_fill: u32,
+}
 /// The embedded KPRCB offset inside the KPCR (Xbox layout); its first field
 /// is `CurrentThread`, and `KPCR.Prcb` (`fs:[0x20]`) points here.
 const PRCB_OFFSET: u32 = 0x28;
@@ -127,10 +148,26 @@ pub(crate) struct ThreadManager {
     /// 164), captured when the kernel variables are built, or `None` when the
     /// image does not import it.
     launch_data_page_cell: Option<GuestVa>,
+    /// The guest address of the `KeTickCount` variable cell (data ordinal
+    /// 156), which the run loop advances as the virtual clock (KRN-003).
+    tick_count_cell: Option<GuestVa>,
+    /// The image's TLS directory, when it has one; each thread gets a block
+    /// built from this template.
+    tls_template: Option<TlsTemplate>,
+    /// Guest event objects (handle → (manual-reset, signaled)). Under the
+    /// cooperative scheduler (ADR 0011) events never block; the state exists
+    /// for the guest's own signal/query bookkeeping.
+    events: HashMap<u32, (bool, bool)>,
 }
+
+/// The first guest handle the event table hands out; disjoint from file
+/// (`0x100`+) and thread (`0xE000`+) handles.
+const EVENT_HANDLE_BASE: u32 = 0x0000_A000;
 
 /// The data-export ordinal of the kernel `LaunchDataPage` pointer variable.
 const LAUNCH_DATA_PAGE_ORDINAL: u16 = 164;
+/// The data-export ordinal of the kernel `KeTickCount` variable.
+const KE_TICK_COUNT_ORDINAL: u16 = 156;
 
 impl ThreadManager {
     pub(crate) fn new(
@@ -155,7 +192,35 @@ impl ThreadManager {
             files: HostFileSystem::new(disc_root, hdd_root),
             persisted: Vec::new(),
             launch_data_page_cell: None,
+            tick_count_cell: None,
+            tls_template: None,
+            events: HashMap::new(),
         }
+    }
+
+    /// Returns the guest address of the `KeTickCount` cell, when imported.
+    pub(crate) fn tick_count_cell(&self) -> Option<GuestVa> {
+        self.tick_count_cell
+    }
+
+    /// Supplies the image's TLS directory before threads are created.
+    pub(crate) fn set_tls_template(&mut self, template: TlsTemplate) {
+        self.tls_template = Some(template);
+    }
+
+    /// Bytes to reserve for TLS at the top of each thread's stack.
+    ///
+    /// Mirrors the XDK CRT's size computation — `align16(data + zero_fill) +
+    /// 4` — with slack, so the region the CRT claims below `StackBase` sits
+    /// wholly above the initial stack pointer.
+    pub(crate) fn tls_reserve_bytes(&self) -> u32 {
+        let Some(template) = self.tls_template else {
+            return 0;
+        };
+        let data = template.raw_end.saturating_sub(template.raw_start).min(MAX_TLS_BYTES);
+        let zero = template.zero_fill.min(MAX_TLS_BYTES);
+        let total = data.saturating_add(zero);
+        (total.saturating_add(15) & !15).saturating_add(16)
     }
 
     /// Returns the guest address of the `LaunchDataPage` variable cell, when
@@ -183,7 +248,7 @@ impl ThreadManager {
         stack_base: GuestVa,
         stack_bytes: u32,
     ) -> Result<GuestVa, MemoryError> {
-        let kpcr = self.build_thread_pages(stack_base, stack_bytes, GuestVa(0))?;
+        let kpcr = self.build_thread_pages(stack_base, stack_bytes)?;
         self.threads.push(GuestThread {
             cpu: CpuState::default(),
             state: ThreadState::Running,
@@ -251,6 +316,9 @@ impl ThreadManager {
             if ordinal == LAUNCH_DATA_PAGE_ORDINAL {
                 self.launch_data_page_cell = Some(cell);
             }
+            if ordinal == KE_TICK_COUNT_ORDINAL {
+                self.tick_count_cell = Some(cell);
+            }
             variables.insert(ordinal, cell);
         }
         Ok(variables)
@@ -294,14 +362,16 @@ impl ThreadManager {
         &mut self,
         stack_base: GuestVa,
         stack_bytes: u32,
-        tls_data: GuestVa,
     ) -> Result<GuestVa, MemoryError> {
         let kpcr_range = self.allocate_kernel_block(GUEST_PAGE_SIZE)?;
         let kpcr = kpcr_range.start();
         let kthread = GuestVa(kpcr.0 + KTHREAD_OFFSET);
         let stack_top = stack_base.0.wrapping_add(stack_bytes);
 
-        // KPCR / NT_TIB / KPRCB fields (Xbox layout, ADR 0010).
+        // KPCR / NT_TIB / KPRCB fields (Xbox layout, ADR 0010). `fs:[4]` is
+        // the true StackBase: the CRT claims its TLS region at negative
+        // offsets below it, so the initial ESP must sit below the reserve
+        // (`tls_reserve_bytes`), which the thread-creation paths honor.
         self.memory.write_u32(kpcr, 0xFFFF_FFFF)?; // fs:[0x00] NtTib.ExceptionList
         self.memory.write_u32(GuestVa(kpcr.0 + 0x04), stack_top)?; // NtTib.StackBase
         self.memory.write_u32(GuestVa(kpcr.0 + 0x08), stack_base.0)?; // NtTib.StackLimit
@@ -310,11 +380,49 @@ impl ThreadManager {
         self.memory.write_u32(GuestVa(kpcr.0 + 0x20), kpcr.0 + PRCB_OFFSET)?; // KPCR.Prcb
         self.memory.write_u32(GuestVa(kpcr.0 + PRCB_OFFSET), kthread.0)?; // Prcb.CurrentThread
 
-        // Synthetic KTHREAD fields XAPI consumes.
+        // Synthetic KTHREAD fields XAPI consumes; TlsData points at the
+        // thread's TLS area below StackBase when the image has TLS.
         self.memory.write_u32(GuestVa(kthread.0 + 0x1C), stack_top)?;
         self.memory.write_u32(GuestVa(kthread.0 + 0x20), stack_base.0)?;
-        self.memory.write_u32(GuestVa(kthread.0 + 0x28), tls_data.0)?;
+        let tls_data = self.initialize_stack_tls(stack_top)?;
+        self.memory.write_u32(GuestVa(kthread.0 + 0x28), tls_data)?;
         Ok(kpcr)
+    }
+
+    /// Lays out the thread's TLS area at the top of its stack.
+    ///
+    /// Mirrors the XDK CRT contract exactly: with `size = align16(data +
+    /// zero_fill) + 4` and `_tls_index = -size/4`, the accessor reads a block
+    /// pointer from `[StackBase + _tls_index*4] = [StackBase - size]`, so
+    /// that slot holds a self-pointer to the data at `StackBase - size + 4`,
+    /// which is filled from the image's TLS template (zero-fill is already
+    /// zero from the fresh stack mapping). Returns the TLS data address, or
+    /// zero when the image has no TLS.
+    fn initialize_stack_tls(&mut self, stack_top: u32) -> Result<u32, MemoryError> {
+        let Some(template) = self.tls_template else {
+            return Ok(0);
+        };
+        let data_bytes = template.raw_end.saturating_sub(template.raw_start).min(MAX_TLS_BYTES);
+        let zero_bytes = template.zero_fill.min(MAX_TLS_BYTES);
+        let size =
+            (data_bytes.saturating_add(zero_bytes).saturating_add(15) & !15).saturating_add(4);
+        let slot = stack_top.saturating_sub(size);
+        let data = slot.saturating_add(4);
+        self.memory.write_u32(GuestVa(slot), data)?;
+        if data_bytes > 0 {
+            let mut bytes = vec![0_u8; data_bytes as usize];
+            // A short template read leaves zeros, which still functions.
+            if self.memory.read(GuestVa(template.raw_start), &mut bytes).is_ok() {
+                self.memory.write(GuestVa(data), &bytes)?;
+            }
+        }
+        tracing::debug!(
+            slot = format_args!("{slot:#x}"),
+            data = format_args!("{data:#x}"),
+            size,
+            "thread TLS laid out at stack top"
+        );
+        Ok(data)
     }
 
     /// Takes the scheduling action the last kernel call recorded.
@@ -369,23 +477,23 @@ impl KernelServices for ThreadManager {
         let stack = self
             .allocate_kernel_block(stack_bytes)
             .map_err(|_| KernelServiceError::ResourceExhausted)?;
-        let tls = if request.tls_data_size == 0 {
-            GuestVa(0)
-        } else {
-            self.allocate_kernel_block(request.tls_data_size)
-                .map_err(|_| KernelServiceError::ResourceExhausted)?
-                .start()
-        };
+        // The requested TLS size derives from the same image TLS directory
+        // the template models, so each thread's block comes from the
+        // template inside `build_thread_pages`.
         let kpcr = self
-            .build_thread_pages(stack.start(), stack.len() as u32, tls)
+            .build_thread_pages(stack.start(), stack.len() as u32)
             .map_err(|_| KernelServiceError::ResourceExhausted)?;
         let kthread = GuestVa(kpcr.0 + KTHREAD_OFFSET);
 
         // The initial frame: the start routine returns to the exit sentinel
-        // and receives its two context arguments. The cursor bound keeps
-        // stack_top well below 2^32, so this cannot underflow.
+        // and receives its two context arguments. ESP starts below the TLS
+        // reserve at the stack top (the CRT claims that region). The cursor
+        // bound keeps stack_top well below 2^32, so this cannot underflow.
         let stack_top = stack.start().0.wrapping_add(stack.len() as u32);
-        let esp = stack_top.saturating_sub(STACK_SCRATCH).saturating_sub(12);
+        let esp = stack_top
+            .saturating_sub(self.tls_reserve_bytes())
+            .saturating_sub(STACK_SCRATCH)
+            .saturating_sub(12);
         let frame_ok = self.memory.write_u32(GuestVa(esp), THREAD_EXIT_SENTINEL.0).is_ok()
             && self.memory.write_u32(GuestVa(esp + 4), request.start_context1).is_ok()
             && self.memory.write_u32(GuestVa(esp + 8), request.start_context2).is_ok();
@@ -421,8 +529,30 @@ impl KernelServices for ThreadManager {
     }
 
     fn close_handle(&mut self, handle: u32) -> bool {
-        // Thread and file handles share one namespace but disjoint ranges.
-        self.handles.remove(&handle) || self.files.close(handle)
+        // Thread, file, and event handles share one namespace but disjoint
+        // ranges.
+        self.handles.remove(&handle)
+            || self.files.close(handle)
+            || self.events.remove(&handle).is_some()
+    }
+
+    fn create_event(
+        &mut self,
+        manual_reset: bool,
+        initially_signaled: bool,
+    ) -> Result<u32, KernelServiceError> {
+        let handle = EVENT_HANDLE_BASE + self.events.len() as u32 * 4;
+        self.events.insert(handle, (manual_reset, initially_signaled));
+        Ok(handle)
+    }
+
+    fn set_event(&mut self, handle: u32) -> Result<bool, KernelServiceError> {
+        let Some((_, signaled)) = self.events.get_mut(&handle) else {
+            return Err(KernelServiceError::InvalidHandle);
+        };
+        let previous = *signaled;
+        *signaled = true;
+        Ok(previous)
     }
 
     fn open_file(&mut self, request: FileOpenRequest) -> Result<FileOpened, KernelServiceError> {
@@ -462,6 +592,14 @@ impl KernelServices for ThreadManager {
 
     fn delete_symbolic_link(&mut self, name: &str) -> bool {
         self.files.delete_link(name)
+    }
+
+    fn open_symbolic_link(&mut self, name: &str) -> Result<u32, KernelServiceError> {
+        self.files.open_link_object(name)
+    }
+
+    fn query_symbolic_link(&mut self, handle: u32) -> Result<String, KernelServiceError> {
+        self.files.link_target(handle)
     }
 
     fn persist_memory(&mut self, base: u32, size: u32) {

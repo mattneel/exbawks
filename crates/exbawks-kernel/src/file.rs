@@ -45,6 +45,11 @@ const FILE_CREATED: u32 = 2;
 const FILE_STANDARD_INFORMATION: u32 = 5;
 /// `FILE_POSITION_INFORMATION` class ordinal.
 const FILE_POSITION_INFORMATION: u32 = 14;
+/// `FILE_NETWORK_OPEN_INFORMATION` class ordinal.
+const FILE_NETWORK_OPEN_INFORMATION: u32 = 34;
+/// `FILE_ATTRIBUTE_NORMAL` and `FILE_ATTRIBUTE_DIRECTORY`.
+const ATTRIBUTE_NORMAL: u32 = 0x80;
+const ATTRIBUTE_DIRECTORY: u32 = 0x10;
 
 /// Registers the Nt* file exports.
 pub(crate) fn register_file_exports(registry: &KernelRegistry) -> Result<(), KernelError> {
@@ -370,6 +375,7 @@ impl KernelExport for NtQueryInformationFile {
         ) else {
             return KernelStatus::INVALID_PARAMETER;
         };
+        tracing::debug!(class, length, "NtQueryInformationFile");
 
         let info = match context.services.file_info(handle) {
             Ok(info) => info,
@@ -399,6 +405,24 @@ impl KernelExport for NtQueryInformationFile {
                 }
                 write_u64(context, info_out, info.position);
                 8
+            }
+            FILE_NETWORK_OPEN_INFORMATION => {
+                // CreationTime, LastAccessTime, LastWriteTime, ChangeTime
+                // (8 each, zero — the virtual clock is later work),
+                // AllocationSize(8), EndOfFile(8), FileAttributes(4), pad(4).
+                if length < 56 {
+                    return buffer_too_small(context, iosb);
+                }
+                for offset in [0_u32, 8, 16, 24] {
+                    write_u64(context, info_out + offset, 0);
+                }
+                write_u64(context, info_out + 32, info.size); // AllocationSize
+                write_u64(context, info_out + 40, info.size); // EndOfFile
+                let attributes =
+                    if info.directory { ATTRIBUTE_DIRECTORY } else { ATTRIBUTE_NORMAL };
+                let _ = context.memory.write_u32(GuestVa(info_out + 48), attributes);
+                let _ = context.memory.write_u32(GuestVa(info_out + 52), 0);
+                56
             }
             _ => return buffer_too_small(context, iosb),
         };
@@ -624,7 +648,7 @@ mod tests {
         }
 
         fn file_info(&mut self, _handle: u32) -> Result<FileInfo, KernelServiceError> {
-            Ok(FileInfo { size: self.size, position: 0 })
+            Ok(FileInfo { size: self.size, position: 0, directory: false })
         }
     }
 

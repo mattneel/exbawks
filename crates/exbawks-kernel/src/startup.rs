@@ -25,6 +25,8 @@ pub mod ordinal {
     pub const KE_INITIALIZE_DPC: u16 = 107;
     /// `KeInitializeTimerEx`.
     pub const KE_INITIALIZE_TIMER_EX: u16 = 113;
+    /// `KeQuerySystemTime`.
+    pub const KE_QUERY_SYSTEM_TIME: u16 = 128;
     /// `KeSetTimer`.
     pub const KE_SET_TIMER: u16 = 149;
     /// `MmAllocateContiguousMemory`.
@@ -37,6 +39,8 @@ pub mod ordinal {
     pub const MM_GET_PHYSICAL_ADDRESS: u16 = 173;
     /// `MmPersistContiguousMemory`.
     pub const MM_PERSIST_CONTIGUOUS_MEMORY: u16 = 178;
+    /// `MmQueryStatistics`.
+    pub const MM_QUERY_STATISTICS: u16 = 181;
     /// `NtAllocateVirtualMemory`.
     pub const NT_ALLOCATE_VIRTUAL_MEMORY: u16 = 184;
     /// `NtClose`.
@@ -51,6 +55,10 @@ pub mod ordinal {
     pub const NT_FREE_VIRTUAL_MEMORY: u16 = 199;
     /// `NtOpenFile`.
     pub const NT_OPEN_FILE: u16 = 202;
+    /// `NtOpenSymbolicLinkObject`.
+    pub const NT_OPEN_SYMBOLIC_LINK_OBJECT: u16 = 203;
+    /// `NtQuerySymbolicLinkObject`.
+    pub const NT_QUERY_SYMBOLIC_LINK_OBJECT: u16 = 215;
     /// `NtQueryInformationFile`.
     pub const NT_QUERY_INFORMATION_FILE: u16 = 211;
     /// `NtQueryVolumeInformationFile`.
@@ -77,14 +85,16 @@ pub mod ordinal {
     pub const RTL_LEAVE_CRITICAL_SECTION: u16 = 294;
     /// `RtlNtStatusToDosError`.
     pub const RTL_NT_STATUS_TO_DOS_ERROR: u16 = 301;
+    /// `XeLoadSection`.
+    pub const XE_LOAD_SECTION: u16 = 327;
+    /// `XeUnloadSection`.
+    pub const XE_UNLOAD_SECTION: u16 = 328;
 }
 
-/// The startup stubs for events and timers.
-const STARTUP_STUBS: [(u16, &str); 4] = [
+/// The startup stubs for timers and reclamation.
+const STARTUP_STUBS: [(u16, &str); 2] = [
     (ordinal::KE_DELAY_EXECUTION_THREAD, "KeDelayExecutionThread"),
-    (ordinal::NT_CREATE_EVENT, "NtCreateEvent"),
     (ordinal::NT_FREE_VIRTUAL_MEMORY, "NtFreeVirtualMemory"),
-    (ordinal::NT_SET_EVENT, "NtSetEvent"),
 ];
 
 /// Benign exports that succeed as no-ops on the boot path:
@@ -99,6 +109,8 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     registry.register(PsCreateSystemThreadEx)?;
     registry.register(PsTerminateSystemThread)?;
     registry.register(NtClose)?;
+    registry.register(NtCreateEvent)?;
+    registry.register(NtSetEvent)?;
     crate::rtl::register_rtl_exports(registry)?;
     crate::ke::register_ke_exports(registry)?;
     crate::ex::register_ex_exports(registry)?;
@@ -106,6 +118,7 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     crate::file::register_file_exports(registry)?;
     crate::mm::register_mm_exports(registry)?;
     crate::io::register_io_exports(registry)?;
+    crate::xe::register_xe_exports(registry)?;
     for (ordinal, name, stack_bytes) in BENIGN_SUCCESS {
         registry.register(SuccessExport::new(ordinal, name, stack_bytes))?;
     }
@@ -305,6 +318,81 @@ impl KernelExport for NtClose {
     }
 }
 
+/// Creates a guest event object (ADR 0011: events never block; the state
+/// backs the guest's signal/query bookkeeping).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NtCreateEvent;
+
+impl KernelExport for NtCreateEvent {
+    fn ordinal(&self) -> u16 {
+        ordinal::NT_CREATE_EVENT
+    }
+
+    fn name(&self) -> &'static str {
+        "NtCreateEvent"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        16
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // NtCreateEvent(EventHandle, ObjectAttributes, EventType,
+        //               InitialState); type 0 is a manual-reset notification
+        //               event, 1 an auto-reset synchronization event.
+        let (Some(handle_out), Some(event_type), Some(initial)) =
+            (stack_argument(context, 0), stack_argument(context, 2), stack_argument(context, 3))
+        else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        if handle_out == 0 {
+            return KernelStatus::INVALID_PARAMETER;
+        }
+        match context.services.create_event(event_type == 0, initial & 0xFF != 0) {
+            Ok(handle) => {
+                let _ = context.memory.write_u32(GuestVa(handle_out), handle);
+                KernelStatus::SUCCESS
+            }
+            Err(_) => KernelStatus::INSUFFICIENT_RESOURCES,
+        }
+    }
+}
+
+/// Signals a guest event object.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NtSetEvent;
+
+impl KernelExport for NtSetEvent {
+    fn ordinal(&self) -> u16 {
+        ordinal::NT_SET_EVENT
+    }
+
+    fn name(&self) -> &'static str {
+        "NtSetEvent"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        8
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // NtSetEvent(EventHandle, PreviousState optional).
+        let Some(handle) = stack_argument(context, 0) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        let previous_out = stack_argument(context, 1).unwrap_or(0);
+        match context.services.set_event(handle) {
+            Ok(previous) => {
+                if previous_out != 0 {
+                    let _ = context.memory.write_u32(GuestVa(previous_out), u32::from(previous));
+                }
+                KernelStatus::SUCCESS
+            }
+            Err(_) => KernelStatus::INVALID_HANDLE,
+        }
+    }
+}
+
 /// Reads one 32-bit stack argument above the return-address slot.
 pub(crate) fn stack_argument(context: &KernelCallContext<'_>, index: u32) -> Option<u32> {
     let esp = context.cpu.gpr[4];
@@ -354,12 +442,11 @@ mod tests {
         let registry = KernelRegistry::new();
         register_startup_exports(&registry).expect("registration succeeds");
 
-        // Five thread/handle exports, six Rtl and three Ke dispatcher
-        // exports, one Ex executive export, one Nt virtual-memory export,
-        // seven Nt file exports, five Mm contiguous exports, two Io
-        // symbolic-link exports, one benign success export, and four startup
-        // stubs.
-        assert_eq!(registry.len(), 35);
+        // Seven thread/handle/event exports, six Rtl and four Ke exports,
+        // one Ex executive export, one Nt virtual-memory export, seven Nt
+        // file exports, six Mm exports, four symbolic-link exports, two Xe
+        // section exports, one benign success export, and two startup stubs.
+        assert_eq!(registry.len(), 41);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,

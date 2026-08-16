@@ -7,6 +7,8 @@
 //! is no real GPU yet (only the null backend), so the returned physical
 //! address is never dereferenced by hardware.
 
+use exbawks_types::GuestVa;
+
 use crate::startup::stack_argument;
 use crate::{KernelCallContext, KernelError, KernelExport, KernelRegistry, KernelStatus};
 
@@ -21,7 +23,60 @@ pub(crate) fn register_mm_exports(registry: &KernelRegistry) -> Result<(), Kerne
     registry.register(MmFreeContiguousMemory)?;
     registry.register(MmGetPhysicalAddress)?;
     registry.register(MmPersistContiguousMemory)?;
+    registry.register(MmQueryStatistics)?;
     Ok(())
+}
+
+/// Answers `MM_STATISTICS` queries with a retail memory profile.
+///
+/// The caller sets `Length`; every covered field after it is filled. The
+/// numbers model a 64 MiB retail console with roughly half its pages free —
+/// synthetic but plausible, so titles sizing caches proceed.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MmQueryStatistics;
+
+impl KernelExport for MmQueryStatistics {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::MM_QUERY_STATISTICS
+    }
+
+    fn name(&self) -> &'static str {
+        "MmQueryStatistics"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        4
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        let Some(stats) = stack_argument(context, 0).filter(|pointer| *pointer != 0) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        let Ok(length) = context.memory.read_u32(GuestVa(stats)) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        // MM_STATISTICS: Length, TotalPhysicalPages, AvailablePages,
+        // VirtualMemoryBytesCommitted, VirtualMemoryBytesReserved,
+        // CachePagesCommitted, PoolPagesCommitted, StackPagesCommitted,
+        // ImagePagesCommitted.
+        let fields: [u32; 8] = [
+            0x4000,      // 64 MiB of physical pages
+            0x2000,      // half free
+            0x0100_0000, // 16 MiB committed
+            0x0200_0000, // 32 MiB reserved
+            0x100,       // cache pages
+            0x100,       // pool pages
+            0x40,        // stack pages
+            0x800,       // image pages
+        ];
+        for (index, value) in fields.iter().enumerate() {
+            let offset = 4 + index as u32 * 4;
+            if u64::from(offset) + 4 <= u64::from(length) {
+                let _ = context.memory.write_u32(GuestVa(stats + offset), *value);
+            }
+        }
+        KernelStatus::SUCCESS
+    }
 }
 
 /// Allocates one contiguous buffer, returning its guest address (or NULL).

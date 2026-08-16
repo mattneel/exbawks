@@ -53,6 +53,8 @@ pub(crate) struct HostFileSystem {
     /// target path). Titles link their drive letters (`\??\D:`, `\??\T:`, …)
     /// to device paths at startup; resolution rewrites a matching prefix.
     links: HashMap<String, String>,
+    /// Open symbolic-link object handles (handle → target string).
+    link_objects: HashMap<u32, String>,
 }
 
 impl HostFileSystem {
@@ -65,7 +67,26 @@ impl HostFileSystem {
             files: HashMap::new(),
             next_handle: FILE_HANDLE_BASE,
             links: HashMap::new(),
+            link_objects: HashMap::new(),
         }
+    }
+
+    /// Opens a handle to an existing guest symbolic link.
+    pub(crate) fn open_link_object(&mut self, name: &str) -> Result<u32, KernelServiceError> {
+        let target = self
+            .links
+            .get(&name.to_ascii_uppercase())
+            .cloned()
+            .ok_or(KernelServiceError::NotFound)?;
+        let handle = self.next_handle;
+        self.next_handle = self.next_handle.wrapping_add(FILE_HANDLE_STEP);
+        self.link_objects.insert(handle, target);
+        Ok(handle)
+    }
+
+    /// Returns the target of an open symbolic-link handle.
+    pub(crate) fn link_target(&self, handle: u32) -> Result<String, KernelServiceError> {
+        self.link_objects.get(&handle).cloned().ok_or(KernelServiceError::InvalidHandle)
     }
 
     /// Records one guest symbolic link (case-insensitive name).
@@ -289,12 +310,12 @@ impl HostFileSystem {
             Some(file) => file.metadata().map_err(|_| KernelServiceError::AccessDenied)?.len(),
             None => 0,
         };
-        Ok(FileInfo { size, position: entry.position })
+        Ok(FileInfo { size, position: entry.position, directory: entry.file.is_none() })
     }
 
-    /// Closes one file handle, returning whether it named an open file.
+    /// Closes one handle, returning whether it named an open object.
     pub(crate) fn close(&mut self, handle: u32) -> bool {
-        self.files.remove(&handle).is_some()
+        self.files.remove(&handle).is_some() || self.link_objects.remove(&handle).is_some()
     }
 }
 

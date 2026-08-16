@@ -91,6 +91,8 @@ pub struct FileInfo {
     pub size: u64,
     /// The current byte offset of the file pointer.
     pub position: u64,
+    /// True when the handle names a directory or device object.
+    pub directory: bool,
 }
 
 /// A kernel service failure.
@@ -219,6 +221,30 @@ pub trait KernelServices {
     /// Returns `true` when the link existed.
     fn delete_symbolic_link(&mut self, _name: &str) -> bool {
         false
+    }
+
+    /// Creates an event object, returning its guest handle.
+    fn create_event(
+        &mut self,
+        _manual_reset: bool,
+        _initially_signaled: bool,
+    ) -> Result<u32, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
+    /// Signals an event, returning its previous signaled state.
+    fn set_event(&mut self, _handle: u32) -> Result<bool, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
+    /// Opens a handle to an existing symbolic-link object.
+    fn open_symbolic_link(&mut self, _name: &str) -> Result<u32, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
+    /// Returns the target string of an open symbolic-link handle.
+    fn query_symbolic_link(&mut self, _handle: u32) -> Result<String, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
     }
 }
 

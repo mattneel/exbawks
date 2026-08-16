@@ -17,6 +17,7 @@ mod services;
 mod startup;
 mod status;
 mod vm;
+mod xe;
 
 pub use context::KernelCallContext;
 pub use error::KernelError;
@@ -24,8 +25,10 @@ pub use ex::ExQueryNonVolatileSetting;
 pub use export::{KernelExport, StubExport, SuccessExport};
 pub use file::{NtCreateFile, NtOpenFile, NtQueryInformationFile, NtReadFile, NtWriteFile};
 pub use gate::{KERNEL_GATE_BASE, KERNEL_GATE_END, gate_address, gate_ordinal};
-pub use io::{IoCreateSymbolicLink, IoDeleteSymbolicLink};
-pub use ke::KeInitializeDpc;
+pub use io::{
+    IoCreateSymbolicLink, IoDeleteSymbolicLink, NtOpenSymbolicLinkObject, NtQuerySymbolicLinkObject,
+};
+pub use ke::{KeInitializeDpc, KeQuerySystemTime};
 pub use mm::{MmAllocateContiguousMemory, MmGetPhysicalAddress};
 pub use ordinals::{
     CallingConvention, ExportKind, KERNEL_ORDINALS, KernelOrdinalInfo, kernel_ordinal_info,
@@ -40,8 +43,9 @@ pub use services::{
     ThreadCreated, UnsupportedServices, VirtualAllocRequest, VirtualAllocation,
 };
 pub use startup::{
-    DbgPrint, HalReturnToFirmware, NtClose, PsCreateSystemThreadEx, PsTerminateSystemThread,
-    ordinal, register_startup_exports,
+    DbgPrint, HalReturnToFirmware, NtClose, NtCreateEvent, NtSetEvent, PsCreateSystemThreadEx,
+    PsTerminateSystemThread, ordinal, register_startup_exports,
 };
 pub use status::KernelStatus;
 pub use vm::NtAllocateVirtualMemory;
+pub use xe::{XeLoadSection, XeUnloadSection};

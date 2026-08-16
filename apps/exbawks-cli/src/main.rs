@@ -543,6 +543,22 @@ fn run(
         });
     }
 
+    // TEMP TLS investigation.
+    if std::env::var("EXBAWKS_TLS_PROBE").is_ok() {
+        use exbawks_memory::GuestMemory;
+        let mem = emulator.memory();
+        let read = |addr: u32| mem.read_u32(GuestVa(addr)).map(|v| format!("{v:#010x}"));
+        eprintln!("_tls_index [0x61E828] = {:?}", read(0x0061_E828));
+        for kpcr in [0x8010_1000u32, 0x8022_4000] {
+            eprintln!(
+                "kpcr {kpcr:#x}: fs[4]={:?} array[0]={:?} array[1]={:?}",
+                read(kpcr + 4),
+                read(kpcr + 0x40),
+                read(kpcr + 0x44)
+            );
+        }
+    }
+
     let gpr = emulator.cpu().gpr;
     println!("Stop reason:  {stop:?}{}", stop_reason_note(&stop));
     println!("Final EIP:    {}", GuestVa(emulator.cpu().eip));

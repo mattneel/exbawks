@@ -557,6 +557,39 @@ fn execute_straightline(
             state.eflags = (value & WRITABLE) | (state.eflags & !WRITABLE) | 0x02;
             Ok(())
         }
+        // x87 control plumbing: enough for CRT floating-point presence
+        // probes (`fninit`/`fnstsw`/`fnstcw`/`fldcw`/`fnclex`). Arithmetic
+        // x87 stays unsupported until the WHP tier (ADR 0013) provides it.
+        Mnemonic::Fninit => {
+            state.x87 = crate::X87State::default();
+            Ok(())
+        }
+        Mnemonic::Fnclex => {
+            // Clear the exception flags and busy bit.
+            state.x87.status &= !0x80FF;
+            Ok(())
+        }
+        Mnemonic::Fnstsw => {
+            if instruction.op0_kind() == OpKind::Register {
+                // `fnstsw ax`.
+                state.gpr[0] = (state.gpr[0] & 0xFFFF_0000) | u32::from(state.x87.status);
+                Ok(())
+            } else {
+                let target = operand(state, instruction, 0, address)?;
+                write_operand(state, memory, target, Width::W, u32::from(state.x87.status))
+            }
+        }
+        Mnemonic::Fnstcw => {
+            let target = operand(state, instruction, 0, address)?;
+            write_operand(state, memory, target, Width::W, u32::from(state.x87.control))
+        }
+        Mnemonic::Fldcw => {
+            let source = operand(state, instruction, 0, address)?;
+            let value = read_operand(state, memory, source, Width::W)?;
+            state.x87.control = value as u16;
+            Ok(())
+        }
+        Mnemonic::Wait => Ok(()),
         Mnemonic::Leave => {
             // Only the 32-bit form; `66 C9` pops 2 bytes into BP on hardware.
             if instruction.code() != Code::Leaved {

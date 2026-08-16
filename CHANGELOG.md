@@ -209,7 +209,35 @@ The project follows Keep a Changelog structure before its first release.
   disk as full.
 - `RtlInitAnsiString` and `RtlEqualString` (`HLE-007`). The retail image
   advances through its title-data bootstrap to its CRT thread-local-storage
-  accessor, the next wall (a per-thread TLS array behind `fs:[4]`).
+  accessor.
+- Thread-local storage at the stack top (`CORE-003`): the loader parses the
+  XBE's `IMAGE_TLS_DIRECTORY` and every thread reserves and initializes its
+  TLS area just below `NtTib.StackBase`, matching the XDK CRT contract
+  (`_tls_index = -size/4`; the block pointer lives at `[StackBase - size]`),
+  with the initial stack pointer kept below the reserve. Decoded from the
+  image's own CRT: the earlier "TLS array at `fs:[4]`" model was wrong.
+- `NtQueryInformationFile` answers `FileNetworkOpenInformation` (times,
+  sizes, attributes), which XAPI's save bootstrap reads after creating
+  `TitleMeta.xbx`; a failure there read as a disk problem.
+- `XeLoadSection` and `XeUnloadSection` maintain a demand-loaded XBE
+  section's reference counts; the bytes are already resident because the
+  loader maps the whole section union (ADR 0007).
+- `NtOpenSymbolicLinkObject` and `NtQuerySymbolicLinkObject` read back the
+  drive-letter links a title created, through link-object handles on the
+  file device.
+- The interpreter executes the x87 control-plumbing subset (`fninit`,
+  `fnstsw`, `fnstcw`, `fldcw`, `fnclex`, `wait`), enough for CRT
+  floating-point presence probes; arithmetic x87 remains for the WHP tier
+  (ADR 0013).
+- `KeQuerySystemTime` reports a deterministic virtual clock derived from the
+  virtualized time-stamp counter (first slice of `KRN-003`), and
+  `MmQueryStatistics` reports a synthetic retail memory profile.
+- Real `NtCreateEvent` and `NtSetEvent` maintain guest event objects under
+  the cooperative scheduler (events never block; ADR 0011).
+- The run loop advances the `KeTickCount` cell deterministically (one
+  millisecond per 4096 executed blocks, `KRN-003`), so titles that pace
+  themselves by polling the tick counter make progress instead of spinning
+  forever. The retail image runs minutes deep into its initialization.
 
 ### Fixed
 

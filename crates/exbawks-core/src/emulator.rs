@@ -275,6 +275,20 @@ impl Emulator {
         // DATA-export slots can point at real kernel variables (ADR 0010).
         let mut threads =
             ThreadManager::new(memory.clone(), self.disc_root.clone(), self.hdd_root.clone());
+        // The image's TLS directory (IMAGE_TLS_DIRECTORY at the header's TLS
+        // address) drives each thread's TLS block; a missing or unreadable
+        // directory means the image has no TLS.
+        let tls_directory = image.header.tls_address;
+        if tls_directory.0 != 0 {
+            let field = |offset: u32| memory.read_u32(GuestVa(tls_directory.0 + offset));
+            if let (Ok(raw_start), Ok(raw_end), Ok(zero_fill)) = (field(0), field(4), field(16)) {
+                threads.set_tls_template(crate::threads::TlsTemplate {
+                    raw_start,
+                    raw_end,
+                    zero_fill,
+                });
+            }
+        }
         let data_ordinals: Vec<u16> = thunks
             .entries
             .iter()
@@ -299,8 +313,13 @@ impl Emulator {
         let stack = GuestRange::page_aligned(GUEST_STACK_BASE, u64::from(stack_bytes))
             .map_err(MemoryError::from)?;
         memory.map_anonymous(stack, MemoryPermissions::READ | MemoryPermissions::WRITE)?;
-        let stack_top =
-            GUEST_STACK_BASE.0.saturating_add(stack_bytes).saturating_sub(GUEST_STACK_SCRATCH);
+        // The initial ESP sits below both the scratch words and the TLS
+        // region the CRT claims at the top of the stack (ADR 0010).
+        let stack_top = GUEST_STACK_BASE
+            .0
+            .saturating_add(stack_bytes)
+            .saturating_sub(threads.tls_reserve_bytes())
+            .saturating_sub(GUEST_STACK_SCRATCH);
 
         // Build the boot thread's KPCR/KTHREAD pages and wire the fs base so
         // XAPI startup can read its TIB and current-thread pointers.
@@ -567,11 +586,22 @@ impl Emulator {
     }
 
     fn run_blocks(&mut self, max_blocks: usize) -> Result<StopReason, CoreError> {
+        /// Executed blocks per KeTickCount millisecond (KRN-003): the
+        /// deterministic virtual clock a title polls for pacing.
+        const BLOCKS_PER_TICK: usize = 4096;
+
         if self.loaded.is_none() {
             return Err(CoreError::NoImageLoaded);
         }
+        let tick_cell = self.threads.as_ref().and_then(ThreadManager::tick_count_cell);
 
-        for _ in 0..max_blocks {
+        for executed in 0..max_blocks {
+            if executed.is_multiple_of(BLOCKS_PER_TICK)
+                && let Some(cell) = tick_cell
+                && let Ok(ticks) = self.memory.read_u32(cell)
+            {
+                let _ = self.memory.write_u32(cell, ticks.wrapping_add(1));
+            }
             let start = GuestVa(self.cpu.eip);
             // A thread's start routine returned (ADR 0011): a created thread
             // returns to the exit sentinel; the boot thread, whose stack has
@@ -1838,15 +1868,16 @@ mod tests {
         #[cfg(windows)]
         #[test]
         fn unimplemented_stub_halts_the_run() {
-            // Ordinal 189 (NtCreateEvent) is a registered but unimplemented stub.
+            // Ordinal 99 (KeDelayExecutionThread) is a registered but
+            // unimplemented stub.
             let code = [0xFF, 0x15, 0x00, 0x12, 0x01, 0x00, 0xC3];
             let mut emulator = Emulator::new().expect("emulator must initialize");
             emulator
-                .load_xbe(synthetic_xbe_with(&code, &[0x8000_00BD]))
+                .load_xbe(synthetic_xbe_with(&code, &[0x8000_0063]))
                 .expect("synthetic XBE must load");
 
             let stop = emulator.run(16).expect("the run must stop cleanly");
-            assert_eq!(stop, StopReason::UnimplementedKernelExport { ordinal: 189 });
+            assert_eq!(stop, StopReason::UnimplementedKernelExport { ordinal: 99 });
         }
 
         #[cfg(windows)]

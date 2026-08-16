@@ -20,7 +20,50 @@ pub(crate) fn register_ke_exports(registry: &KernelRegistry) -> Result<(), Kerne
     registry.register(KeInitializeDpc)?;
     registry.register(KeInitializeTimerEx)?;
     registry.register(KeSetTimer)?;
+    registry.register(KeQuerySystemTime)?;
     Ok(())
+}
+
+/// The virtual clock's epoch: 2004-01-01 00:00:00 as an NT `FILETIME`
+/// (100 ns units since 1601-01-01).
+const SYSTEM_TIME_EPOCH: u64 = 127_173_888_000_000_000;
+
+/// Returns the deterministic virtual system time.
+///
+/// Derived from the virtualized time-stamp counter (one tick per retired
+/// instruction, read as 100 ns units), so runs are reproducible and no host
+/// clock leaks into guest-visible state. The virtual-clock design (boot plan
+/// D3) will formalize the scaling.
+fn virtual_system_time(context: &KernelCallContext<'_>) -> u64 {
+    SYSTEM_TIME_EPOCH.wrapping_add(context.cpu.tsc)
+}
+
+/// Writes the current system time as an NT `FILETIME`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KeQuerySystemTime;
+
+impl KernelExport for KeQuerySystemTime {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::KE_QUERY_SYSTEM_TIME
+    }
+
+    fn name(&self) -> &'static str {
+        "KeQuerySystemTime"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        4
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        let Some(out) = stack_argument(context, 0).filter(|pointer| *pointer != 0) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        let time = virtual_system_time(context);
+        let _ = context.memory.write_u32(GuestVa(out), time as u32);
+        let _ = context.memory.write_u32(GuestVa(out + 4), (time >> 32) as u32);
+        KernelStatus::SUCCESS
+    }
 }
 
 /// `KTIMER.DueTime` (a `LARGE_INTEGER`) and `KTIMER.Dpc` field offsets.
