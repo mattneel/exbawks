@@ -57,6 +57,8 @@ pub mod ordinal {
     pub const MM_ALLOCATE_CONTIGUOUS_MEMORY: u16 = 165;
     /// `MmAllocateContiguousMemoryEx`.
     pub const MM_ALLOCATE_CONTIGUOUS_MEMORY_EX: u16 = 166;
+    /// `MmClaimGpuInstanceMemory`.
+    pub const MM_CLAIM_GPU_INSTANCE_MEMORY: u16 = 168;
     /// `MmFreeContiguousMemory`.
     pub const MM_FREE_CONTIGUOUS_MEMORY: u16 = 171;
     /// `MmGetPhysicalAddress`.
@@ -482,7 +484,7 @@ mod tests {
         // five Ex executive exports, seven IRQL/interrupt exports, one Nt virtual-memory export, seven Nt
         // file exports, six Mm exports, four symbolic-link exports, two Xe
         // section exports, one benign success export, and two startup stubs.
-        assert_eq!(registry.len(), 56);
+        assert_eq!(registry.len(), 57);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,

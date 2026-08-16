@@ -66,9 +66,12 @@ pub struct DeviceSpace {
     registers: Mutex<std::collections::HashMap<u32, u32>>,
     /// Guest VA pages holding APU DSP command mailboxes, one per comm
     /// region the guest programs. The engine unmaps them so accesses route
-    /// here: writes are consumed instantly (an "infinitely fast DSP"),
-    /// reads report the consumed (zero) state.
+    /// here: writes land in RAM, and the most recently written cell reads
+    /// as zero (an "infinitely fast DSP" consumed it); every other cell
+    /// keeps its RAM contents, so setup data in the same page survives.
     mailbox_pages: Mutex<Vec<u32>>,
+    /// The most recently written mailbox cell (the FIFO head being polled).
+    mailbox_head: Mutex<Option<u32>>,
 }
 
 /// The APU register receiving the GP comm region's physical base address.
@@ -183,6 +186,18 @@ impl DeviceSpace {
         Self::contains(address, 1) || self.in_mailbox(address, 1)
     }
 
+    /// Records the most recent mailbox write and reports consumption.
+    fn consume_mailbox_write(&self, address: u32) {
+        *self.mailbox_head.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(address);
+    }
+
+    /// True when this cell is the consumed FIFO head.
+    fn mailbox_consumed(&self, address: u32) -> bool {
+        *self.mailbox_head.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            == Some(address)
+    }
+
     /// True when an access falls inside an identified mailbox page.
     fn in_mailbox(&self, address: u32, len: usize) -> bool {
         let end = u64::from(address) + len as u64;
@@ -228,9 +243,12 @@ impl<'a> MmioView<'a> {
 impl GuestMemory for MmioView<'_> {
     fn read(&self, address: GuestVa, output: &mut [u8]) -> Result<(), MemoryError> {
         if self.devices.in_mailbox(address.0, output.len()) {
-            // The infinitely fast DSP already consumed everything.
-            output.fill(0);
-            return Ok(());
+            if self.devices.mailbox_consumed(address.0) {
+                // The infinitely fast DSP consumed the FIFO head.
+                output.fill(0);
+                return Ok(());
+            }
+            return self.ram.read(address, output);
         }
         if DeviceSpace::contains(address.0, output.len()) {
             self.devices.read(address.0, output);
@@ -246,8 +264,9 @@ impl GuestMemory for MmioView<'_> {
 
     fn write(&self, address: GuestVa, input: &[u8]) -> Result<(), MemoryError> {
         if self.devices.in_mailbox(address.0, input.len()) {
-            // Commands are consumed the instant they are written.
-            return Ok(());
+            // The write lands, and the cell becomes the consumed FIFO head.
+            self.devices.consume_mailbox_write(address.0);
+            return self.ram.write(address, input);
         }
         if DeviceSpace::contains(address.0, input.len()) {
             self.devices.write(address.0, input);

@@ -260,6 +260,13 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- The DSP mailbox refined to write-through semantics: writes land in RAM
+  and only the most recently written cell (the polled FIFO head) reads as
+  consumed, so setup data sharing the comm page survives. DirectSound's
+  initialization now completes natively, and Direct3D begins:
+  `MmClaimGpuInstanceMemory` claims the NV2A instance area from the
+  contiguous allocator. The retail image proceeds into distributed
+  D3D/game-side initialization on the hypervisor tier.
 - The audio-path burndown over the M2 device model, each piece demanded by
   the retail image's DirectSound init in order: ready-bit overrides for the
   APU GP-DSP status and the AC'97 `GLOB_STA` codec-ready bits (a zero read

@@ -7,7 +7,7 @@
 //! is no real GPU yet (only the null backend), so the returned physical
 //! address is never dereferenced by hardware.
 
-use exbawks_types::GuestVa;
+use exbawks_types::{GUEST_PAGE_SIZE, GuestVa};
 
 use crate::startup::stack_argument;
 use crate::{KernelCallContext, KernelError, KernelExport, KernelRegistry, KernelStatus};
@@ -25,7 +25,43 @@ pub(crate) fn register_mm_exports(registry: &KernelRegistry) -> Result<(), Kerne
     registry.register(MmPersistContiguousMemory)?;
     registry.register(MmQueryStatistics)?;
     registry.register(MmQueryAllocationSize)?;
+    registry.register(MmClaimGpuInstanceMemory)?;
     Ok(())
+}
+
+/// Claims the GPU instance-memory region, returning its base in EAX.
+///
+/// On hardware this carves the top of physical RAM for the NV2A's
+/// instance area; here it is a contiguous kernel block like any other GPU
+/// buffer. `0xFFFF_FFFF` requests the default-sized claim.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MmClaimGpuInstanceMemory;
+
+impl KernelExport for MmClaimGpuInstanceMemory {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::MM_CLAIM_GPU_INSTANCE_MEMORY
+    }
+
+    fn name(&self) -> &'static str {
+        "MmClaimGpuInstanceMemory"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        8
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        /// The retail kernel's default instance-memory claim.
+        const DEFAULT_CLAIM_BYTES: u32 = 0x0011_0000;
+
+        let requested = stack_argument(context, 0).unwrap_or(0);
+        let padding_out = stack_argument(context, 1).unwrap_or(0);
+        let bytes = if requested == u32::MAX { DEFAULT_CLAIM_BYTES } else { requested };
+        if padding_out != 0 {
+            let _ = context.memory.write_u32(GuestVa(padding_out), 0);
+        }
+        allocate(context, bytes.max(GUEST_PAGE_SIZE))
+    }
 }
 
 /// Reports the byte size of one contiguous allocation in EAX.
