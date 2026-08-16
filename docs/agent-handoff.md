@@ -163,25 +163,34 @@ Two active threads:
    proving the page survived) — but it re-persists the same data and reboots
    again. Boots differ only in that 165, so the relaunch decision is not
    kernel-call-driven; it turns on register/memory state our environment does
-   not satisfy. DC3 is video/vblank-sensitive (Cxbx evidence, and the memory
-   note), so the prime suspect is the **display/video-mode setup** — the title
-   sets a mode and relaunches to apply it, and the mode never "takes" without
-   real display HLE. The loop detector (identical persisted data → stop) ends
-   the run at `Reboot { routine: 2 }` after one relaunch instead of spinning.
+   not satisfy. The loop detector (identical persisted data → stop) ends the
+   run at `Reboot { routine: 2 }` after one relaunch instead of spinning.
 
-   **Next: find the upstream relaunch condition.** Disassemble the caller of
-   the launch helper (the function above `0x1A64F9`) to see what it tests
-   before deciding to relaunch — likely an `Av*`/`XVideo*` display-mode or
-   AV-pack value, or an `ExQueryNonVolatileSetting` video field the title
-   compares against the running mode. If it is display-mode, this converges
-   with the graphics HLE long pole (only `NullGraphicsBackend` exists), which
-   the requested screenshot/frame-dump command also hangs off; a minimal
-   Av/video-mode HLE may be enough to clear the relaunch even before full
-   rendering. Once past it the game should `NtReadFile` real assets (the read
-   path already works). `KRN-003` (virtual clock) is independent. Disassemble
-   with `decode --hex <bytes> --ip <va>` after slicing `.text` at file offset
-   `0x1000 + (va - 0x11000)`; trace boots with `run --trace <f> --trace-filter
-   kernel,stop` and split at each `HalReturnToFirmware` (ordinal 49).
+   **What the disassembly shows (partial).** The launch-data setup at guest
+   `0x1A6462` walks an XAPI registration list through the global at
+   `ds:[0x25058C]` (with a callback fn-ptr at `ds:[0x250590]`) and, per entry,
+   compares `entry[+4]` against `[[0x10118]+8]` — a process/identity field of
+   an XAPI global rooted at `0x10118` (an image-header-region global). So the
+   relaunch is gated by **XAPI boot state** (a registration walk + an
+   identity match), not the simple video value earlier suspected; DC3's known
+   video/vblank sensitivity may still matter downstream, but this decision is
+   XAPI infrastructure. The *top-level* "should I relaunch" test is further up
+   the call chain (above the launch helper at `0x1A6381`, called from
+   `0x1A64F9`) and is not yet pinned down.
+
+   **Next: pin the upstream relaunch condition.** Ring-buffer the block EIPs in
+   `run_blocks` (print on the `Reboot` stop, then revert) to capture the exact
+   path into the launch helper, then disassemble the deciding branch. Likely
+   it needs more XAPI environment fidelity (the `0x25058C` registration list,
+   the `0x10118` process globals, or a notification/callback the title
+   registers) rather than one canned value. This converges with the broader
+   XAPI/graphics HLE work (only `NullGraphicsBackend` exists), which the
+   requested screenshot/frame-dump command also hangs off. Once past it the
+   game should `NtReadFile` real assets (the read path already works).
+   `KRN-003` (virtual clock) is independent. Disassemble with `decode --hex
+   <bytes> --ip <va>` after slicing `.text` at file offset `0x1000 + (va -
+   0x11000)`; trace boots with `run --trace <f> --trace-filter kernel,stop`
+   and split at each `HalReturnToFirmware` (ordinal 49).
 
 The retail image stays outside the repository; automated tests remain
 synthetic.
