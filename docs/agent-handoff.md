@@ -169,12 +169,22 @@ Two active threads:
    `KeInitializeInterrupt` (28 stack bytes — 24 corrupted the caller's
    stack into a wild jump), `KeConnectInterrupt` returning TRUE.
 
-   **Current DC3 wall (WHP tier): the next DSOUND null deref** — fault at
-   `0x20EEB3`, address `0x33C` (a null object + 0x33C). Same shape as
-   before: some DSOUND sub-object creation failed quietly under the stub;
-   sample, decode, find which hardware answer it needed. After audio, the
-   GPU frontier (graphics HLE feeds the screenshot goal). The interpreter
-   tier remains the deterministic oracle (its frontier: `movss` at
+   Since then: the mailbox model moved to write-through semantics (only
+   the polled FIFO head reads consumed; setup data in the comm page
+   survives), which completed DirectSound initialization, and
+   `MmClaimGpuInstanceMemory` landed — Direct3D is initializing.
+
+   **Current DC3 state (WHP tier): a quiet 10-minute native run.** No stop,
+   no exit storms, no dominant spin RIP — cancel-pump samples spread across
+   D3DX (`0x1D4xxx`), DSOUND work loops (`0x20C2xx`, `0x2160xx`), and XAPI
+   (`0x1ACxxx`). Either the game genuinely churns (asset staging) or the
+   main thread waits on cross-subsystem state while a worker spins politely.
+   Next: sample longer and by THREAD (add the fs base or a thread id to the
+   cancel sample), check whether NV2A register traffic ever starts (the GPU
+   stub would log it: `RUST_LOG=exbawks_core::mmio=trace`, region=Gpu), and
+   drive toward the D3D init path — the GPU frontier is where the graphics
+   HLE (`GraphicsFrontend`) picks up and the screenshot command lands. The
+   interpreter tier remains the deterministic oracle (frontier: `movss` at
    `0x1685A0`).
 
 2. **Kernel HLE burndown** (substrate-independent, needed under either
