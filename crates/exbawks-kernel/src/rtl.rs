@@ -6,6 +6,9 @@
 //! kernel dispatch points, so a critical section is never contended while a
 //! thread holds it; these exports therefore maintain the lock and recursion
 //! counts for the guest's own bookkeeping without ever blocking.
+//!
+//! `RtlNtStatusToDosError` is a pure status-code translator titles call from
+//! their error-reporting paths.
 
 use exbawks_types::GuestVa;
 
@@ -21,12 +24,43 @@ const OWNING_THREAD: u32 = 0x18;
 /// The placeholder owner id for the single running thread.
 const CURRENT_THREAD: u32 = 1;
 
-/// Registers the Rtl critical-section exports.
+/// Registers the Rtl runtime-library exports.
 pub(crate) fn register_rtl_exports(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register(RtlInitializeCriticalSection)?;
     registry.register(RtlEnterCriticalSection)?;
     registry.register(RtlLeaveCriticalSection)?;
+    registry.register(RtlNtStatusToDosError)?;
     Ok(())
+}
+
+/// The generic Win32 error for an NTSTATUS with no specific mapping
+/// (`ERROR_MR_MID_NOT_FOUND`).
+const ERROR_MR_MID_NOT_FOUND: u32 = 317;
+
+/// Translates an NTSTATUS to its Win32/DOS error code.
+///
+/// This is the well-known subset titles actually hit on their error paths;
+/// a success or informational status maps to `NO_ERROR`, and an unmapped
+/// failure to the generic `ERROR_MR_MID_NOT_FOUND`, matching the kernel's
+/// own fall-through.
+fn dos_error(status: u32) -> u32 {
+    match status {
+        0x0000_0000 => 0,    // STATUS_SUCCESS -> NO_ERROR
+        0xC000_0002 => 120,  // NOT_IMPLEMENTED -> ERROR_CALL_NOT_IMPLEMENTED
+        0xC000_0005 => 998,  // ACCESS_VIOLATION -> ERROR_NOACCESS
+        0xC000_0008 => 6,    // INVALID_HANDLE -> ERROR_INVALID_HANDLE
+        0xC000_000D => 87,   // INVALID_PARAMETER -> ERROR_INVALID_PARAMETER
+        0xC000_000F => 2,    // NO_SUCH_FILE -> ERROR_FILE_NOT_FOUND
+        0xC000_0011 => 38,   // END_OF_FILE -> ERROR_HANDLE_EOF
+        0xC000_0017 => 8,    // NO_MEMORY -> ERROR_NOT_ENOUGH_MEMORY
+        0xC000_0023 => 122,  // BUFFER_TOO_SMALL -> ERROR_INSUFFICIENT_BUFFER
+        0xC000_0034 => 2,    // OBJECT_NAME_NOT_FOUND -> ERROR_FILE_NOT_FOUND
+        0xC000_0035 => 183,  // OBJECT_NAME_COLLISION -> ERROR_ALREADY_EXISTS
+        0xC000_003A => 3,    // OBJECT_PATH_NOT_FOUND -> ERROR_PATH_NOT_FOUND
+        0xC000_009A => 1450, // INSUFFICIENT_RESOURCES -> ERROR_NO_SYSTEM_RESOURCES
+        _ if status >> 31 == 0 => 0,
+        _ => ERROR_MR_MID_NOT_FOUND,
+    }
 }
 
 /// Reads the critical-section pointer argument, when readable.
@@ -134,6 +168,32 @@ impl KernelExport for RtlLeaveCriticalSection {
     }
 }
 
+/// Translates one NTSTATUS to a Win32/DOS error, returned in EAX.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RtlNtStatusToDosError;
+
+impl KernelExport for RtlNtStatusToDosError {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::RTL_NT_STATUS_TO_DOS_ERROR
+    }
+
+    fn name(&self) -> &'static str {
+        "RtlNtStatusToDosError"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        4
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // The function returns a ULONG in EAX rather than an NTSTATUS; the
+        // runtime places the returned value in EAX, so the DOS error rides
+        // out as the "status".
+        let status = stack_argument(context, 0).unwrap_or(0);
+        KernelStatus(dos_error(status))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use exbawks_cpu::CpuState;
@@ -187,6 +247,30 @@ mod tests {
             0,
             "unowned when balanced"
         );
+    }
+
+    #[test]
+    fn status_maps_to_the_expected_dos_error() {
+        assert_eq!(dos_error(0x0000_0000), 0, "success is NO_ERROR");
+        assert_eq!(dos_error(0xC000_000D), 87, "invalid parameter");
+        assert_eq!(dos_error(0xC000_0023), 122, "buffer too small");
+        assert_eq!(dos_error(0x4000_0000), 0, "an informational status is NO_ERROR");
+        assert_eq!(dos_error(0xC000_9999), ERROR_MR_MID_NOT_FOUND, "an unmapped failure");
+    }
+
+    #[test]
+    fn dos_error_reaches_the_return_register() {
+        let (memory, mut cpu) = context_at(0xC000_000D);
+        let mut services = UnsupportedServices;
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut services,
+            stop_request: None,
+        };
+        // The export returns the DOS error as its status; the runtime places
+        // it in EAX, so asserting on the returned value is sufficient here.
+        assert_eq!(RtlNtStatusToDosError.call(&mut context), KernelStatus(87));
     }
 
     #[test]

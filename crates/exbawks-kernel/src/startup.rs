@@ -45,12 +45,13 @@ pub mod ordinal {
     pub const RTL_INITIALIZE_CRITICAL_SECTION: u16 = 291;
     /// `RtlLeaveCriticalSection`.
     pub const RTL_LEAVE_CRITICAL_SECTION: u16 = 294;
+    /// `RtlNtStatusToDosError`.
+    pub const RTL_NT_STATUS_TO_DOS_ERROR: u16 = 301;
 }
 
 /// The startup stubs for virtual memory, events, timers, and files.
-const STARTUP_STUBS: [(u16, &str); 7] = [
+const STARTUP_STUBS: [(u16, &str); 6] = [
     (ordinal::KE_DELAY_EXECUTION_THREAD, "KeDelayExecutionThread"),
-    (ordinal::KE_SET_TIMER, "KeSetTimer"),
     (ordinal::NT_ALLOCATE_VIRTUAL_MEMORY, "NtAllocateVirtualMemory"),
     (ordinal::NT_CREATE_EVENT, "NtCreateEvent"),
     (ordinal::NT_CREATE_FILE, "NtCreateFile"),
@@ -314,10 +315,10 @@ mod tests {
         let registry = KernelRegistry::new();
         register_startup_exports(&registry).expect("registration succeeds");
 
-        // Five thread/handle exports, three Rtl and two Ke dispatcher
+        // Five thread/handle exports, four Rtl and three Ke dispatcher
         // exports, one Ex executive export, one benign success export, and
-        // seven startup stubs.
-        assert_eq!(registry.len(), 19);
+        // six startup stubs.
+        assert_eq!(registry.len(), 20);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,

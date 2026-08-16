@@ -114,6 +114,14 @@ The project follows Keep a Changelog structure before its first release.
   buffer size; there is no real EEPROM, so guest-visible identifiers stay
   zeroed (ADR 0010). The retail image advances past its EEPROM probe to
   `RtlNtStatusToDosError` (`HLE-011`).
+- `RtlNtStatusToDosError` translates the NTSTATUS codes titles hit on their
+  error paths to Win32/DOS error codes, returning the result in EAX, with a
+  generic fall-through matching the kernel (`HLE-007`).
+- `KeSetTimer` records a timer's due time and DPC and reports the timer was
+  not already queued (`FALSE`). Under the cooperative scheduler (ADR 0011)
+  the timer does not fire yet — the firing machinery is later work — so a
+  title that arms fire-and-forget timers proceeds. The retail image advances
+  to `NtAllocateVirtualMemory` (`HLE-007`).
 - Implementation-burndown diagnostics: `exbawks coverage` reports
   implemented/stub/missing counts across the CPU, kernel, and GPU surfaces
   (with `--xbe` to scope the kernel surface to one image's imports), and a

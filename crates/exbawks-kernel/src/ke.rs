@@ -19,8 +19,13 @@ const NOTIFICATION_TIMER_TYPE: u32 = 8;
 pub(crate) fn register_ke_exports(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register(KeInitializeDpc)?;
     registry.register(KeInitializeTimerEx)?;
+    registry.register(KeSetTimer)?;
     Ok(())
 }
+
+/// `KTIMER.DueTime` (a `LARGE_INTEGER`) and `KTIMER.Dpc` field offsets.
+const TIMER_DUE_TIME: u32 = 0x10;
+const TIMER_DPC: u32 = 0x20;
 
 /// Initializes a guest `KDPC` with its deferred routine and context.
 #[derive(Debug, Default, Clone, Copy)]
@@ -104,6 +109,47 @@ impl KernelExport for KeInitializeTimerEx {
     }
 }
 
+/// Arms a guest `KTIMER` with a due time and optional DPC.
+///
+/// `KeSetTimer(Timer, DueTime, Dpc)` normally inserts the timer into the
+/// system timer queue and returns whether it was already queued. Under the
+/// cooperative single-thread scheduler (ADR 0011) there is no timer queue
+/// yet — the full firing machinery is `KRN-007` — so this records the due
+/// time and DPC on the object and reports the timer was not already set
+/// (`FALSE`). A title that merely arms fire-and-forget timers proceeds; one
+/// that blocks waiting for a timer to signal is later work.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KeSetTimer;
+
+impl KernelExport for KeSetTimer {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::KE_SET_TIMER
+    }
+
+    fn name(&self) -> &'static str {
+        "KeSetTimer"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        16
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        let Some(timer) = stack_argument(context, 0).filter(|pointer| *pointer != 0) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        // DueTime is a LARGE_INTEGER passed by value (two args); Dpc follows.
+        let due_low = stack_argument(context, 1).unwrap_or(0);
+        let due_high = stack_argument(context, 2).unwrap_or(0);
+        let dpc = stack_argument(context, 3).unwrap_or(0);
+        let _ = context.memory.write_u32(GuestVa(timer + TIMER_DUE_TIME), due_low);
+        let _ = context.memory.write_u32(GuestVa(timer + TIMER_DUE_TIME + 4), due_high);
+        let _ = context.memory.write_u32(GuestVa(timer + TIMER_DPC), dpc);
+        // BOOLEAN FALSE: the timer was not already in the (empty) queue.
+        KernelStatus(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use exbawks_cpu::CpuState;
@@ -140,5 +186,34 @@ mod tests {
         assert_eq!(memory.read_u32(GuestVa(dpc)).unwrap(), DPC_OBJECT_TYPE);
         assert_eq!(memory.read_u32(GuestVa(dpc + 0x0C)).unwrap(), 0xAABB_CCDD);
         assert_eq!(memory.read_u32(GuestVa(dpc + 0x10)).unwrap(), 0x1234_5678);
+    }
+
+    #[test]
+    fn set_timer_records_the_due_time_and_returns_false() {
+        let memory = SoftwareAddressSpace::new(64 * 1024).expect("memory is valid");
+        let range = GuestRange::page_aligned(GuestVa(0x1000), 2 * u64::from(GUEST_PAGE_SIZE))
+            .expect("range is valid");
+        memory
+            .map_anonymous(range, MemoryPermissions::READ | MemoryPermissions::WRITE)
+            .expect("mapping succeeds");
+        let timer = 0x1100_u32;
+        // [esp]=return, then Timer, DueTime.Low, DueTime.High, Dpc.
+        for (slot, value) in [timer, 0xDEAD_BEEF, 0x0000_0001, 0x2200].iter().enumerate() {
+            memory.write_u32(GuestVa(0x2004 + slot as u32 * 4), *value).expect("write");
+        }
+        let mut cpu = CpuState::default();
+        cpu.gpr[4] = 0x2000;
+        let mut services = UnsupportedServices;
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut services,
+            stop_request: None,
+        };
+
+        assert_eq!(KeSetTimer.call(&mut context), KernelStatus(0), "the timer was not queued");
+        assert_eq!(memory.read_u32(GuestVa(timer + TIMER_DUE_TIME)).unwrap(), 0xDEAD_BEEF);
+        assert_eq!(memory.read_u32(GuestVa(timer + TIMER_DUE_TIME + 4)).unwrap(), 1);
+        assert_eq!(memory.read_u32(GuestVa(timer + TIMER_DPC)).unwrap(), 0x2200);
     }
 }

@@ -24,7 +24,10 @@ pub use ordinals::{
     CallingConvention, ExportKind, KERNEL_ORDINALS, KernelOrdinalInfo, kernel_ordinal_info,
 };
 pub use registry::KernelRegistry;
-pub use rtl::{RtlEnterCriticalSection, RtlInitializeCriticalSection, RtlLeaveCriticalSection};
+pub use rtl::{
+    RtlEnterCriticalSection, RtlInitializeCriticalSection, RtlLeaveCriticalSection,
+    RtlNtStatusToDosError,
+};
 pub use services::{
     KernelServiceError, KernelServices, ThreadCreateRequest, ThreadCreated, UnsupportedServices,
 };
