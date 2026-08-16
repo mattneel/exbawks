@@ -1083,11 +1083,14 @@ mod tests {
 
         let fs_base = emulator.cpu().segment(exbawks_cpu::Segment::Fs).base;
         assert!(fs_base >= 0x8000_0000, "the KPCR must live in kernel space");
-        // fs:[0x1C] is the self pointer; fs:[0x28] points at the KTHREAD.
+        // fs:[0x1C] is the self pointer; fs:[0x20] is the Prcb pointer, whose
+        // first field (fs:[0x28]) is the current KTHREAD.
         let self_pointer = emulator.memory().read_u32(GuestVa(fs_base + 0x1C)).expect("read");
         assert_eq!(self_pointer, fs_base);
-        let kthread = emulator.memory().read_u32(GuestVa(fs_base + 0x28)).expect("read");
-        assert_eq!(kthread, fs_base + 0x200);
+        let prcb = emulator.memory().read_u32(GuestVa(fs_base + 0x20)).expect("read");
+        assert_eq!(prcb, fs_base + 0x28, "the Prcb points at the embedded KPRCB");
+        let kthread = emulator.memory().read_u32(GuestVa(prcb)).expect("read");
+        assert_eq!(kthread, fs_base + 0x200, "Prcb.CurrentThread is the KTHREAD");
     }
 
     /// PsCreateSystemThreadEx succeeds through the service, and a thread that

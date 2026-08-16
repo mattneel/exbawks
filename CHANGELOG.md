@@ -85,6 +85,10 @@ The project follows Keep a Changelog structure before its first release.
   `RTL_CRITICAL_SECTION` lock and recursion counts without blocking, which is
   correct under the cooperative single-thread scheduler; the retail image
   advances past its heap-init critical section (first slice of `HLE-007`).
+- The boot KPCR now populates `NtTib.Self` and the `KPCR.Prcb` pointer
+  (`fs:[0x20]`) at the embedded KPRCB, whose `CurrentThread` field XAPI reads;
+  the retail image advances past its `KeGetCurrentThread`-style Prcb walk
+  (`CORE-003`).
 - Implementation-burndown diagnostics: `exbawks coverage` reports
   implemented/stub/missing counts across the CPU, kernel, and GPU surfaces
   (with `--xbe` to scope the kernel surface to one image's imports), and a

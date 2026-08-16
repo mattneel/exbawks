@@ -25,6 +25,9 @@ const KERNEL_REGION_BASE: u32 = 0x8001_0000;
 
 /// The KTHREAD block offset inside each thread's KPCR page.
 const KTHREAD_OFFSET: u32 = 0x200;
+/// The embedded KPRCB offset inside the KPCR (Xbox layout); its first field
+/// is `CurrentThread`, and `KPCR.Prcb` (`fs:[0x20]`) points here.
+const PRCB_OFFSET: u32 = 0x28;
 /// The minimum guest stack size in bytes.
 const MINIMUM_STACK_BYTES: u32 = 16 * 1024;
 /// Scratch bytes kept above a new thread's initial stack pointer.
@@ -231,12 +234,14 @@ impl ThreadManager {
         let kthread = GuestVa(kpcr.0 + KTHREAD_OFFSET);
         let stack_top = stack_base.0.wrapping_add(stack_bytes);
 
-        // KPCR/TIB fields per ADR 0010.
-        self.memory.write_u32(kpcr, 0xFFFF_FFFF)?; // fs:[0] SEH list head
-        self.memory.write_u32(GuestVa(kpcr.0 + 0x04), stack_top)?;
-        self.memory.write_u32(GuestVa(kpcr.0 + 0x08), stack_base.0)?;
-        self.memory.write_u32(GuestVa(kpcr.0 + 0x1C), kpcr.0)?; // self
-        self.memory.write_u32(GuestVa(kpcr.0 + 0x28), kthread.0)?; // current KTHREAD
+        // KPCR / NT_TIB / KPRCB fields (Xbox layout, ADR 0010).
+        self.memory.write_u32(kpcr, 0xFFFF_FFFF)?; // fs:[0x00] NtTib.ExceptionList
+        self.memory.write_u32(GuestVa(kpcr.0 + 0x04), stack_top)?; // NtTib.StackBase
+        self.memory.write_u32(GuestVa(kpcr.0 + 0x08), stack_base.0)?; // NtTib.StackLimit
+        self.memory.write_u32(GuestVa(kpcr.0 + 0x18), kpcr.0)?; // NtTib.Self
+        self.memory.write_u32(GuestVa(kpcr.0 + 0x1C), kpcr.0)?; // KPCR.SelfPcr
+        self.memory.write_u32(GuestVa(kpcr.0 + 0x20), kpcr.0 + PRCB_OFFSET)?; // KPCR.Prcb
+        self.memory.write_u32(GuestVa(kpcr.0 + PRCB_OFFSET), kthread.0)?; // Prcb.CurrentThread
 
         // Synthetic KTHREAD fields XAPI consumes.
         self.memory.write_u32(GuestVa(kthread.0 + 0x1C), stack_top)?;
