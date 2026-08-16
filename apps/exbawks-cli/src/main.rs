@@ -7,7 +7,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use exbawks_core::{BootPlanReport, EmulatorBuilder, EmulatorConfig};
 use exbawks_cpu::{BasicBlockDecoder, DecodeConfig, format_instruction};
-use exbawks_debug::{JsonLinesTrace, TraceEventKind};
+use exbawks_debug::{
+    CoverageItem, CoverageLedger, CoverageStatus, JsonLinesTrace, Surface, SurfaceCoverage,
+    TraceEventKind,
+};
+use exbawks_kernel::{
+    ExportKind, KERNEL_ORDINALS, KernelRegistry, kernel_ordinal_info, register_startup_exports,
+};
 use exbawks_platform::{
     HostCapabilities, SystemMemoryInfo, probe_host_capabilities, query_system_memory_info,
 };
@@ -93,6 +99,35 @@ enum Command {
         #[arg(long, default_value_t = 1 << 20)]
         max_blocks: usize,
     },
+    /// Reports the implementation burndown across emulator surfaces.
+    Coverage {
+        /// Restricts the report to one surface.
+        #[arg(long, value_enum)]
+        surface: Option<SurfaceArg>,
+        /// Filters the kernel surface to one XBE's imported ordinals.
+        #[arg(long)]
+        xbe: Option<PathBuf>,
+        /// Lists the missing elements of each reported surface.
+        #[arg(long)]
+        missing: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SurfaceArg {
+    Cpu,
+    Kernel,
+    Gpu,
+}
+
+impl From<SurfaceArg> for exbawks_debug::Surface {
+    fn from(value: SurfaceArg) -> Self {
+        match value {
+            SurfaceArg::Cpu => Self::Cpu,
+            SurfaceArg::Kernel => Self::Kernel,
+            SurfaceArg::Gpu => Self::Gpu,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -172,6 +207,9 @@ fn main() -> Result<()> {
             max_blocks,
             cli.json,
         ),
+        Command::Coverage { surface, xbe, missing } => {
+            coverage(surface.map(Into::into), xbe.as_deref(), missing, cli.json)
+        }
     }
 }
 
@@ -495,7 +533,78 @@ fn run(
     println!("Final EAX:    0x{:08X}", gpr[0]);
     println!("Final ESI:    0x{:08X}", gpr[6]);
     println!("Final EDI:    0x{:08X}", gpr[7]);
+
+    if let Some(diagnosis) = diagnose_stop(&emulator, &stop) {
+        println!("\n{diagnosis}");
+    }
     Ok(())
+}
+
+/// Renders an ariadne diagnosis of a run's stop site, when the stop names a
+/// coverage gap at a decodable guest address.
+fn diagnose_stop(emulator: &exbawks_core::Emulator, stop: &StopReason) -> Option<String> {
+    let (title, label, note) = match stop {
+        StopReason::MissingKernelExport { ordinal }
+        | StopReason::UnimplementedKernelExport { ordinal } => {
+            let name = kernel_ordinal_info(*ordinal)
+                .map_or_else(|| format!("ordinal-{ordinal}"), |info| info.name.to_owned());
+            let state = match stop {
+                StopReason::UnimplementedKernelExport { .. } => "stub, no semantics",
+                _ => "not registered",
+            };
+            (
+                "kernel HLE surface reached an unimplemented export".to_owned(),
+                format!("calls {name} (ordinal {ordinal}) — {state}"),
+                Some(format!(
+                    "burndown: run `exbawks coverage --surface kernel --missing` for the gap list"
+                )),
+            )
+        }
+        StopReason::UnsupportedInstruction { .. } => (
+            "interpreter oracle reached an unimplemented instruction".to_owned(),
+            "not in the tier-0 instruction set".to_owned(),
+            None,
+        ),
+        StopReason::GuestFault { address } => (
+            "guest raised a fault the runtime cannot deliver".to_owned(),
+            format!("faulting access to {address}"),
+            None,
+        ),
+        _ => return None,
+    };
+
+    let eip = emulator.cpu().eip;
+    let mut bytes = [0_u8; 32];
+    let read = read_guest_prefix(emulator.memory(), GuestVa(eip), &mut bytes)?;
+    let block = BasicBlockDecoder::new(DecodeConfig { max_instructions: 6, max_bytes: read })
+        .decode(GuestVa(eip), &bytes[..read])
+        .ok()?;
+    if block.instructions.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = block
+        .instructions
+        .iter()
+        .map(|instruction| {
+            format!("{}  {}", GuestVa(instruction.ip() as u32), format_instruction(instruction))
+        })
+        .collect();
+    Some(exbawks_debug::render_site(&title, &lines, 0, &label, note.as_deref()))
+}
+
+/// Reads as many mapped bytes at `address` as fit before an unmapped page.
+fn read_guest_prefix(
+    memory: &exbawks_memory::SoftwareAddressSpace,
+    address: GuestVa,
+    buffer: &mut [u8],
+) -> Option<usize> {
+    use exbawks_memory::GuestMemory;
+    for len in (1..=buffer.len()).rev() {
+        if memory.fetch(address, &mut buffer[..len]).is_ok() {
+            return Some(len);
+        }
+    }
+    None
 }
 
 /// Names the export behind kernel-related stop reasons.
@@ -508,6 +617,223 @@ fn stop_reason_note(stop: &StopReason) -> String {
                 .unwrap_or_default()
         }
         _ => String::new(),
+    }
+}
+
+fn coverage(only: Option<Surface>, xbe: Option<&Path>, missing: bool, json: bool) -> Result<()> {
+    let imports = match xbe {
+        Some(path) => Some(xbe_import_ordinals(path)?),
+        None => None,
+    };
+    let want = |surface: Surface| only.is_none_or(|selected| selected == surface);
+
+    let mut ledger = CoverageLedger::default();
+    if want(Surface::Cpu) {
+        ledger.push(cpu_surface());
+    }
+    if want(Surface::Kernel) {
+        ledger.push(kernel_surface(imports.as_deref()));
+    }
+    if want(Surface::Gpu) {
+        ledger.push(gpu_surface());
+    }
+
+    if json {
+        return print_json(&CoverageJson::from_ledger(&ledger));
+    }
+    print_coverage(&ledger, missing);
+    Ok(())
+}
+
+/// Reads the imported kernel ordinals of one XBE.
+fn xbe_import_ordinals(path: &Path) -> Result<Vec<u16>> {
+    let bytes = read_file(path)?;
+    let mut emulator = EmulatorBuilder::new().build()?;
+    let loaded =
+        emulator.load_xbe(bytes).with_context(|| format!("failed to load {}", path.display()))?;
+    let mut ordinals: Vec<u16> =
+        loaded.kernel_thunks().entries.iter().map(|thunk| thunk.ordinal).collect();
+    ordinals.sort_unstable();
+    ordinals.dedup();
+    Ok(ordinals)
+}
+
+/// Builds the kernel HLE ordinal coverage, optionally filtered to imports.
+fn kernel_surface(imports: Option<&[u16]>) -> SurfaceCoverage {
+    let registry = KernelRegistry::new();
+    let _ = register_startup_exports(&registry);
+    let ordinals: Vec<u16> = match imports {
+        Some(list) => list.to_vec(),
+        None => KERNEL_ORDINALS.iter().map(|entry| entry.ordinal).collect(),
+    };
+
+    let items = ordinals
+        .into_iter()
+        .map(|ordinal| {
+            let info = kernel_ordinal_info(ordinal);
+            let name =
+                info.map_or_else(|| format!("ordinal-{ordinal}"), |info| info.name.to_owned());
+            let status = match registry.get(ordinal) {
+                Some(export) if export.is_stub() => CoverageStatus::Stub,
+                Some(_) => CoverageStatus::Implemented,
+                None => CoverageStatus::Missing,
+            };
+            let note = info.map(|info| match info.kind {
+                ExportKind::Function => "function".to_owned(),
+                ExportKind::Data => "data".to_owned(),
+            });
+            CoverageItem { id: u32::from(ordinal), name, status, note }
+        })
+        .collect();
+    SurfaceCoverage::new(Surface::Kernel, items)
+}
+
+/// Builds the interpreter oracle's instruction-family coverage.
+///
+/// Under the WHP execution tier the host CPU runs these natively; this
+/// surface tracks the deterministic oracle tier that produces goldens.
+fn cpu_surface() -> SurfaceCoverage {
+    use CoverageStatus::{Implemented, Missing};
+    const FAMILIES: &[(&str, CoverageStatus)] = &[
+        ("mov / movzx / movsx / lea", Implemented),
+        ("alu add/adc/sub/sbb/and/or/xor/cmp/test", Implemented),
+        ("inc / dec / neg / not", Implemented),
+        ("shift / rotate (incl. shld/shrd)", Implemented),
+        ("mul / imul / div / idiv", Implemented),
+        ("bt family / bsf / bsr / bswap", Implemented),
+        ("setcc / cmovcc", Implemented),
+        ("xchg / xadd / cmpxchg / cmpxchg8b", Implemented),
+        ("string ops with rep prefixes", Implemented),
+        ("jmp / jcc / call / ret / loop / jecxz", Implemented),
+        ("push / pop / pushad / popad / pushfd / popfd / leave", Implemented),
+        ("cbw / cwde / cwd / cdq / flag ops", Implemented),
+        ("cpuid / rdtsc", Implemented),
+        ("x87 fpu", Missing),
+        ("mmx", Missing),
+        ("sse1", Missing),
+    ];
+    let items = FAMILIES
+        .iter()
+        .enumerate()
+        .map(|(index, (name, status))| CoverageItem {
+            id: index as u32,
+            name: (*name).to_owned(),
+            status: *status,
+            note: None,
+        })
+        .collect();
+    SurfaceCoverage::new(Surface::Cpu, items)
+}
+
+/// Builds the NV2A graphics method coverage (scaffold; none implemented).
+fn gpu_surface() -> SurfaceCoverage {
+    const METHODS: &[&str] = &[
+        "SET_OBJECT",
+        "pushbuffer FIFO kick",
+        "CLEAR",
+        "BEGIN_END primitives",
+        "inline vertex arrays",
+        "texture and format state",
+        "blend and alpha state",
+        "viewport and transform",
+        "PCRTC present / flip",
+    ];
+    let items = METHODS
+        .iter()
+        .enumerate()
+        .map(|(index, name)| CoverageItem {
+            id: index as u32,
+            name: (*name).to_owned(),
+            status: CoverageStatus::Missing,
+            note: None,
+        })
+        .collect();
+    SurfaceCoverage::new(Surface::Gpu, items)
+}
+
+fn print_coverage(ledger: &CoverageLedger, missing: bool) {
+    println!(
+        "{:<8} {:>11} {:>5} {:>7} {:>6} {:>4}",
+        "Surface", "Implemented", "Stub", "Missing", "Total", "%"
+    );
+    for surface in &ledger.surfaces {
+        println!(
+            "{:<8} {:>11} {:>5} {:>7} {:>6} {:>3}%",
+            surface.surface.as_str(),
+            surface.count(CoverageStatus::Implemented),
+            surface.count(CoverageStatus::Stub),
+            surface.count(CoverageStatus::Missing),
+            surface.total(),
+            surface.percent_implemented(),
+        );
+    }
+
+    if missing {
+        for surface in &ledger.surfaces {
+            let gaps: Vec<&CoverageItem> = surface.missing().collect();
+            if gaps.is_empty() {
+                continue;
+            }
+            println!("\n{} missing ({}):", surface.surface, gaps.len());
+            for item in gaps {
+                match &item.note {
+                    Some(note) => println!("  {:>4}  {:<32} {}", item.id, item.name, note),
+                    None => println!("  {:>4}  {}", item.id, item.name),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CoverageJson {
+    surfaces: Vec<SurfaceJson>,
+}
+
+#[derive(Debug, Serialize)]
+struct SurfaceJson {
+    surface: String,
+    implemented: usize,
+    stub: usize,
+    missing: usize,
+    total: usize,
+    percent_implemented: u32,
+    items: Vec<ItemJson>,
+}
+
+#[derive(Debug, Serialize)]
+struct ItemJson {
+    id: u32,
+    name: String,
+    status: String,
+    note: Option<String>,
+}
+
+impl CoverageJson {
+    fn from_ledger(ledger: &CoverageLedger) -> Self {
+        let surfaces = ledger
+            .surfaces
+            .iter()
+            .map(|surface| SurfaceJson {
+                surface: surface.surface.as_str().to_owned(),
+                implemented: surface.count(CoverageStatus::Implemented),
+                stub: surface.count(CoverageStatus::Stub),
+                missing: surface.count(CoverageStatus::Missing),
+                total: surface.total(),
+                percent_implemented: surface.percent_implemented(),
+                items: surface
+                    .items
+                    .iter()
+                    .map(|item| ItemJson {
+                        id: item.id,
+                        name: item.name.clone(),
+                        status: item.status.as_str().to_owned(),
+                        note: item.note.clone(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        Self { surfaces }
     }
 }
 
