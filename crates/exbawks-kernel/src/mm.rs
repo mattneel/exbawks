@@ -13,7 +13,8 @@ use crate::startup::stack_argument;
 use crate::{KernelCallContext, KernelError, KernelExport, KernelRegistry, KernelStatus};
 
 /// The physical-address mask for a kernel-window virtual address (ADR 0010:
-/// the cached window is `0x8000_0000 | PA`).
+/// the cached window is `0x8000_0000 | PA`), the fallback when a virtual
+/// address is not currently mapped.
 const PHYSICAL_ADDRESS_MASK: u32 = 0x1FFF_FFFF;
 
 /// Registers the Mm* contiguous-memory exports.
@@ -287,7 +288,15 @@ impl KernelExport for MmGetPhysicalAddress {
 
     fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
         let address = stack_argument(context, 0).unwrap_or(0);
-        // The physical address is the low bits of the window virtual address.
+        // A real page-table walk, so the answer is truthful for every
+        // mapped virtual address (window, image, and user allocations
+        // alike); an unmapped address falls back to the window mask.
+        let table = context.memory.page_table();
+        let descriptor = table.get(exbawks_types::GuestPage(address >> 12));
+        if descriptor.kind() == exbawks_memory::PageKind::Ram {
+            let physical = descriptor.physical_page().0 << 12;
+            return KernelStatus(physical | (address & 0xFFF));
+        }
         KernelStatus(address & PHYSICAL_ADDRESS_MASK)
     }
 }

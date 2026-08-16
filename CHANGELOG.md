@@ -260,6 +260,35 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- The cached physical window is real (ADR 0010): virtual
+  `[0x8000_0000, 0x8000_0000 + ram)` aliases physical `[0, ram)`, kernel
+  blocks are physical allocations whose virtual address is the window
+  identity `0x8000_0000 | PA`, and the loader reserves kernel-owned low
+  physical memory up front — page 0 as the scratch/zero page (Direct3D
+  primes cache flushes by writing through the window base) and physical
+  `0x10000` for the synthetic kernel image at its architectural address.
+  `MmGetPhysicalAddress` now performs a real page-table walk, so physical
+  addresses are truthful for every mapped virtual address (the PRAMIN
+  alias and GPU-visible pointers inherit the correctness). The ADR 0010
+  stack-guard fault property is traded away — under the window every
+  physical page is mapped; guard pages remain as burned spacing. An
+  adversarial review caught the refactor silently killing the ADR 0015
+  soft-reboot restore (window addresses are always mapped, so the old
+  remap-then-write gate failed and launch data was lost while the pointer
+  test still passed): persisted window regions now reserve their physical
+  pages before the fresh boot allocates and restore by writing straight
+  through the window, a content-integrity relaunch test pins the path,
+  kernel blocks are scrubbed on allocation (the guest can dirty any page
+  through the window first), reservation bounds clamp to real RAM, and
+  emulated RAM is capped at the 128 MiB console ceiling so the window can
+  never reach device space.
+- First pushbuffer contact: writes to the NV2A `USER` channel `DMA_PUT`
+  latch `DMA_GET` to the submitted value (an infinitely fast GPU), with the
+  submission logged for the coming graphics frontend, and the PFB trigger
+  register (`0xFD10_0410`) self-clears. The retail image programs the GPU
+  through PFIFO/PFB/PCRTC, submits its first pushbuffer, and proceeds into
+  Direct3D's post-submission path — the frontier where real command-stream
+  consumption (the `GraphicsFrontend`) begins.
 - The Direct3D-init burndown on the hypervisor tier. The GPU instance
   claim now backs the NV2A `PRAMIN` window: the engine aliases the claimed
   region into the partition (and the interpreter's device view redirects

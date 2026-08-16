@@ -21,12 +21,19 @@ impl EmulatorConfig {
     pub const RETAIL_RAM_BYTES: usize = 64 * 1024 * 1024;
     /// A common development-kit RAM size.
     pub const DEVELOPMENT_RAM_BYTES: usize = 128 * 1024 * 1024;
+    /// The largest supported RAM size: the development-kit ceiling. Keeping
+    /// the cached physical window (`0x8000_0000 + ram`, ADR 0010) far below
+    /// the device MMIO space (`0xFD00_0000`) is a hard requirement.
+    pub const MAX_RAM_BYTES: usize = Self::DEVELOPMENT_RAM_BYTES;
 
-    /// Returns true when physical memory uses complete guest pages.
+    /// Returns true when physical memory uses complete guest pages and fits
+    /// under the console ceiling.
     #[must_use]
     pub fn physical_memory_is_aligned(&self) -> bool {
         let page_size = usize::try_from(GUEST_PAGE_SIZE).unwrap_or(4096);
-        self.physical_memory_bytes != 0 && self.physical_memory_bytes.is_multiple_of(page_size)
+        self.physical_memory_bytes != 0
+            && self.physical_memory_bytes.is_multiple_of(page_size)
+            && self.physical_memory_bytes <= Self::MAX_RAM_BYTES
     }
 }
 

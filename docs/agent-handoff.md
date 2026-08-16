@@ -186,24 +186,39 @@ Two active threads:
    latching port model), and `HalReadWritePCISpace` (synthetic NV2A config
    with real BARs).
 
-   **Current DC3 wall (WHP tier): the cached physical window (ADR 0010).**
-   Fault: write to `ds:[0x8000_0000]` at guest `0x1CD82F` (D3D's GPU init
-   touching the window base, physical page 0). The Xbox maps a cached
-   window where `VA = 0x8000_0000 | PA` aliasing *all* of physical RAM, but
-   the current `allocate_kernel_block` places kernel blocks at
-   `0x8010_0000+` with independently bump-allocated physical pages, so the
-   window invariant does not hold and low window addresses are unmapped.
-   **Next: make the kernel window real** — either map the whole
-   `[0x8000_0000, 0x8000_0000+ram)` range as an alias of physical `[0, ram)`
-   at boot AND allocate kernel blocks so their VA satisfies
-   `VA = 0x8000_0000 | PA` (the two must agree — today they conflict), or
-   the narrower fix of mapping the specific low-window pages D3D touches.
-   The clean version is the ADR 0010 design; it moves the KPCR/kernel-var
-   addresses, so re-verify the boot layout. After the window, the GPU
-   register model (`region=Gpu` traffic is already flowing —
-   `RUST_LOG=exbawks_core::mmio=trace`) is the graphics frontier where
-   `GraphicsFrontend` and the screenshot command land. The interpreter tier
-   remains the deterministic oracle (frontier: `movss` at `0x1685A0`).
+   **The cached physical window is REAL (ADR 0010).** `map_physical_window`
+   aliases `[0x8000_0000, +ram)` onto physical `[0, ram)`; kernel blocks are
+   physical allocations with `VA = 0x8000_0000 | PA` (scrubbed on allocation
+   — the guest can dirty any page through the window first); the loader
+   reserves physical `[0, 0x11000)` (zero page for D3D's WBINVD-priming
+   write + the synthetic kernel image at PA `0x10000`); RAM is capped at
+   128 MiB so the window can never reach device space.
+   `MmGetPhysicalAddress` does a real page-table walk. An adversarial review
+   caught the refactor silently killing the ADR 0015 relaunch restore
+   (window VAs are always mapped, so the old `map_anonymous` gate failed →
+   launch data zeroed): persisted window regions now reserve their physical
+   pages BEFORE the fresh boot allocates (`pending_persist_reservations` in
+   `load_xbe`) and restore by writing straight through the window;
+   `reserve_cursor_through` is gone. A content-integrity relaunch test
+   (magic word round-trips a reboot) pins the path.
+
+   Past the window, D3D advanced through: the PFB trigger register
+   (`0xFD10_0410`, self-clearing) and **the first pushbuffer submission** —
+   D3D writes `DMA_PUT` (NV_USER channel + 0x40, 64 KiB stride) and polls
+   `DMA_GET`; the stub GPU snaps GET to PUT ("infinitely fast") and logs
+   `pushbuffer submitted put=... channel=...`.
+
+   **Current DC3 wall (WHP tier): D3D's post-submission path** — fault at
+   `0x1D426C` (`mov eax,[ecx+eax*4+0x138]`-shape with a garbage arg): D3D
+   proceeded past "GPU idle" and is consuming results only a real
+   command-stream consumer produces. **Next: the graphics frontier proper**
+   — consume the submitted pushbuffer (commands live in guest RAM at the
+   logged physical PUT addresses; NV2A method encoding: header
+   `count<<18 | subchannel<<13 | method`, then count dwords), feed decoded
+   methods into `GraphicsFrontend`, and model enough PGRAPH state for D3D's
+   readbacks. That path ends at the framebuffer and the screenshot command.
+   The interpreter tier remains the deterministic oracle (frontier: `movss`
+   at `0x1685A0`).
 
 2. **Kernel HLE burndown** (substrate-independent, needed under either
    engine). Done this session, in order the retail image demanded them:

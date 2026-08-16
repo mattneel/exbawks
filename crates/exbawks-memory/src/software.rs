@@ -86,6 +86,42 @@ impl SoftwareAddressSpace {
         self.physical.read().base_ptr()
     }
 
+    /// Maps the cached physical window (ADR 0010): virtual
+    /// `[0x8000_0000, 0x8000_0000 + ram)` aliases physical `[0, ram)`
+    /// read-write, so every physical page is reachable at
+    /// `VA = 0x8000_0000 | PA` — the invariant Xbox software relies on.
+    pub fn map_physical_window(&self) -> Result<(), MemoryError> {
+        let len = self.physical_len() as u64;
+        let range = GuestRange::page_aligned(GuestVa(0x8000_0000), len)?;
+        self.map_alias(range, GuestPa(0), MemoryPermissions::READ | MemoryPermissions::WRITE)
+    }
+
+    /// Allocates page-rounded physical pages without mapping a virtual range.
+    ///
+    /// For allocations living in the cached physical window (ADR 0010),
+    /// where `VA = 0x8000_0000 | PA` and the window alias already maps
+    /// every physical page: the caller derives the virtual address from the
+    /// returned physical one.
+    pub fn allocate_physical(&self, bytes: u32) -> Result<GuestPa, MemoryError> {
+        let pages = bytes.max(1).div_ceil(GUEST_PAGE_SIZE);
+        let mut allocator = self.allocator.lock();
+        Ok(allocator.allocate(pages)?.start_pa())
+    }
+
+    /// Advances the physical allocator so every page below `end` is spoken
+    /// for (soft-reboot restore keeps persisted regions out of reuse).
+    pub fn reserve_physical_through(&self, end: GuestPa) {
+        let mut allocator = self.allocator.lock();
+        // Clamped to real RAM: a bogus bound must not silently exhaust the
+        // allocator page by page.
+        let target = end.0.div_ceil(GUEST_PAGE_SIZE).min(allocator.page_count());
+        while allocator.next_page() < target {
+            if allocator.allocate(1).is_err() {
+                break;
+            }
+        }
+    }
+
     /// The current mapping epoch; changes whenever guest mappings mutate.
     #[must_use]
     pub fn mapping_epoch(&self) -> u64 {

@@ -22,14 +22,11 @@ use crate::hostfs::HostFileSystem;
 /// (ADR 0011).
 pub(crate) const THREAD_EXIT_SENTINEL: GuestVa = GuestVa(0xFFBF_FFF4);
 
-/// The first virtual address of the kernel-owned object region (ADR 0010).
-///
-/// Until the real allocators land (MEM-006/007), kernel blocks are
-/// bump-mapped here; the guest-visible property that matters is that every
-/// kernel pointer compares above `0x8000_0000`. This sits above the
-/// synthetic kernel image (which the guest accesses at its fixed
-/// `0x8001_0000` base) so the two never collide.
-const KERNEL_REGION_BASE: u32 = 0x8010_0000;
+/// The base of the cached physical window (ADR 0010): `VA = 0x8000_0000 |
+/// PA`, aliasing all of physical RAM. Kernel blocks are physical
+/// allocations whose virtual address is derived through this identity, so
+/// `MmGetPhysicalAddress` and GPU-visible physical pointers are truthful.
+const KERNEL_WINDOW_BASE: u32 = 0x8000_0000;
 
 /// The first virtual address the user-space allocator hands out (ADR 0010).
 ///
@@ -137,8 +134,6 @@ pub(crate) struct ThreadManager {
     threads: Vec<GuestThread>,
     current: usize,
     pending: Option<PendingAction>,
-    kernel_cursor: u32,
-    kernel_region_end: u32,
     /// The next free user-space address `NtAllocateVirtualMemory` hands out
     /// for a kernel-chosen (`BaseAddress == 0`) allocation. A forward bump
     /// until the real VA region map lands (MEM-007).
@@ -186,18 +181,11 @@ impl ThreadManager {
         disc_root: Option<PathBuf>,
         hdd_root: Option<PathBuf>,
     ) -> Self {
-        // Kernel blocks stay inside the cached physical window
-        // (`0x8000_0000 | PA`, ADR 0010) so they never stray into the
-        // higher windows the ADR reserves.
-        let window = u32::try_from(memory.physical_len()).unwrap_or(u32::MAX);
-        let kernel_region_end = 0x8000_0000_u32.saturating_add(window);
         Self {
             memory,
             threads: Vec::new(),
             current: 0,
             pending: None,
-            kernel_cursor: KERNEL_REGION_BASE,
-            kernel_region_end,
             user_cursor: USER_ALLOC_BASE,
             handles: HashSet::new(),
             files: HostFileSystem::new(disc_root, hdd_root),
@@ -279,12 +267,6 @@ impl ThreadManager {
         &self.persisted
     }
 
-    /// Advances the kernel bump cursor to at least `end`, so a restored
-    /// persisted region is never re-allocated over on the next boot.
-    pub(crate) fn reserve_cursor_through(&mut self, end: u32) {
-        self.kernel_cursor = self.kernel_cursor.max(end);
-    }
-
     /// Builds the boot thread's KPCR/KTHREAD pages and registers thread one.
     ///
     /// Returns the KPCR address the caller wires into the active `fs` base.
@@ -306,26 +288,32 @@ impl ThreadManager {
     }
 
     /// Allocates one page-rounded kernel block and returns its range.
+    ///
+    /// The block is a physical allocation; its virtual address is the
+    /// window identity `0x8000_0000 | PA` (ADR 0010), which the window
+    /// alias already maps, so `MmGetPhysicalAddress` and GPU-visible
+    /// physical pointers hold trivially.
     fn allocate_kernel_block(&mut self, bytes: u32) -> Result<GuestRange, MemoryError> {
         let page = GUEST_PAGE_SIZE;
         let rounded = bytes.max(1).div_ceil(page).saturating_mul(page);
-        let Some(end) =
-            self.kernel_cursor.checked_add(rounded).filter(|end| *end <= self.kernel_region_end)
-        else {
-            return Err(MemoryError::OutOfPhysicalMemory { requested_pages: rounded / page });
-        };
-        let range = GuestRange::new(GuestVa(self.kernel_cursor), u64::from(rounded))?;
-        self.memory.map_anonymous(range, MemoryPermissions::READ | MemoryPermissions::WRITE)?;
-        self.kernel_cursor = end;
+        let physical = self.memory.allocate_physical(rounded)?;
+        let base = KERNEL_WINDOW_BASE | physical.0;
+        let range = GuestRange::new(GuestVa(base), u64::from(rounded))?;
+        // The guest can write any physical page through the window before
+        // it is allocated, so a fresh block is scrubbed to keep the zeroed
+        // invariant KPCR/TLS construction relies on.
+        let zeros = vec![0_u8; rounded as usize];
+        self.memory.write(GuestVa(base), &zeros)?;
         Ok(range)
     }
 
-    /// Advances the cursor past one unmapped guard page.
+    /// Burns one physical page of spacing between kernel blocks.
     ///
-    /// A guard below a stack limit turns an overflow into a fault instead of
-    /// silent corruption of the neighboring kernel block (ADR 0010).
+    /// Under the window alias every physical page is mapped, so this no
+    /// longer faults an overflow (the ADR 0010 guard property); it keeps
+    /// the neighboring block out of the first overflowing write's way.
     fn reserve_guard_page(&mut self) {
-        self.kernel_cursor = self.kernel_cursor.saturating_add(GUEST_PAGE_SIZE);
+        let _ = self.memory.allocate_physical(GUEST_PAGE_SIZE);
     }
 
     /// Builds the kernel-variables region backing the DATA exports (ADR 0010).
@@ -842,6 +830,8 @@ mod tests {
 
     fn manager() -> ThreadManager {
         let memory = Arc::new(SoftwareAddressSpace::new(4 * 1024 * 1024).expect("memory is valid"));
+        // Kernel blocks live behind the cached physical window (ADR 0010).
+        memory.map_physical_window().expect("the window maps");
         ThreadManager::new(memory, None, None)
     }
 

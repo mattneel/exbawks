@@ -28,6 +28,16 @@ impl PhysicalAllocator {
         Ok(start)
     }
 
+    /// The next page the allocator would hand out.
+    pub(crate) fn next_page(&self) -> u32 {
+        self.next_page
+    }
+
+    /// The total number of physical pages.
+    pub(crate) fn page_count(&self) -> u32 {
+        self.page_count
+    }
+
     pub(crate) fn rollback_last(&mut self, start: GuestPage, page_count: u32) {
         let expected_end =
             start.0.checked_add(page_count).expect("a completed allocation cannot overflow");

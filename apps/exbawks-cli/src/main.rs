@@ -596,6 +596,11 @@ fn run(
     println!("Stop reason:  {stop:?}{}", stop_reason_note(&stop));
     println!("Final EIP:    {}", GuestVa(emulator.cpu().eip));
     println!("Final EAX:    0x{:08X}", gpr[0]);
+    println!("Final ECX:    0x{:08X}", gpr[1]);
+    println!("Final EDX:    0x{:08X}", gpr[2]);
+    println!("Final EBX:    0x{:08X}", gpr[3]);
+    println!("Final ESP:    0x{:08X}", gpr[4]);
+    println!("Final EBP:    0x{:08X}", gpr[5]);
     println!("Final ESI:    0x{:08X}", gpr[6]);
     println!("Final EDI:    0x{:08X}", gpr[7]);
 

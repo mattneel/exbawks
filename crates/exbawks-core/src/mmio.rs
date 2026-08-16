@@ -82,6 +82,11 @@ pub struct DeviceSpace {
 /// The NV2A `PRAMIN` window: the GPU instance-memory aperture.
 const PRAMIN_BASE: u32 = 0xFD70_0000;
 
+/// The NV2A `USER` region: per-channel pushbuffer control (`DMA_PUT` at
+/// `+0x40`, `DMA_GET` at `+0x44` within each channel window).
+const NV_USER_START: u32 = 0xFD80_0000;
+const NV_USER_END: u32 = 0xFDA0_0000;
+
 /// The APU register receiving the GP comm region's physical base address.
 const APU_GP_COMM_BASE: u32 = 0xFE82_0808;
 /// The mailbox cell's page offset within the GP comm region.
@@ -129,9 +134,12 @@ impl DeviceSpace {
         // observed cases.
         let ac97_channel_control =
             (0xFEC0_0100..=0xFEC0_01FF).contains(&address) && address & 0xF == 0xB;
+        // `0xFD10_0410`: an NV2A PFB (memory controller) register D3D
+        // writes a trigger bit into and polls until it self-clears.
+        const SELF_CLEAR: [u32; 1] = [0xFD10_0410];
         if READY_OVERRIDES.contains(&address) {
             output.fill(0xFF);
-        } else if ac97_channel_control {
+        } else if ac97_channel_control || SELF_CLEAR.contains(&address) {
             // Already zero-filled: the command completed instantly.
         } else {
             let registers =
@@ -154,6 +162,23 @@ impl DeviceSpace {
         let take = input.len().min(4);
         bytes[..take].copy_from_slice(&input[..take]);
         let value = u32::from_le_bytes(bytes);
+        // A pushbuffer submission: the guest writes DMA_PUT (offset 0x40
+        // within a 64 KiB USER channel window) and polls DMA_GET until the
+        // GPU catches up. The stub GPU is infinitely fast: GET snaps to PUT
+        // the moment PUT is written. The submitted range's commands live in
+        // guest RAM for the graphics frontend to consume once it exists.
+        if (NV_USER_START..NV_USER_END).contains(&address) && address & 0xFFFF == 0x40 {
+            let get_register = address + 4;
+            self.registers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(get_register, value);
+            tracing::debug!(
+                put = format_args!("{value:#010x}"),
+                channel = format_args!("{:#010x}", address & !0xFFFF),
+                "pushbuffer submitted"
+            );
+        }
         if address == APU_GP_COMM_BASE && value != 0 {
             // A comm region's physical base: its mailbox page (in the
             // cached kernel window) becomes an instant-consumer mailbox.

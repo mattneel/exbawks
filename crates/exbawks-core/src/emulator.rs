@@ -149,6 +149,7 @@ impl EmulatorBuilder {
             disc_root: None,
             hdd_root: None,
             devices: crate::mmio::DeviceSpace::default(),
+            pending_persist_reservations: Vec::new(),
             last_relaunch_data: None,
         })
     }
@@ -179,6 +180,11 @@ pub struct Emulator {
     hdd_root: Option<PathBuf>,
     /// The device model behind unmapped hardware register blocks (WHP-M2).
     devices: crate::mmio::DeviceSpace,
+    /// Physical ranges (base, len) the next `load_xbe` must keep the
+    /// allocator away from: soft-reboot persisted regions live at fixed
+    /// window addresses, so their physical pages are reserved before the
+    /// fresh boot allocates anything (ADR 0015 under the ADR 0010 window).
+    pending_persist_reservations: Vec<(u32, u32)>,
     /// The persisted launch data of the previous relaunch (ADR 0015). A
     /// relaunch that persists identical data is a reboot loop, not progress,
     /// so the run stops instead of spinning.
@@ -264,6 +270,28 @@ impl Emulator {
         let bytes: Arc<[u8]> = bytes.into();
         let image = XbeImage::parse(&bytes)?;
         let memory = Arc::new(SoftwareAddressSpace::new(self.config.physical_memory_bytes)?);
+        // The console's kernel-owned low physical memory (ADR 0010): page 0
+        // is the scratch/zero page (Direct3D primes cache flushes by writing
+        // through the window base), and the page at physical `0x10000` holds
+        // the synthetic kernel image at its architectural window address.
+        let low_reservation = memory
+            .allocate_physical(KERNEL_IMAGE_BASE - 0x8000_0000 + GUEST_PAGE_SIZE)
+            .map_err(|_| {
+                CoreError::InvalidConfiguration(
+                    "physical memory is too small for the kernel-owned low region",
+                )
+            })?;
+        debug_assert_eq!(low_reservation.0, 0, "the low reservation must start at physical zero");
+        // The cached physical window: every physical page is reachable at
+        // `VA = 0x8000_0000 | PA`, the invariant Xbox software (and D3D's
+        // GPU programming in particular) relies on.
+        memory.map_physical_window()?;
+        // Keep the fresh allocator away from soft-reboot persisted regions:
+        // their window addresses are fixed, so their physical pages must
+        // survive the new boot's allocations (ADR 0015).
+        for (base, len) in self.pending_persist_reservations.drain(..) {
+            memory.reserve_physical_through(exbawks_types::GuestPa(base.saturating_add(len)));
+        }
         map_xbe(&memory, &image, &bytes)?;
         map_synthetic_kernel_image(&memory)?;
 
@@ -532,14 +560,32 @@ impl Emulator {
 
         // Reload the same image (the empty launch path is a self-relaunch).
         // `reset` clears the loop-detection state, so it is set after restore.
+        // Window-resident regions have fixed physical pages; recording them
+        // here makes the fresh `load_xbe` reserve those pages before it
+        // allocates anything.
+        let window_len = self.memory.physical_len() as u32;
+        let in_window = |base: u32, len: u32| {
+            base >= 0x8000_0000 && (base - 0x8000_0000).saturating_add(len) <= window_len
+        };
+        self.pending_persist_reservations = snapshots
+            .iter()
+            .filter(|(base, bytes)| in_window(*base, bytes.len() as u32))
+            .map(|(base, bytes)| (base & 0x1FFF_FFFF, bytes.len() as u32))
+            .collect();
         let bytes = self.loaded.as_ref().ok_or(CoreError::NoImageLoaded)?.bytes().to_vec();
         self.reset()?;
         self.load_xbe(bytes)?;
 
         // Restore the persisted regions at their original (page-aligned)
-        // addresses and keep the new boot's kernel allocator clear of them. A
-        // region that fails to map is skipped, not fatal to the run.
+        // addresses. A window address is always mapped (the window alias
+        // covers all of physical RAM), so its bytes write straight back; a
+        // non-window region is remapped first. Failure skips the region, not
+        // the run.
         for (base, bytes) in &snapshots {
+            if in_window(*base, bytes.len() as u32) {
+                let _ = self.memory.write(GuestVa(*base), bytes);
+                continue;
+            }
             let Ok(range) = GuestRange::page_aligned(GuestVa(*base), bytes.len() as u64) else {
                 continue;
             };
@@ -549,9 +595,6 @@ impl Emulator {
                 .is_ok()
             {
                 let _ = self.memory.write(GuestVa(*base), bytes);
-                if let Some(threads) = self.threads.as_mut() {
-                    threads.reserve_cursor_through(base.saturating_add(bytes.len() as u32));
-                }
             }
         }
 
@@ -1002,12 +1045,18 @@ impl Emulator {
                     // is wherever the guest was interrupted.
                     if tracing::enabled!(tracing::Level::TRACE) {
                         let sampled = machine
-                            .get_registers(&[exbawks_whp::Register::Rbx, exbawks_whp::Register::Fs])
+                            .get_registers(&[
+                                exbawks_whp::Register::Rax,
+                                exbawks_whp::Register::Rbx,
+                                exbawks_whp::Register::Fs,
+                            ])
                             .unwrap_or_default();
-                        let rbx = sampled.first().map(|value| value.low).unwrap_or(0);
-                        let fs_base = sampled.get(1).map(|value| value.low).unwrap_or(0);
+                        let rax = sampled.first().map(|value| value.low).unwrap_or(0);
+                        let rbx = sampled.get(1).map(|value| value.low).unwrap_or(0);
+                        let fs_base = sampled.get(2).map(|value| value.low).unwrap_or(0);
                         tracing::trace!(
                             rip = format_args!("{exit_rip:#010x}"),
+                            rax = format_args!("{rax:#010x}"),
                             rbx = format_args!("{rbx:#010x}"),
                             fs = format_args!("{fs_base:#010x}"),
                             "whp cancel sample"
@@ -1111,6 +1160,14 @@ impl Emulator {
                     let gate = gate_ordinal(GuestVa(fault_va)).filter(|_| access.access_type == 2);
                     let Some(ordinal) = gate else {
                         self.whp_read_cpu(&mut machine)?;
+                        tracing::debug!(
+                            gpa = format_args!("{:#010x}", access.gpa),
+                            gva = format_args!("{:#010x}", access.gva),
+                            access_type = access.access_type,
+                            gpa_unmapped = access.gpa_unmapped,
+                            gva_valid = access.gva_valid,
+                            "unhandled memory-access exit"
+                        );
                         return Ok(StopReason::GuestFault { address: GuestVa(fault_va) });
                     };
 
@@ -1281,6 +1338,13 @@ impl Emulator {
             if permissions.contains(MemoryPermissions::EXECUTE) {
                 flags |= 4;
             }
+            tracing::trace!(
+                gpa = format_args!("{:#010x}", run_va * page_size),
+                pa = format_args!("{:#010x}", run_pa * page_size),
+                bytes = length * page_size,
+                flags,
+                "partition map"
+            );
             machine
                 .map_address_space(
                     &self.memory,
@@ -1706,9 +1770,11 @@ const KERNEL_IMAGE_BASE: u32 = 0x8001_0000;
 fn map_synthetic_kernel_image(memory: &SoftwareAddressSpace) -> Result<(), CoreError> {
     const E_LFANEW: u32 = 0x40;
     let base = KERNEL_IMAGE_BASE;
+    // The image lives in kernel-owned low physical memory reserved at load
+    // (physical `0x10000`), already reachable through the window alias; the
+    // writes below go through the window, then the page tightens to R+X.
     let range = GuestRange::page_aligned(GuestVa(base), u64::from(GUEST_PAGE_SIZE))
         .map_err(MemoryError::from)?;
-    memory.map_anonymous(range, MemoryPermissions::READ | MemoryPermissions::WRITE)?;
 
     // DOS header: the `MZ` magic and the `e_lfanew` offset to the PE header.
     memory.write(GuestVa(base), b"MZ")?;
@@ -1946,6 +2012,57 @@ mod tests {
         assert_eq!(stop, StopReason::GuestExit { code: 0 });
     }
 
+    /// Persisted launch-data BYTES survive the relaunch, not just the
+    /// pointer: boot one writes a magic word into the persisted page and
+    /// reboots; boot two exits 0 only when the magic reads back intact.
+    /// (The window alias regression silently skipped the byte restore while
+    /// the pointer test still passed — this pins the content path.)
+    ///
+    /// ```text
+    /// mov ecx, [0x11200]; mov eax, [ecx]; test eax, eax; jnz already
+    /// push 0x1000; call [0x11204]; mov [ecx], eax
+    /// mov dword [eax+0x400], 0xC0DEC0DE
+    /// push 1; push 0x1000; push eax; call [0x11208]
+    /// push 2; call [0x1120C]
+    /// already: cmp dword [eax+0x400], 0xC0DEC0DE; jne bad
+    /// push 0; call [0x1120C]
+    /// bad: push 7; call [0x1120C]
+    /// ```
+    #[test]
+    fn relaunch_restores_persisted_content() {
+        const CONTENT_CODE: [u8; 85] = [
+            0x8B, 0x0D, 0x00, 0x12, 0x01, 0x00, // mov ecx, [0x00011200]
+            0x8B, 0x01, // mov eax, [ecx]
+            0x85, 0xC0, // test eax, eax
+            0x75, 0x2D, // jnz already (+0x2D)
+            0x68, 0x00, 0x10, 0x00, 0x00, // push 0x1000
+            0xFF, 0x15, 0x04, 0x12, 0x01, 0x00, // call [0x00011204]
+            0x89, 0x01, // mov [ecx], eax
+            0xC7, 0x80, 0x00, 0x04, 0x00, 0x00, 0xDE, 0xC0, 0xDE,
+            0xC0, // mov dword [eax+0x400], 0xC0DEC0DE
+            0x6A, 0x01, // push 1
+            0x68, 0x00, 0x10, 0x00, 0x00, // push 0x1000
+            0x50, // push eax
+            0xFF, 0x15, 0x08, 0x12, 0x01, 0x00, // call [0x00011208]
+            0x6A, 0x02, // push 2
+            0xFF, 0x15, 0x0C, 0x12, 0x01, 0x00, // call [0x0001120C]
+            0x81, 0xB8, 0x00, 0x04, 0x00, 0x00, 0xDE, 0xC0, 0xDE,
+            0xC0, // already: cmp dword [eax+0x400], 0xC0DEC0DE
+            0x75, 0x08, // jne bad (+8)
+            0x6A, 0x00, // push 0
+            0xFF, 0x15, 0x0C, 0x12, 0x01, 0x00, // call [0x0001120C]
+            0x6A, 0x07, // bad: push 7
+            0xFF, 0x15, 0x0C, 0x12, 0x01, 0x00, // call [0x0001120C]
+        ];
+        let thunks = [0x8000_0000 | 164, 0x8000_0000 | 165, 0x8000_0000 | 178, 0x8000_0000 | 49];
+        let mut emulator = Emulator::new().expect("emulator must initialize");
+        emulator.load_xbe(synthetic_xbe_with(&CONTENT_CODE, &thunks)).expect("image must load");
+
+        let stop = emulator.run(4096).expect("run must complete");
+
+        assert_eq!(stop, StopReason::GuestExit { code: 0 }, "the magic word must survive");
+    }
+
     /// A title stuck rebooting with identical launch data is a reboot loop,
     /// not progress; the run detects the repeated launch data and stops with
     /// `Reboot` instead of relaunching to the backstop limit. The guest here
@@ -2097,12 +2214,13 @@ mod tests {
             })
             .expect("thread creates");
 
-        // The KTHREAD records the child's stack limit; the page below it is
-        // unmapped (a write there faults).
+        // The KTHREAD records the child's stack limit. Under the cached
+        // physical window (ADR 0010) every physical page is mapped, so the
+        // page below the limit is burned spacing rather than a faulting
+        // guard; the limit itself must still be a valid window address.
         let stack_limit =
             emulator.memory().read_u32(GuestVa(created.kthread.0 + 0x20)).expect("read");
-        let error = emulator.memory().write_u32(GuestVa(stack_limit - 4), 0);
-        assert!(error.is_err(), "the guard page below the stack must be unmapped");
+        assert!(stack_limit >= 0x8000_0000, "the stack lives in the kernel window");
 
         // A boot thread that has run instructions exits into the child; the
         // counter carries across rather than resetting to the child default.
