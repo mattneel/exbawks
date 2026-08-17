@@ -2035,4 +2035,97 @@ mod tests {
         assert_eq!(end, 0x1000, "the abandonment point is the bad word");
         assert_eq!(engine.stats().aborted, 1);
     }
+
+    /// TEMPORARY probe: the reviewer's exact trigger.
+    #[test]
+    fn probe_reviewer_trigger() {
+        let memory = FakeMemory::new(0x2_0000);
+        let pramin = 0x8000_u32;
+        let handle = 0x1234_u32;
+        let hash = ramht_hash(handle, 9, 0) % 512;
+        memory.write_words(pramin + hash * 8, &[handle, 0x100]);
+        // class 0x3D, limit 0xFF (256 bytes), frame/base 0x2000.
+        memory.write_words(pramin + 0x1000, &[0x0000_003D, 0xFF, 0x2000]);
+
+        let words = vec![
+            header(1, 0, METHOD_SET_CONTEXT_DMA_COLOR),
+            handle,
+            header(1, 0, METHOD_SET_SURFACE_CLIP_HORIZONTAL),
+            10 << 16,
+            header(1, 0, METHOD_SET_SURFACE_CLIP_VERTICAL),
+            10 << 16,
+            header(1, 0, METHOD_SET_SURFACE_PITCH),
+            (40 << 16) | 40,
+            header(1, 0, METHOD_SET_SURFACE_ZETA_OFFSET),
+            0x4000,
+            header(1, 0, METHOD_SET_CLEAR_RECT_HORIZONTAL),
+            10 << 16,
+            header(1, 0, METHOD_SET_CLEAR_RECT_VERTICAL),
+            10 << 16,
+            header(1, 0, METHOD_SET_ZSTENCIL_CLEAR_VALUE),
+            0xDEAD_BEEF,
+            header(1, 0, METHOD_SET_COLOR_CLEAR_VALUE),
+            0xCAFE_BABE,
+            header(1, 0, METHOD_CLEAR_SURFACE),
+            0xF3,
+        ];
+        let len = words.len() as u32 * 4;
+        memory.write_words(0x1000, &words);
+        let mut engine = PushbufferEngine::default();
+
+        engine.submit(&memory, 0, pramin, 0, 0x1000, 0x1000 + len);
+
+        println!("zeta 0x6000        = {:#010x}", memory.read_word(0x6000));
+        println!("zeta 0x6000+9*40   = {:#010x}", memory.read_word(0x6000 + 9 * 40));
+        for row in 0..10 {
+            println!(
+                "color row {row}: {:#010x} at {:#06x}",
+                memory.read_word(0x2000 + row * 40),
+                0x2000 + row * 40
+            );
+        }
+        println!("cleared_pixels = {}", engine.stats().cleared_pixels);
+    }
+
+    /// TEMPORARY probe: the colour path aimed outside the object too.
+    #[test]
+    fn probe_color_offset_escapes_the_limit() {
+        let memory = FakeMemory::new(0x2_0000);
+        let pramin = 0x8000_u32;
+        let handle = 0x1234_u32;
+        let hash = ramht_hash(handle, 9, 0) % 512;
+        memory.write_words(pramin + hash * 8, &[handle, 0x100]);
+        memory.write_words(pramin + 0x1000, &[0x0000_003D, 0xFF, 0x2000]);
+
+        let words = vec![
+            header(1, 0, METHOD_SET_CONTEXT_DMA_COLOR),
+            handle,
+            header(1, 0, METHOD_SET_SURFACE_CLIP_HORIZONTAL),
+            10 << 16,
+            header(1, 0, METHOD_SET_SURFACE_CLIP_VERTICAL),
+            10 << 16,
+            header(1, 0, METHOD_SET_SURFACE_PITCH),
+            (40 << 16) | 40,
+            header(1, 0, METHOD_SET_SURFACE_COLOR_OFFSET),
+            0x4000,
+            header(1, 0, METHOD_SET_CLEAR_RECT_HORIZONTAL),
+            10 << 16,
+            header(1, 0, METHOD_SET_CLEAR_RECT_VERTICAL),
+            10 << 16,
+            header(1, 0, METHOD_SET_COLOR_CLEAR_VALUE),
+            0xCAFE_BABE,
+            header(1, 0, METHOD_CLEAR_SURFACE),
+            0xF0,
+        ];
+        let len = words.len() as u32 * 4;
+        memory.write_words(0x1000, &words);
+        let mut engine = PushbufferEngine::default();
+
+        engine.submit(&memory, 0, pramin, 0, 0x1000, 0x1000 + len);
+
+        println!("color at 0x6000       = {:#010x}", memory.read_word(0x6000));
+        println!("color at 0x6000+6*40  = {:#010x}", memory.read_word(0x6000 + 6 * 40));
+        println!("color at 0x6000+7*40  = {:#010x}", memory.read_word(0x6000 + 7 * 40));
+        println!("cleared_pixels = {}", engine.stats().cleared_pixels);
+    }
 }

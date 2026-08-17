@@ -76,6 +76,11 @@ deny:
 smoke:
     cargo exbawks plan '{{synthetic_xbe}}' --json
 
+# Run the private golden frames (needs EXBAWKS_PRIVATE_FIXTURES set).
+[group("emulator")]
+goldens:
+    cargo test --release -p exbawks-core --test private_goldens -- --ignored --nocapture
+
 # Parse and describe one XBE file.
 [group("emulator")]
 inspect xbe *flags:

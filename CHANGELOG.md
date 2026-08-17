@@ -260,6 +260,15 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- A private compatibility harness (`QA-002`): manifests under a directory
+  named by `EXBAWKS_PRIVATE_FIXTURES` say which local image to run and which
+  frame digest it should render, and `just goldens` runs them. The suite is
+  ignored by default and inert without that variable, so a clean checkout
+  still runs `cargo test` — no commercial data enters the repository, and a
+  manifest whose image is missing is skipped rather than failed. Verified
+  against a retail title: the harness ran it for three minutes and matched
+  its recorded digest.
+
 - Golden frames: `exbawks run --frame-digest` prints a captured frame's
   digest and `--expect-frame <digest>` fails the run when it differs, which
   turns a screenshot into a regression test. The digest covers the frame's
