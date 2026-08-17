@@ -159,7 +159,9 @@ impl TextureState {
     fn is_linear(self) -> bool {
         matches!(
             self.color_format(),
-            TEXTURE_FORMAT_LINEAR_A8R8G8B8 | TEXTURE_FORMAT_LINEAR_X8R8G8B8
+            TEXTURE_FORMAT_LINEAR_A8R8G8B8
+                | TEXTURE_FORMAT_LINEAR_X8R8G8B8
+                | TEXTURE_FORMAT_LINEAR_R5G6B5
         )
     }
 }
@@ -225,6 +227,17 @@ struct VertexState {
     /// Vertex indices received through `ARRAY_ELEMENT` for the current
     /// primitive, when the title draws from arrays in memory instead.
     elements: Vec<u32>,
+    /// The model-view matrix, which takes a vertex into eye space.
+    model_view: [f32; 16],
+    /// The inverse model-view matrix, which takes a normal there.
+    inverse_model_view: [f32; 16],
+    /// How each unit generates each coordinate, when not read from a
+    /// vertex attribute.
+    texgen: [[u32; 4]; TEXTURE_UNITS],
+    /// Whether each unit transforms its coordinates by a matrix.
+    texture_matrix_enable: [bool; TEXTURE_UNITS],
+    /// Each unit's texture matrix, in upload order.
+    texture_matrix: [[f32; 16]; TEXTURE_UNITS],
     /// The value each attribute takes when no array supplies it.
     ///
     /// A title sets these by method and leaves them standing across draws:
@@ -267,6 +280,59 @@ struct SurfaceHistory {
 
 /// The attribute registers a vertex starts from.
 ///
+/// Transforms a four-component vector by a matrix in upload order.
+fn transform(vector: [f32; 4], matrix: &[f32; 16]) -> [f32; 4] {
+    std::array::from_fn(|row| (0..4).map(|column| vector[column] * matrix[row * 4 + column]).sum())
+}
+
+/// Scales a three-component vector to unit length, or leaves it alone
+/// when it has no length to speak of.
+fn normalize(vector: [f32; 3]) -> [f32; 3] {
+    let length = vector[0].mul_add(vector[0], vector[1].mul_add(vector[1], vector[2] * vector[2]));
+    if length <= 0.0 || !length.is_finite() {
+        return vector;
+    }
+    let scale = 1.0 / length.sqrt();
+    [vector[0] * scale, vector[1] * scale, vector[2] * scale]
+}
+
+/// The coordinates a unit's texgen produces for one vertex.
+///
+/// Only the reflection map is generated: it is what this title asks for,
+/// and a mode this engine does not generate falls back to the vertex's own
+/// coordinates rather than inventing any.
+fn generated_texcoords(
+    state: &VertexState,
+    unit: usize,
+    position: [f32; 4],
+    normal: [f32; 4],
+) -> Option<[f32; 2]> {
+    if state.texgen[unit][0] != TEXGEN_REFLECTION_MAP {
+        return None;
+    }
+    // The eye vector runs from the eye to the vertex, and the normal has
+    // to reach eye space through the inverse matrix.
+    let eye = transform(position, &state.model_view);
+    let towards = normalize([eye[0], eye[1], eye[2]]);
+    let transformed = transform([normal[0], normal[1], normal[2], 0.0], &state.inverse_model_view);
+    let facing = normalize([transformed[0], transformed[1], transformed[2]]);
+    let projection =
+        2.0 * facing[0].mul_add(towards[0], facing[1].mul_add(towards[1], facing[2] * towards[2]));
+    let reflected: [f32; 3] = std::array::from_fn(|axis| towards[axis] - projection * facing[axis]);
+
+    let coordinates = [reflected[0], reflected[1], reflected[2], 1.0];
+    // A title maps the reflection into the texture with a matrix of its
+    // own; without one the reflection is already the coordinate.
+    if !state.texture_matrix_enable[unit] {
+        return Some([coordinates[0], coordinates[1]]);
+    }
+    let mapped = transform(coordinates, &state.texture_matrix[unit]);
+    if mapped[3] != 0.0 && mapped[3].is_finite() {
+        return Some([mapped[0] / mapped[3], mapped[1] / mapped[3]]);
+    }
+    Some([mapped[0], mapped[1]])
+}
+
 /// A mesh need not carry every attribute, and the ones it leaves out are
 /// not zero: a vertex with no color of its own is white, which is what
 /// makes its texture show through unchanged.
@@ -365,6 +431,10 @@ pub struct PusherStats {
     /// unit no draw binds sees white, which is how a modulate turns into
     /// a brightening — so the counts are worth having.
     pub bound_by_unit: [u64; TEXTURE_UNITS],
+    /// Draws per texture color format, and how many of those this engine
+    /// could not sample. A format it does not decode costs the whole
+    /// primitive, so the two counts together say what is missing.
+    pub formats_seen: std::collections::BTreeMap<u32, (u64, u64)>,
     /// The last constant written to each vertex attribute by method, and
     /// how many times each was written.
     pub constant_attributes: [(u32, u64); 16],
@@ -520,7 +590,7 @@ pub struct PushbufferEngine {
     /// The texture most recently sampled, as `(state, context object)`.
     /// Dumping it answers whether a black frame is bad addressing or a
     /// texture that is genuinely empty.
-    last_texture: Option<(TextureState, Option<DmaObject>)>,
+    last_texture: [Option<(TextureState, Option<DmaObject>)>; TEXTURE_UNITS],
     /// Pixels and draws charged to each distinct combiner program, keyed
     /// by its control words. Which program shades the most of the screen
     /// is the question a wrong-looking frame asks first.
@@ -534,6 +604,11 @@ pub struct PushbufferEngine {
     /// The texture units that draw had bound, as `(format, rect, pitch)`
     /// per unit, with `None` for a unit it left disabled.
     busiest_textures: [Option<BoundTexture>; TEXTURE_UNITS],
+    /// That draw's declared vertex layout, as `(kind, size, stride,
+    /// offset)` per attribute, and whether a transform program ran.
+    busiest_layout: (bool, Vec<(u32, u32, u32, u32)>),
+    /// That draw's texgen modes and matrix enables.
+    busiest_texgen: ([[u32; 4]; TEXTURE_UNITS], [bool; TEXTURE_UNITS]),
     /// The combiner configuration the last draw ran under. Printing it is
     /// how a decode of the title's own program gets checked against what
     /// the color on screen looks like.
@@ -666,6 +741,7 @@ const MAX_ELEMENTS: usize = 1 << 18;
 /// The vertex attribute carrying position.
 const ATTRIBUTE_POSITION: usize = 0;
 /// The vertex attribute carrying the diffuse color.
+const ATTRIBUTE_NORMAL: usize = 2;
 const ATTRIBUTE_DIFFUSE: usize = 3;
 /// The vertex attribute carrying the specular color.
 const ATTRIBUTE_SPECULAR: usize = 4;
@@ -805,6 +881,31 @@ const METHOD_SET_DEPTH_FUNC: u16 = 0x0354;
 const METHOD_SET_DEPTH_MASK: u16 = 0x035C;
 /// Kelvin `SET_SURFACE_ZETA_OFFSET`.
 const METHOD_SET_SURFACE_ZETA_OFFSET: u16 = 0x0214;
+/// Kelvin `SET_MODEL_VIEW_MATRIX`, which takes a vertex to eye space.
+const METHOD_SET_MODEL_VIEW_MATRIX: u16 = 0x0480;
+/// Its last method.
+const MODEL_VIEW_MATRIX_LAST: u16 = 0x04BC;
+/// Kelvin `SET_INVERSE_MODEL_VIEW_MATRIX`, which takes a normal there.
+const METHOD_SET_INVERSE_MODEL_VIEW_MATRIX: u16 = 0x0580;
+/// Its last method.
+const INVERSE_MODEL_VIEW_MATRIX_LAST: u16 = 0x05BC;
+/// The texgen mode that reflects the eye vector about the normal.
+const TEXGEN_REFLECTION_MAP: u32 = 0x8512;
+
+/// Kelvin `SET_TEXGEN_S`: how each texture unit generates each of its
+/// four coordinates, four methods per unit.
+const METHOD_SET_TEXGEN: u16 = 0x03C0;
+/// One past the last texgen method.
+const METHOD_SET_TEXGEN_END: u16 = METHOD_SET_TEXGEN + 4 * 16;
+/// Kelvin `SET_TEXTURE_MATRIX_ENABLE`, one method per unit.
+const METHOD_SET_TEXTURE_MATRIX_ENABLE: u16 = 0x0420;
+/// One past the last of them.
+const METHOD_SET_TEXTURE_MATRIX_ENABLE_END: u16 = METHOD_SET_TEXTURE_MATRIX_ENABLE + 4 * 4;
+/// Kelvin `SET_TEXTURE_MATRIX`: sixteen floats per unit.
+const METHOD_SET_TEXTURE_MATRIX: u16 = 0x06C0;
+/// One past the last of them.
+const METHOD_SET_TEXTURE_MATRIX_END: u16 = METHOD_SET_TEXTURE_MATRIX + 4 * 64;
+
 /// Kelvin `SET_VERTEX_DATA2F_M`: two floats per attribute.
 const METHOD_SET_VERTEX_DATA2F: u16 = 0x1880;
 /// One past its last method.
@@ -850,8 +951,14 @@ const TEXTURE_ENABLE: u32 = 0x4000_0000;
 /// The texture color format for linear 8-bit ARGB.
 const TEXTURE_FORMAT_LINEAR_A8R8G8B8: u32 = 0x12;
 /// The texture color format for linear 8-bit XRGB (alpha reads as one).
-const TEXTURE_FORMAT_LINEAR_X8R8G8B8: u32 = 0x11;
+const TEXTURE_FORMAT_LINEAR_X8R8G8B8: u32 = 0x1E;
 /// The texture color format for swizzled 8-bit ARGB.
+/// Kelvin `LU_IMAGE_R5G6B5`. Sixteen bits per texel, and not a linear
+/// `X8R8G8B8` — reading it as one was a transcription error that this
+/// title never exercised.
+const TEXTURE_FORMAT_LINEAR_R5G6B5: u32 = 0x11;
+/// Kelvin `SZ_X8R8G8B8`, the opaque swizzled format.
+const TEXTURE_FORMAT_SWIZZLED_X8R8G8B8: u32 = 0x07;
 const TEXTURE_FORMAT_SWIZZLED_A8R8G8B8: u32 = 0x06;
 /// The texture color format for `DXT1` blocks.
 const TEXTURE_FORMAT_DXT1: u32 = 0x0C;
@@ -1284,6 +1391,30 @@ impl PushbufferEngine {
                 // shared, which this engine reads per stage regardless.
                 state.combiner.active = ((argument & 0xFF) as usize).min(crate::COMBINER_STAGES);
             }
+            METHOD_SET_MODEL_VIEW_MATRIX..=MODEL_VIEW_MATRIX_LAST => {
+                let index = usize::from((method - METHOD_SET_MODEL_VIEW_MATRIX) / 4);
+                state.vertex.model_view[index] = f32::from_bits(argument);
+            }
+            METHOD_SET_INVERSE_MODEL_VIEW_MATRIX..=INVERSE_MODEL_VIEW_MATRIX_LAST => {
+                let index = usize::from((method - METHOD_SET_INVERSE_MODEL_VIEW_MATRIX) / 4);
+                state.vertex.inverse_model_view[index] = f32::from_bits(argument);
+            }
+            METHOD_SET_TEXGEN..METHOD_SET_TEXGEN_END => {
+                let within = method - METHOD_SET_TEXGEN;
+                let unit = usize::from(within / 16);
+                let component = usize::from(within % 16) / 4;
+                state.vertex.texgen[unit][component] = argument;
+            }
+            METHOD_SET_TEXTURE_MATRIX_ENABLE..METHOD_SET_TEXTURE_MATRIX_ENABLE_END => {
+                let unit = usize::from((method - METHOD_SET_TEXTURE_MATRIX_ENABLE) / 4);
+                state.vertex.texture_matrix_enable[unit] = argument != 0;
+            }
+            METHOD_SET_TEXTURE_MATRIX..METHOD_SET_TEXTURE_MATRIX_END => {
+                let within = method - METHOD_SET_TEXTURE_MATRIX;
+                let unit = usize::from(within / 64);
+                let lane = usize::from(within % 64) / 4;
+                state.vertex.texture_matrix[unit][lane] = f32::from_bits(argument);
+            }
             METHOD_SET_VERTEX_DATA2F..METHOD_SET_VERTEX_DATA2F_END => {
                 let within = method - METHOD_SET_VERTEX_DATA2F;
                 let attribute = usize::from(within / 8);
@@ -1388,7 +1519,21 @@ impl PushbufferEngine {
     /// anything else is counted and skipped, so what is missing stays
     /// visible in the statistics rather than quietly drawing nothing.
     fn end_primitive(&mut self, memory: &dyn Nv2aMemory, channel: u32) {
-        let (primitive, vertices, surface, textures, texture_dma, pipeline, combiner) = {
+        let (
+            primitive,
+            vertices,
+            surface,
+            textures,
+            texture_dma,
+            pipeline,
+            combiner,
+            texgen,
+            texture_matrix_enable,
+            transform_programmed,
+            layout,
+            array_strides,
+            array_offsets,
+        ) = {
             let state = self.channels.entry(channel).or_default();
             let Some(primitive) = state.vertex.primitive.take() else {
                 return;
@@ -1430,7 +1575,21 @@ impl PushbufferEngine {
                     reference: state.alpha_reference & 0xFF,
                 },
             };
-            (primitive, vertices, state.surface, state.textures, dma, pipeline, state.combiner)
+            (
+                primitive,
+                vertices,
+                state.surface,
+                state.textures,
+                dma,
+                pipeline,
+                state.combiner,
+                state.vertex.texgen,
+                state.vertex.texture_matrix_enable,
+                state.transform.programmed,
+                state.vertex.formats,
+                state.vertex.array_strides,
+                state.vertex.array_offsets,
+            )
         };
         self.last_combiner = combiner;
         let census_key = combiner_key(&combiner);
@@ -1458,16 +1617,18 @@ impl PushbufferEngine {
             if !texture.enabled {
                 continue;
             }
+            self.stats.formats_seen.entry(texture.color_format()).or_default().0 += 1;
             match Self::bind_texture(memory, &texture, texture_dma[unit]) {
                 Some(sampler) => {
                     self.stats.bound_by_unit[unit] += 1;
                     if unit == 0 {
                         self.stats.textured_primitives += 1;
-                        self.last_texture = Some((texture, texture_dma[unit]));
                     }
+                    self.last_texture[unit] = Some((texture, texture_dma[unit]));
                     bound[unit] = Some(sampler);
                 }
                 None => {
+                    self.stats.formats_seen.entry(texture.color_format()).or_default().1 += 1;
                     // The primitive is textured with a format this engine
                     // cannot decode. Drawing it flat would paint its vertex
                     // color over the frame — and over the render targets a
@@ -1553,6 +1714,17 @@ impl PushbufferEngine {
         }
         if drawn > self.busiest_vertices.0 {
             self.busiest_vertices = (drawn, vertices.iter().copied().take(3).collect());
+            self.busiest_texgen = (texgen, texture_matrix_enable);
+            self.busiest_layout = (
+                transform_programmed,
+                layout
+                    .iter()
+                    .enumerate()
+                    .map(|(index, format)| {
+                        (format.kind, format.size, array_strides[index], array_offsets[index])
+                    })
+                    .collect(),
+            );
             self.busiest_textures = std::array::from_fn(|unit| {
                 let texture = textures[unit];
                 let sampler = bound[unit].as_ref()?;
@@ -1591,7 +1763,9 @@ impl PushbufferEngine {
             TEXTURE_FORMAT_LINEAR_A8R8G8B8 | TEXTURE_FORMAT_LINEAR_X8R8G8B8 => {
                 TextureLayout::Linear
             }
-            TEXTURE_FORMAT_SWIZZLED_A8R8G8B8 => TextureLayout::Swizzled,
+            TEXTURE_FORMAT_SWIZZLED_A8R8G8B8 | TEXTURE_FORMAT_SWIZZLED_X8R8G8B8 => {
+                TextureLayout::Swizzled
+            }
             TEXTURE_FORMAT_DXT1 => TextureLayout::Dxt1,
             TEXTURE_FORMAT_DXT3 => TextureLayout::Dxt3,
             TEXTURE_FORMAT_DXT5 => TextureLayout::Dxt5,
@@ -1614,7 +1788,10 @@ impl PushbufferEngine {
             width,
             height,
             layout,
-            has_alpha: texture.color_format() != TEXTURE_FORMAT_LINEAR_X8R8G8B8,
+            has_alpha: !matches!(
+                texture.color_format(),
+                TEXTURE_FORMAT_LINEAR_X8R8G8B8 | TEXTURE_FORMAT_SWIZZLED_X8R8G8B8
+            ),
             end: base.saturating_add(object.limit).saturating_add(1),
         })
     }
@@ -1688,6 +1865,10 @@ impl PushbufferEngine {
                 *lane = (0..4).map(|column| source[column] * matrix[row * 4 + column]).sum();
             }
             let texcoords = std::array::from_fn(|unit| {
+                let normal = attributes[ATTRIBUTE_NORMAL];
+                if let Some(generated) = generated_texcoords(state, unit, source, normal) {
+                    return generated;
+                }
                 let texcoord = attributes[ATTRIBUTE_TEXCOORD0 + unit];
                 [texcoord[0], texcoord[1]]
             });
@@ -2031,6 +2212,18 @@ impl PushbufferEngine {
         &self.busiest_vertices.1
     }
 
+    /// The busiest draw's texgen modes and matrix enables.
+    #[must_use]
+    pub fn busiest_texgen(&self) -> ([[u32; 4]; TEXTURE_UNITS], [bool; TEXTURE_UNITS]) {
+        self.busiest_texgen
+    }
+
+    /// The busiest draw's declared vertex layout.
+    #[must_use]
+    pub fn busiest_layout(&self) -> (bool, &[(u32, u32, u32, u32)]) {
+        (self.busiest_layout.0, &self.busiest_layout.1)
+    }
+
     /// The texture units that draw had bound.
     #[must_use]
     pub fn busiest_textures(&self) -> [Option<BoundTexture>; TEXTURE_UNITS] {
@@ -2062,10 +2255,14 @@ impl PushbufferEngine {
     ///
     /// Returns its width, height, and `width * height * 4` bytes.
     #[must_use]
-    pub fn dump_last_texture(&self, memory: &dyn Nv2aMemory) -> Option<(u32, u32, Vec<u8>)> {
+    pub fn dump_last_texture(
+        &self,
+        memory: &dyn Nv2aMemory,
+        unit: usize,
+    ) -> Option<(u32, u32, Vec<u8>)> {
         use crate::TextureSource;
 
-        let (state, dma) = self.last_texture?;
+        let (state, dma) = *self.last_texture.get(unit)?.as_ref()?;
         let texture = Self::bind_texture(memory, &state, dma)?;
         let (width, height) = (texture.width(), texture.height());
         let bytes = u64::from(width) * u64::from(height) * 4;
@@ -2630,7 +2827,7 @@ mod tests {
         engine.submit(&memory, 0, 0x8000, 0, 0x1000, 0x1000 + words.len() as u32 * 4);
 
         assert!(
-            engine.dump_last_texture(&memory).is_none(),
+            engine.dump_last_texture(&memory, 0).is_none(),
             "no sampler for an impossible texture"
         );
     }
@@ -2693,6 +2890,57 @@ mod tests {
             ..crate::CombinerRegisters::default()
         };
         assert_eq!(crate::evaluate_combiner(&combiner, &registers), Some(0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn a_reflection_map_generates_its_own_coordinates() {
+        // The title asks texture unit one for a reflection map and gives
+        // it no coordinate array at all, so the unit would otherwise
+        // sample one texel across every primitive it draws.
+        let identity = {
+            let mut matrix = [0.0_f32; 16];
+            for lane in 0..4 {
+                matrix[lane * 4 + lane] = 1.0;
+            }
+            matrix
+        };
+        let mut state = VertexState { model_view: identity, ..VertexState::default() };
+        state.inverse_model_view = identity;
+        state.texgen[1] = [TEXGEN_REFLECTION_MAP; 4];
+
+        // A vertex straight ahead of the eye, with a normal facing back at
+        // it, reflects the eye vector onto itself reversed.
+        let straight_on =
+            generated_texcoords(&state, 1, [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, -1.0, 0.0])
+                .expect("the mode is generated");
+        assert_eq!(straight_on, [0.0, 0.0], "a head-on reflection has no lateral component");
+
+        // A surface turned away from the eye reflects to the side, which
+        // is what makes the map sweep across the geometry.
+        let angled = generated_texcoords(&state, 1, [0.0, 0.0, 1.0, 1.0], [1.0, 0.0, -1.0, 0.0])
+            .expect("the mode is generated");
+        assert!(angled[0].abs() > 0.5, "an angled surface reflects sideways: {angled:?}");
+
+        // A unit the title left alone keeps reading its vertex attribute.
+        assert!(
+            generated_texcoords(&state, 0, [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, -1.0, 0.0]).is_none()
+        );
+    }
+
+    #[test]
+    fn the_texgen_and_matrix_methods_decode() {
+        let (engine, _) = submit_words(&[
+            header(1, 0, METHOD_SET_TEXGEN + 16),
+            TEXGEN_REFLECTION_MAP,
+            header(1, 0, METHOD_SET_TEXTURE_MATRIX_ENABLE + 4),
+            1,
+            header(1, 0, METHOD_SET_TEXTURE_MATRIX + 64),
+            0x3F80_0000,
+        ]);
+        let vertex = &engine.channels[&0].vertex;
+        assert_eq!(vertex.texgen[1][0], TEXGEN_REFLECTION_MAP, "unit one generates coordinates");
+        assert!(vertex.texture_matrix_enable[1], "and maps them through a matrix");
+        assert_eq!(vertex.texture_matrix[1][0], 1.0);
     }
 
     #[test]

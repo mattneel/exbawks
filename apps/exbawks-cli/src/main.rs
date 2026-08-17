@@ -133,6 +133,9 @@ struct RunArgs {
     /// Writes the most recently sampled texture to this PNG file.
     #[arg(long)]
     dump_texture: Option<PathBuf>,
+    /// Which texture unit `--dump-texture` writes.
+    #[arg(long, default_value_t = 0)]
+    dump_texture_unit: usize,
     /// Captures this color surface instead of the presented one.
     #[arg(long, value_parser = parse_u32)]
     screenshot_address: Option<u32>,
@@ -259,6 +262,7 @@ fn main() -> Result<()> {
                 screenshot,
                 gpu_methods,
                 dump_texture,
+                dump_texture_unit,
                 screenshot_address,
                 gpu_program,
                 gpu_combiner,
@@ -283,6 +287,7 @@ fn main() -> Result<()> {
                     screenshot: screenshot.as_deref(),
                     gpu_methods,
                     dump_texture: dump_texture.as_deref(),
+                    dump_texture_unit,
                     screenshot_address,
                     gpu_program,
                     gpu_combiner,
@@ -598,6 +603,8 @@ struct RunOptions<'a> {
     gpu_methods: Option<usize>,
     /// Where the most recently sampled texture is written, when asked for.
     dump_texture: Option<&'a Path>,
+    /// Which texture unit that dump reads.
+    dump_texture_unit: usize,
     /// A specific color surface to capture instead of the presented one.
     screenshot_address: Option<u32>,
     /// Whether to print the transform program's instruction words.
@@ -623,6 +630,7 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
         screenshot,
         gpu_methods,
         dump_texture,
+        dump_texture_unit,
         screenshot_address,
         gpu_program,
         gpu_combiner,
@@ -794,9 +802,29 @@ Graphics methods (object, method, submissions):"
                 vertex.x, vertex.y, vertex.color, vertex.texcoords
             );
         }
+        for (code, (seen, refused)) in &stats.formats_seen {
+            println!("  format {code:#04x}: {seen} draws, {refused} refused");
+        }
+        println!("  unsupported textures: {}", stats.unsupported_textures);
         for (attribute, (value, count)) in stats.constant_attributes.iter().enumerate() {
             if *count > 0 {
                 println!("  attribute {attribute:2}: constant {value:08x} set {count} times");
+            }
+        }
+        let (texgen, matrix_enable) = emulator.gpu_busiest_texgen();
+        for (unit, modes) in texgen.iter().enumerate() {
+            println!(
+                "  unit {unit}: texgen {:04x} {:04x} {:04x} {:04x}  matrix {}",
+                modes[0], modes[1], modes[2], modes[3], matrix_enable[unit]
+            );
+        }
+        let (programmed, layout) = emulator.gpu_busiest_layout();
+        println!("  transform program ran: {programmed}");
+        for (attribute, (kind, size, stride, offset)) in layout.iter().enumerate() {
+            if *size > 0 {
+                println!(
+                    "  attr {attribute:2}: kind {kind} size {size} stride {stride}                      offset {offset:08x}"
+                );
             }
         }
         for (unit, bound) in emulator.gpu_busiest_textures().iter().enumerate() {
@@ -830,7 +858,7 @@ Graphics methods (object, method, submissions):"
     }
 
     if let Some(path) = dump_texture {
-        match emulator.capture_last_texture() {
+        match emulator.capture_last_texture(dump_texture_unit) {
             Some(frame) => {
                 let png = exbawks_debug::encode_rgba(frame.width, frame.height, &frame.pixels);
                 fs::write(path, &png)

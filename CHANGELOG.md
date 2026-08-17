@@ -269,6 +269,25 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- Reflection-map texture coordinate generation, with the per-unit texture
+  matrix that maps it into the image. Dino Crisis 3's title screen reflects
+  an environment map off its geometry: it programs `SET_TEXGEN` mode
+  `0x8512` on the second texture unit and supplies that unit no coordinate
+  array at all, so without generating them the unit sampled a single texel
+  across every primitive and shaded it flat.
+
+- The register-combiner output word's two product destinations were read in
+  the wrong order — the second product's destination comes first — and the
+  dot-product and mux flags were read four to six bits too high. Checked
+  against xemu's decoder. This title's output words name neither product
+  destination, so its frame is unchanged; a title that used them would have
+  been shaded from the wrong register.
+
+- Texture format code `0x11` is `LU_IMAGE_R5G6B5`, not a linear
+  `X8R8G8B8`; the linear `X8R8G8B8` code is `0x1E`. The swizzled
+  `X8R8G8B8` code `0x07` is now decoded too. This title uses none of them,
+  so nothing it draws changes.
+
 - All four texture units are sampled, each with its own coordinate set,
   rather than only the first. This title's dominant draw — 44,757 of them
   on the captured surface alone — binds two units and multiplies one by the

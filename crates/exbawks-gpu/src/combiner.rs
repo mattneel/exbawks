@@ -179,12 +179,12 @@ fn run_portion(inputs: u32, outputs: u32, registers: &mut Registers, alpha_porti
 
     // A dot product replaces the pairwise product, and only the color
     // portion has one.
-    let ab_dot = !alpha_portion && outputs & (1 << 19) != 0;
-    let cd_dot = !alpha_portion && outputs & (1 << 20) != 0;
+    let ab_dot = !alpha_portion && outputs & (1 << 13) != 0;
+    let cd_dot = !alpha_portion && outputs & (1 << 12) != 0;
     let ab = if ab_dot { dot(a, b) } else { times(a, b) };
     let cd = if cd_dot { dot(c, d) } else { times(c, d) };
 
-    let sum: [f32; 4] = if outputs & (1 << 18) != 0 {
+    let sum: [f32; 4] = if outputs & (1 << 14) != 0 {
         // The mux picks between the products by the spare register's alpha.
         let pick_cd = registers.spare0[3] >= 0.5;
         if pick_cd { cd } else { ab }
@@ -195,12 +195,13 @@ fn run_portion(inputs: u32, outputs: u32, registers: &mut Registers, alpha_porti
     let scaled = |value: [f32; 4]| -> [f32; 4] {
         std::array::from_fn(|i| scale_and_bias(outputs, value[i]))
     };
-    // A dot product has no second destination to write.
-    if !ab_dot {
-        write_register(outputs, scaled(ab), registers, alpha_portion);
-    }
+    // The second product's destination comes first in the word, and a
+    // dot product leaves no separate result to write.
     if !cd_dot {
-        write_register(outputs >> 4, scaled(cd), registers, alpha_portion);
+        write_register(outputs, scaled(cd), registers, alpha_portion);
+    }
+    if !ab_dot {
+        write_register(outputs >> 4, scaled(ab), registers, alpha_portion);
     }
     write_register(outputs >> 8, scaled(sum), registers, alpha_portion);
 }
@@ -299,9 +300,10 @@ mod tests {
         (a << 24) | (b << 16) | (c << 8) | d
     }
 
-    /// An output word: the three destinations, then flags.
+    /// An output word: the two products' destinations — the second one
+    /// first, as the hardware orders them — then the sum's.
     const fn outputs(ab: u32, cd: u32, sum: u32) -> u32 {
-        ab | (cd << 4) | (sum << 8)
+        cd | (ab << 4) | (sum << 8)
     }
 
     /// Registers with a red texture and a half-grey diffuse.
@@ -398,7 +400,7 @@ mod tests {
         let mut state = CombinerState { active: 1, ..CombinerState::default() };
         state.stages[0] = Stage {
             color_inputs: inputs(input(8, false, 0), input(8, false, 0), 0, 0),
-            color_outputs: outputs(0, 0, 12) | (1 << 19),
+            color_outputs: outputs(0, 0, 12) | (1 << 13),
             ..Stage::default()
         };
         let color = evaluate(&state, &registers()).expect("runs");

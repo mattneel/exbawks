@@ -1007,10 +1007,10 @@ impl Emulator {
     /// A frame that comes out empty is either badly addressed geometry or a
     /// texture read from the wrong place; this tells the two apart.
     #[must_use]
-    pub fn capture_last_texture(&self) -> Option<CapturedFrame> {
+    pub fn capture_last_texture(&self, unit: usize) -> Option<CapturedFrame> {
         let memory = self.memory.clone();
         let view = WindowMemory(&memory);
-        let (width, height, pixels) = self.gpu_pusher.dump_last_texture(&view)?;
+        let (width, height, pixels) = self.gpu_pusher.dump_last_texture(&view, unit)?;
         Some(CapturedFrame { width, height, pixels, frame_buffer: 0 })
     }
 
@@ -1048,6 +1048,18 @@ impl Emulator {
     #[must_use]
     pub fn presented_surface(&self) -> Option<u32> {
         self.presented_surface_by_content().map(|(base, ..)| base)
+    }
+
+    /// The busiest draw's texgen modes and matrix enables.
+    #[must_use]
+    pub fn gpu_busiest_texgen(&self) -> ([[u32; 4]; 4], [bool; 4]) {
+        self.gpu_pusher.busiest_texgen()
+    }
+
+    /// The busiest draw's declared vertex layout.
+    #[must_use]
+    pub fn gpu_busiest_layout(&self) -> (bool, &[(u32, u32, u32, u32)]) {
+        self.gpu_pusher.busiest_layout()
     }
 
     /// The texture units the busiest draw had bound.

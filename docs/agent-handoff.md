@@ -404,10 +404,29 @@ Two active threads:
    variables sit one byte higher than in a general stage: `E` at 24, `F` at
    16, `G` at 8, flags in the low byte.
 
-   Two combiner details are still approximate and worth measuring before
-   trusting: `specular` reads black because no separate specular attribute
-   is interpolated yet, and all four texture registers read the one bound
-   sampler. Both matter only once a draw programs more than one stage.
+   **All four texture units now sample**, and the second one earns its
+   keep: the dominant draw modulates the base texture by an environment
+   map with a fourfold scale. That unit is fed by **reflection-map texgen**
+   (`SET_TEXGEN` at `0x03C0`, four methods per unit, mode `0x8512`) and a
+   per-unit texture matrix (`0x06C0`, stride `0x40`, enabled at `0x0420`),
+   because the title supplies it no coordinate array at all — a fact that
+   only came out of counting draws whose coordinate set was entirely zero
+   (247,235 of 247,550).
+
+   Consulting xemu's decoder was worth it and is worth repeating. It
+   corrected three things this project had inferred: the combiner output
+   word's two product destinations are ordered `CD` then `AB`, its dot and
+   mux flags sit at bits 12-14 rather than 18-20, and texture format
+   `0x11` is `LU_IMAGE_R5G6B5` rather than a linear `X8R8G8B8` (which is
+   `0x1E`). It also placed texgen at `0x03C0`, not the `0x0FD8` guessed
+   from another layout.
+
+   Still approximate: `specular` reads black because no separate specular
+   attribute is interpolated, mip levels are ignored (the base level is
+   always sampled), and fixed-function **lighting** is not modelled at all
+   though the title programs it (`SET_LIGHT_*` from `0x1000`, ~240,000
+   submissions). Lighting is the largest unmodelled piece of the fixed
+   pipeline and the next thing to measure against the reference frame.
 
    Two techniques earned their keep and are worth reaching for again: the
    cancel pump's RIP sampling (`RUST_LOG=exbawks_core::emulator=trace`,
