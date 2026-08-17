@@ -173,6 +173,11 @@ fn execute(
     if let Some(flow) = branch(state, memory, instruction, address)? {
         return Ok(flow);
     }
+    // The floating-point unit owns its own mnemonics (ADR 0018).
+    if let Some(result) = crate::x87::execute(state, memory, instruction, address) {
+        result?;
+        return Ok(Flow::Next);
+    }
     execute_straightline(state, memory, instruction, address)?;
     Ok(Flow::Next)
 }
@@ -557,32 +562,6 @@ fn execute_straightline(
             state.eflags = (value & WRITABLE) | (state.eflags & !WRITABLE) | 0x02;
             Ok(())
         }
-        // x87 control plumbing: enough for CRT floating-point presence
-        // probes (`fninit`/`fnstsw`/`fnstcw`/`fldcw`/`fnclex`). Arithmetic
-        // x87 stays unsupported until the WHP tier (ADR 0013) provides it.
-        Mnemonic::Fninit => {
-            state.x87 = crate::X87State::default();
-            Ok(())
-        }
-        Mnemonic::Fnclex => {
-            // Clear the exception flags and busy bit.
-            state.x87.status &= !0x80FF;
-            Ok(())
-        }
-        Mnemonic::Fnstsw => {
-            if instruction.op0_kind() == OpKind::Register {
-                // `fnstsw ax`.
-                state.gpr[0] = (state.gpr[0] & 0xFFFF_0000) | u32::from(state.x87.status);
-                Ok(())
-            } else {
-                let target = operand(state, instruction, 0, address)?;
-                write_operand(state, memory, target, Width::W, u32::from(state.x87.status))
-            }
-        }
-        Mnemonic::Fnstcw => {
-            let target = operand(state, instruction, 0, address)?;
-            write_operand(state, memory, target, Width::W, u32::from(state.x87.control))
-        }
         Mnemonic::Fldcw => {
             let source = operand(state, instruction, 0, address)?;
             let value = read_operand(state, memory, source, Width::W)?;
@@ -737,6 +716,18 @@ fn operand(
 ///
 /// The cached segment base participates unless the caller is `lea`, which
 /// architecturally produces the raw offset.
+/// The guest memory an instruction executes against.
+pub(crate) type GuestMemoryRef<'a> = &'a dyn GuestMemory;
+
+/// One memory operand's effective address, with its segment applied.
+pub(crate) fn effective_address_for(
+    state: &CpuState,
+    instruction: &Instruction,
+    address: GuestVa,
+) -> Result<GuestVa, ExecError> {
+    effective_address(state, instruction, address, true)
+}
+
 fn effective_address(
     state: &CpuState,
     instruction: &Instruction,
@@ -1927,6 +1918,132 @@ mod tests {
 
     fn arith(state: &CpuState) -> u32 {
         state.eflags & flags::ARITHMETIC
+    }
+
+    /// The `f64` at a guest address, as the unit stored it.
+    fn read_f64(memory: &SoftwareAddressSpace, at: u32) -> f64 {
+        let mut bytes = [0_u8; 8];
+        memory.read(GuestVa(at), &mut bytes).expect("data reads");
+        f64::from_le_bytes(bytes)
+    }
+
+    #[test]
+    fn x87_loads_and_stores_cross_the_memory_boundary() {
+        let (mut state, memory) = machine();
+        memory.write(GuestVa(DATA), &1.5_f32.to_le_bytes()).expect("data writes");
+
+        // fld dword [DATA]; fstp qword [DATA+8]
+        exec(&mut state, &memory, &[0xD9, 0x05, 0x00, 0x00, 0x02, 0x00]);
+        exec(&mut state, &memory, &[0xDD, 0x1D, 0x08, 0x00, 0x02, 0x00]);
+        assert_eq!(read_f64(&memory, DATA + 8), 1.5, "a single widens and a double stores");
+
+        // The pop left the stack empty again, so the top is back where it
+        // started; a load and a store that did not move it would leave the
+        // next value one register off.
+        assert_eq!(state.x87.status & 0x3800, 0, "the stack returned to its top");
+    }
+
+    #[test]
+    fn x87_arithmetic_runs_on_the_stack() {
+        let (mut state, memory) = machine();
+        memory.write(GuestVa(DATA), &3.0_f64.to_le_bytes()).expect("data writes");
+        memory.write(GuestVa(DATA + 8), &4.0_f64.to_le_bytes()).expect("data writes");
+
+        // fld qword [DATA]; fld qword [DATA+8]; fmul st(1),st(0) style:
+        // load both, multiply the top pair, and store the result.
+        exec(&mut state, &memory, &[0xDD, 0x05, 0x00, 0x00, 0x02, 0x00]);
+        exec(&mut state, &memory, &[0xDD, 0x05, 0x08, 0x00, 0x02, 0x00]);
+        // faddp st(1),st(0) — adds the top into the one below and pops.
+        exec(&mut state, &memory, &[0xDE, 0xC1]);
+        exec(&mut state, &memory, &[0xDD, 0x1D, 0x10, 0x00, 0x02, 0x00]);
+        assert_eq!(read_f64(&memory, DATA + 16), 7.0, "three plus four, popped into one");
+    }
+
+    #[test]
+    fn x87_subtraction_keeps_its_operands_the_right_way_round() {
+        let (mut state, memory) = machine();
+        memory.write(GuestVa(DATA), &10.0_f64.to_le_bytes()).expect("data writes");
+        memory.write(GuestVa(DATA + 8), &4.0_f64.to_le_bytes()).expect("data writes");
+
+        // fld qword [DATA]; fsub qword [DATA+8]  ->  10 - 4
+        exec(&mut state, &memory, &[0xDD, 0x05, 0x00, 0x00, 0x02, 0x00]);
+        exec(&mut state, &memory, &[0xDC, 0x25, 0x08, 0x00, 0x02, 0x00]);
+        exec(&mut state, &memory, &[0xDD, 0x1D, 0x10, 0x00, 0x02, 0x00]);
+        assert_eq!(read_f64(&memory, DATA + 16), 6.0, "the reversed form would give -6");
+
+        // fld qword [DATA]; fsubr qword [DATA+8]  ->  4 - 10
+        exec(&mut state, &memory, &[0xDD, 0x05, 0x00, 0x00, 0x02, 0x00]);
+        exec(&mut state, &memory, &[0xDC, 0x2D, 0x08, 0x00, 0x02, 0x00]);
+        exec(&mut state, &memory, &[0xDD, 0x1D, 0x18, 0x00, 0x02, 0x00]);
+        assert_eq!(read_f64(&memory, DATA + 24), -6.0, "and the reverse really reverses");
+    }
+
+    #[test]
+    fn x87_stores_an_integer_by_rounding_it() {
+        let (mut state, memory) = machine();
+        memory.write(GuestVa(DATA), &2.5_f64.to_le_bytes()).expect("data writes");
+
+        // fld qword [DATA]; fistp dword [DATA+8]
+        exec(&mut state, &memory, &[0xDD, 0x05, 0x00, 0x00, 0x02, 0x00]);
+        exec(&mut state, &memory, &[0xDB, 0x1D, 0x08, 0x00, 0x02, 0x00]);
+        let mut bytes = [0_u8; 4];
+        memory.read(GuestVa(DATA + 8), &mut bytes).expect("data reads");
+        // Half rounds to even under the default control word, so 2.5 is 2.
+        assert_eq!(i32::from_le_bytes(bytes), 2, "half rounds to even, not away");
+    }
+
+    #[test]
+    fn x87_compares_through_the_status_word() {
+        let (mut state, memory) = machine();
+        memory.write(GuestVa(DATA), &1.0_f64.to_le_bytes()).expect("data writes");
+        memory.write(GuestVa(DATA + 8), &2.0_f64.to_le_bytes()).expect("data writes");
+
+        // fld qword [DATA]; fcom qword [DATA+8]  ->  1 < 2 sets C0
+        exec(&mut state, &memory, &[0xDD, 0x05, 0x00, 0x00, 0x02, 0x00]);
+        exec(&mut state, &memory, &[0xDC, 0x15, 0x08, 0x00, 0x02, 0x00]);
+        assert_eq!(state.x87.status & 0x4500, 0x0100, "less than sets C0 alone");
+
+        // fcom qword [DATA] against itself  ->  equal sets C3
+        exec(&mut state, &memory, &[0xDC, 0x15, 0x00, 0x00, 0x02, 0x00]);
+        assert_eq!(state.x87.status & 0x4500, 0x4000, "equal sets C3 alone");
+    }
+
+    #[test]
+    fn x87_exchanges_two_stack_registers() {
+        let (mut state, memory) = machine();
+        memory.write(GuestVa(DATA), &1.0_f64.to_le_bytes()).expect("data writes");
+        memory.write(GuestVa(DATA + 8), &2.0_f64.to_le_bytes()).expect("data writes");
+
+        exec(&mut state, &memory, &[0xDD, 0x05, 0x00, 0x00, 0x02, 0x00]);
+        exec(&mut state, &memory, &[0xDD, 0x05, 0x08, 0x00, 0x02, 0x00]);
+        // fxch st(1), then store: the one that was underneath comes out.
+        exec(&mut state, &memory, &[0xD9, 0xC9]);
+        exec(&mut state, &memory, &[0xDD, 0x1D, 0x10, 0x00, 0x02, 0x00]);
+        assert_eq!(read_f64(&memory, DATA + 16), 1.0, "the exchange reached the top");
+    }
+
+    #[test]
+    fn an_extended_value_survives_a_round_trip() {
+        let (mut state, memory) = machine();
+        memory.write(GuestVa(DATA), &1.5_f64.to_le_bytes()).expect("data writes");
+
+        // fld qword [DATA]; fstp tbyte [DATA+16]; fld tbyte [DATA+16];
+        // fstp qword [DATA+32]
+        exec(&mut state, &memory, &[0xDD, 0x05, 0x00, 0x00, 0x02, 0x00]);
+        exec(&mut state, &memory, &[0xDB, 0x3D, 0x10, 0x00, 0x02, 0x00]);
+        exec(&mut state, &memory, &[0xDB, 0x2D, 0x10, 0x00, 0x02, 0x00]);
+        exec(&mut state, &memory, &[0xDD, 0x1D, 0x20, 0x00, 0x02, 0x00]);
+        assert_eq!(read_f64(&memory, DATA + 32), 1.5, "the extended format round-trips");
+    }
+
+    #[test]
+    fn a_fault_leaves_the_floating_point_stack_alone() {
+        let (mut state, memory) = machine();
+        let before = state.x87.clone();
+        // fld dword [READ_ONLY - 0x1000]: an unmapped address.
+        let result = try_exec(&mut state, &memory, &[0xD9, 0x05, 0x00, 0x00, 0x00, 0x00]);
+        assert!(result.is_err(), "an unmapped load faults");
+        assert_eq!(state.x87, before, "and the stack is exactly as it was");
     }
 
     #[test]

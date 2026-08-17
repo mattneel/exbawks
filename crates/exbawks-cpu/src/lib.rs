@@ -7,6 +7,7 @@ pub mod flags;
 mod interpret;
 mod state;
 mod subset;
+mod x87;
 
 pub use decode::{
     BasicBlockDecoder, BlockDecodeError, BlockStop, DecodeConfig, DecodedBlock, format_instruction,

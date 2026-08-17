@@ -269,6 +269,17 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- The interpreter executes x87 (ADR 0018): the register stack with its top
+  in the status word, loads and stores across every memory format including
+  the 80-bit one, integer loads and stores, the arithmetic and comparison
+  families, exchanges, and the transcendentals. The stack holds `f64` and
+  converts at the memory boundary, which is exact for the single and
+  double precision a title actually stores. Three things unblock together
+  — the write watchpoint can step past an `fstp`, the MMIO path can service
+  a floating-point store to a device register, and the oracle tier follows
+  a title through its geometry code. The interpreter's frontier on the
+  retail image moves from x87 to SSE.
+
 - `exbawks run --gpu-method-value` also reads back device registers when
   given an address in device space, so the display controller's state can
   be inspected the same way as a graphics method.
