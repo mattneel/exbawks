@@ -112,6 +112,20 @@ impl DeviceSpace {
         }
     }
 
+    /// The value last written to one device register, if any.
+    ///
+    /// The display controller's start address lives here, and it is the
+    /// only record of which surface the console would actually be
+    /// scanning out.
+    #[must_use]
+    pub fn latched(&self, address: u32) -> Option<u32> {
+        self.registers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&address)
+            .copied()
+    }
+
     /// Serves one device read: the latched value, a ready-bit override, or
     /// zero.
     fn read(&self, address: u32, output: &mut [u8]) {

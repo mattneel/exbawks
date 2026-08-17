@@ -875,6 +875,12 @@ Graphics methods (object, method, submissions):"
                 Some(value) => println!("  {key:#06x}: {value:#010x}"),
                 None => println!("  {key:#06x}: never submitted"),
             }
+            if *method >= 0xFD00_0000 {
+                match emulator.device_register(*method) {
+                    Some(value) => println!("  {method:#010x}: {value:#010x} (device)"),
+                    None => println!("  {method:#010x}: never written (device)"),
+                }
+            }
         }
         println!();
     }

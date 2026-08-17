@@ -269,6 +269,10 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- `exbawks run --gpu-method-value` also reads back device registers when
+  given an address in device space, so the display controller's state can
+  be inspected the same way as a graphics method.
+
 - A mip level is selected per triangle from how many texels it covers per
   pixel, instead of always reading the base level. The chain is walked as
   the hardware lays it out: levels end to end, halving but never

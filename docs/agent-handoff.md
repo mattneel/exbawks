@@ -437,6 +437,18 @@ Two active threads:
    2D (`0x1E70` = 0), and enables separate specular (`0x03B8` = 1,
    `0x0294` = `0x00020001`).
 
+   **Specular was measured and deliberately not implemented.** The title
+   enables it (`0x03B8` = 1, separate specular via `0x0294` =
+   `0x00020001`) and uploads a light specular colour of **0.05** in every
+   channel — the final combiner's `SPARE0 + SECONDARY` can therefore add
+   at most about 1.3% brightness, which cannot account for any visible
+   difference. Its six `SET_SPECULAR_PARAMS` floats
+   (`-0.839, -2.887, 3.048, -0.707, -2.507, 2.801`) do not fit
+   `pow(x, n)` in the obvious form — both quadratics fall through zero
+   near `x = 0.85` — so implementing them would be guesswork for a term
+   with no visible budget. Revisit only for a title that sets a real
+   specular colour.
+
    Still approximate, in the order they are worth attacking: **specular is
    never computed**
    though the title enables it and uploads the light's specular colour and

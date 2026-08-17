@@ -1044,6 +1044,12 @@ impl Emulator {
         self.gpu_pusher.busiest_vertices()
     }
 
+    /// The value last written to one device register.
+    #[must_use]
+    pub fn device_register(&self, address: u32) -> Option<u32> {
+        self.devices.latched(address)
+    }
+
     /// The color surface a capture would read, when one is known.
     #[must_use]
     pub fn presented_surface(&self) -> Option<u32> {
