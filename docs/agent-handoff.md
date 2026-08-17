@@ -469,6 +469,34 @@ Two active threads:
       The interpreter tier remains the deterministic oracle (frontier: `movss`
    at `0x1685A0`).
 
+   **Input, and the wall behind it.** The title renders its title screen and
+   asks for a button it can never receive. Its USB stack is real and running
+   — `HcControl` `0xBE` (operational), `HcHCCA` `0x010D_A000` — and it drives
+   the controller registers directly, because XAPI is statically linked just
+   as Direct3D is. ADR 0019 accepts modelling the OHCI controller and a
+   synthetic gamepad rather than intercepting `XInput*`, and `exbawks-usb`
+   now implements the register file, root hub, frame counter, and done
+   queue. `exbawks run --gamepad` attaches one.
+
+   **The driver still does not enumerate, and the reason is now measured
+   rather than guessed.** With a device attached it reads the port, clears
+   the connect change, sweeps every register once, and stops. A kernel-call
+   census over a full run says why: `KeInitializeInterrupt` and
+   `KeConnectInterrupt` are each called **four** times, and
+   `KeInsertQueueDpc` is called **zero** times. The title connects four
+   interrupt service routines and waits; this emulator delivers no
+   interrupts at all, so no ISR runs, no DPC is queued, and nothing
+   enumerates.
+
+   **Interrupt delivery is therefore the next piece**, and it need not be a
+   programmable interrupt controller. The kernel is high-level emulated, so
+   `KeConnectInterrupt` can record the guest's ISR address and the runtime
+   can call it on the guest processor when a modelled device raises one,
+   then drain the DPC queue — which fits the cooperative scheduler of
+   ADR 0011 and avoids emulating a PIC, an IDT, and hypervisor interrupt
+   injection. Timers not firing (`KeSetTimer` records and does nothing) is
+   the same shape of gap and probably the same fix.
+
 2. **Kernel HLE burndown** (substrate-independent, needed under either
    engine). Done this session, in order the retail image demanded them:
    `CORE-004` (gate dispatch when EIP *enters* the gate region, for the

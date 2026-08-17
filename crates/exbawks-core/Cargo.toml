@@ -15,6 +15,7 @@ exbawks-jit.workspace = true
 exbawks-kernel.workspace = true
 exbawks-memory.workspace = true
 exbawks-types.workspace = true
+exbawks-usb.workspace = true
 exbawks-whp.workspace = true
 exbawks-xbe.workspace = true
 serde.workspace = true

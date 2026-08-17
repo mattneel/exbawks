@@ -86,6 +86,30 @@ const KERNEL_WINDOW_BASE: u32 = 0x8000_0000;
 /// address `pa` is the window alias `0x8000_0000 | pa` (ADR 0010).
 struct WindowMemory<'a>(&'a SoftwareAddressSpace);
 
+/// The USB controller reaches guest memory through the same window.
+impl exbawks_usb::UsbMemory for WindowMemory<'_> {
+    fn read_dword(&self, physical: u32) -> Option<u32> {
+        if physical >= 0x2000_0000 {
+            return None;
+        }
+        self.0.read_u32(GuestVa(0x8000_0000 | physical)).ok()
+    }
+
+    fn write_dword(&self, physical: u32, value: u32) -> bool {
+        physical < 0x2000_0000 && self.0.write_u32(GuestVa(0x8000_0000 | physical), value).is_ok()
+    }
+
+    fn write_bytes(&self, physical: u32, bytes: &[u8]) -> bool {
+        let Ok(length) = u32::try_from(bytes.len()) else {
+            return false;
+        };
+        if physical.saturating_add(length) > 0x2000_0000 {
+            return false;
+        }
+        self.0.write(GuestVa(0x8000_0000 | physical), bytes).is_ok()
+    }
+}
+
 /// Guest physical memory through the cached window (ADR 0010).
 impl exbawks_gpu::Nv2aMemory for WindowMemory<'_> {
     fn read_dword(&self, physical: u32) -> Option<u32> {
@@ -1044,6 +1068,43 @@ impl Emulator {
         self.gpu_pusher.busiest_vertices()
     }
 
+    /// Attaches a gamepad to the emulated controller's root port.
+    ///
+    /// The default is no controller at all, which keeps a run a pure
+    /// function of the image (ADR 0019).
+    pub fn attach_gamepad(&self, attached: bool) {
+        self.devices.set_gamepad_attached(attached);
+    }
+
+    /// Records the controller state the guest's next read will report.
+    pub fn set_gamepad_state(&self, state: exbawks_usb::GamepadState) {
+        self.devices.set_gamepad_state(state);
+    }
+
+    /// Whether the title's USB driver has the controller running.
+    #[must_use]
+    pub fn usb_operational(&self) -> bool {
+        self.devices.usb_operational()
+    }
+
+    /// The communication area the title's driver handed the controller.
+    #[must_use]
+    pub fn usb_hcca(&self) -> u32 {
+        self.devices.usb_hcca()
+    }
+
+    /// Reads and writes per USB register offset.
+    #[must_use]
+    pub fn usb_accesses(&self) -> [(u64, u64); 32] {
+        self.devices.usb_accesses()
+    }
+
+    /// The USB root port's status and how many times the guest wrote it.
+    #[must_use]
+    pub fn usb_port(&self) -> (u32, u64) {
+        self.devices.usb_port()
+    }
+
     /// The value last written to one device register.
     #[must_use]
     pub fn device_register(&self, address: u32) -> Option<u32> {
@@ -1357,6 +1418,7 @@ impl Emulator {
         // DirectSound's time-based startup waits forever on a frozen clock).
         fn advance_clock(
             memory: &SoftwareAddressSpace,
+            devices: &crate::mmio::DeviceSpace,
             cpu: &mut CpuState,
             tick_cell: Option<GuestVa>,
             last_tick: &mut std::time::Instant,
@@ -1364,6 +1426,10 @@ impl Emulator {
             let elapsed = last_tick.elapsed();
             let ticks = u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX);
             if ticks > 0 {
+                // A USB frame is a millisecond, and a driver waits out a
+                // debounce interval in frames before it resets a port it
+                // has just seen a device appear on.
+                devices.advance_usb_frames(&WindowMemory(memory), ticks.min(64));
                 if let Some(cell) = tick_cell
                     && let Ok(current) = memory.read_u32(cell)
                 {
@@ -1470,7 +1536,13 @@ impl Emulator {
                             "whp cancel sample"
                         );
                     }
-                    advance_clock(&self.memory, &mut self.cpu, tick_cell, &mut last_tick);
+                    advance_clock(
+                        &self.memory,
+                        &self.devices,
+                        &mut self.cpu,
+                        tick_cell,
+                        &mut last_tick,
+                    );
                     // Every few cancellations is a time slice (ADR 0017):
                     // rotate ready threads so a compute-only loop cannot
                     // starve the rest of the guest.
@@ -1651,7 +1723,13 @@ impl Emulator {
                     // shape (CORE-004).
                     self.whp_read_cpu(&mut machine)?;
                     self.cpu.eip = fault_va;
-                    advance_clock(&self.memory, &mut self.cpu, tick_cell, &mut last_tick);
+                    advance_clock(
+                        &self.memory,
+                        &self.devices,
+                        &mut self.cpu,
+                        tick_cell,
+                        &mut last_tick,
+                    );
                     if let Some(stop) = self.dispatch_gate_by_eip(ordinal, GuestVa(fault_va))? {
                         if let StopReason::Reboot { .. } = stop
                             && relaunches < MAX_RELAUNCHES

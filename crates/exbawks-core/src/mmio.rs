@@ -26,6 +26,9 @@ const DEVICE_SPACE_END: u32 = 0xFF00_0000;
 pub enum DeviceRegion {
     /// The NV2A graphics processor (`0xFD00_0000`).
     Gpu,
+    /// The first USB host controller (`0xFED0_0000`), which the title
+    /// drives with its own stack to find a gamepad.
+    Usb,
     /// The MCPX audio processor (`0xFE80_0000`).
     Apu,
     /// The AC'97 codec (`0xFEC0_0000`).
@@ -40,6 +43,7 @@ impl DeviceRegion {
     pub fn of(address: u32) -> Self {
         match address {
             0xFD00_0000..=0xFDFF_FFFF => Self::Gpu,
+            USB_BASE..=USB_LAST => Self::Usb,
             0xFE80_0000..=0xFE87_FFFF => Self::Apu,
             0xFEC0_0000..=0xFEC0_FFFF => Self::Ac97,
             _ => Self::Other,
@@ -54,6 +58,11 @@ struct RegionStats {
     writes: u64,
 }
 
+/// The first USB host controller's register window.
+pub const USB_BASE: u32 = 0xFED0_0000;
+/// One past its last register.
+const USB_LAST: u32 = USB_BASE + 0x0FFF;
+
 /// The stub device model: latched registers, counted accesses.
 ///
 /// Writes are stored per register cell and read back verbatim — device
@@ -62,7 +71,11 @@ struct RegionStats {
 /// targeted ready-bit overrides.
 #[derive(Debug, Default)]
 pub struct DeviceSpace {
-    stats: Mutex<[RegionStats; 4]>,
+    stats: Mutex<[RegionStats; 5]>,
+    /// The first USB host controller, and the gamepad on its root port.
+    /// A title's own USB stack drives these registers directly, so the
+    /// model has to behave like the hardware (ADR 0019).
+    usb: Mutex<exbawks_usb::OhciController>,
     registers: Mutex<std::collections::HashMap<u32, u32>>,
     /// Guest VA pages holding APU DSP command mailboxes, one per comm
     /// region the guest programs. The engine unmaps them so accesses route
@@ -108,8 +121,53 @@ impl DeviceSpace {
             DeviceRegion::Gpu => 0,
             DeviceRegion::Apu => 1,
             DeviceRegion::Ac97 => 2,
-            DeviceRegion::Other => 3,
+            DeviceRegion::Usb => 3,
+            DeviceRegion::Other => 4,
         }
+    }
+
+    /// Attaches or detaches the gamepad on the root port.
+    pub fn set_gamepad_attached(&self, attached: bool) {
+        self.usb.lock().unwrap_or_else(std::sync::PoisonError::into_inner).set_attached(attached);
+    }
+
+    /// Records the controller state the next report will carry.
+    pub fn set_gamepad_state(&self, state: exbawks_usb::GamepadState) {
+        self.usb.lock().unwrap_or_else(std::sync::PoisonError::into_inner).set_state(state);
+    }
+
+    /// Whether the title's driver has put the controller into its running
+    /// state, which is how far enumeration has got.
+    #[must_use]
+    pub fn usb_operational(&self) -> bool {
+        self.usb.lock().unwrap_or_else(std::sync::PoisonError::into_inner).operational()
+    }
+
+    /// The communication area the driver handed the controller.
+    #[must_use]
+    pub fn usb_hcca(&self) -> u32 {
+        self.usb.lock().unwrap_or_else(std::sync::PoisonError::into_inner).hcca()
+    }
+
+    /// Advances the USB schedule by `frames` milliseconds of guest time.
+    pub fn advance_usb_frames(&self, memory: &dyn exbawks_usb::UsbMemory, frames: u32) {
+        let mut usb = self.usb.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for _ in 0..frames {
+            usb.advance_frame(memory);
+        }
+    }
+
+    /// Reads and writes per USB register offset.
+    #[must_use]
+    pub fn usb_accesses(&self) -> [(u64, u64); 32] {
+        self.usb.lock().unwrap_or_else(std::sync::PoisonError::into_inner).accesses()
+    }
+
+    /// The root port's status and how many times the driver wrote it.
+    #[must_use]
+    pub fn usb_port(&self) -> (u32, u64) {
+        let usb = self.usb.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (usb.port_status(), usb.port_writes())
     }
 
     /// The value last written to one device register, if any.
@@ -129,6 +187,19 @@ impl DeviceSpace {
     /// Serves one device read: the latched value, a ready-bit override, or
     /// zero.
     fn read(&self, address: u32, output: &mut [u8]) {
+        if DeviceRegion::of(address) == DeviceRegion::Usb {
+            let value = self
+                .usb
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .read(address - USB_BASE);
+            let bytes = value.to_le_bytes();
+            let take = output.len().min(4);
+            output[..take].copy_from_slice(&bytes[..take]);
+            let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            stats[Self::slot(DeviceRegion::Usb)].reads += 1;
+            return;
+        }
         output.fill(0);
         // Registers a boot path polls for hardware-set bits: a zero read
         // spins forever, so these answer all-ones ("whatever you are
@@ -203,6 +274,15 @@ impl DeviceSpace {
         let take = input.len().min(4);
         bytes[..take].copy_from_slice(&input[..take]);
         let value = u32::from_le_bytes(bytes);
+        if DeviceRegion::of(address) == DeviceRegion::Usb {
+            self.usb
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .write(address - USB_BASE, value);
+            let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            stats[Self::slot(DeviceRegion::Usb)].writes += 1;
+            return;
+        }
         // A pushbuffer submission: the guest writes DMA_PUT (offset 0x40
         // within a 64 KiB USER channel window) and polls DMA_GET until the
         // GPU catches up. The stub GPU is infinitely fast: GET snaps to PUT

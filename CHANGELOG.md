@@ -269,6 +269,16 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- An OHCI host controller and a synthetic Xbox gamepad (ADR 0019), in a new
+  `exbawks-usb` crate: the register file, the root hub with its connect and
+  reset handshake, the frame counter a driver times its debounce against,
+  and the done queue. `exbawks run --gamepad` attaches a controller to the
+  root port; the default remains no controller at all, so a run without it
+  is the pure function of the image every recorded digest depends on.
+  Input sources are `NoInput`, a deterministic `ScriptedInput` for tests,
+  and — once the host side exists — a live controller, which by
+  construction may not record a golden.
+
 ### Fixed
 
 - A guest texture coordinate large enough to saturate the cast made the

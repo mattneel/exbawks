@@ -219,6 +219,7 @@ dependencies = [
  "exbawks-kernel",
  "exbawks-memory",
  "exbawks-types",
+ "exbawks-usb",
  "exbawks-whp",
  "exbawks-xbe",
  "serde",
@@ -311,6 +312,13 @@ dependencies = [
  "bitflags",
  "serde",
  "thiserror",
+]
+
+[[package]]
+name = "exbawks-usb"
+version = "0.1.0"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]

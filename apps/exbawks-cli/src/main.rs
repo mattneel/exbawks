@@ -148,6 +148,9 @@ struct RunArgs {
     /// Prints the last value submitted for these graphics methods.
     #[arg(long, value_parser = parse_u32, value_delimiter = ',')]
     gpu_method_value: Vec<u32>,
+    /// Attaches a gamepad to the emulated controller's root port.
+    #[arg(long)]
+    gamepad: bool,
     /// Reports every guest write to this address, with its writer.
     #[arg(long, value_parser = parse_u32)]
     watch_write: Option<u32>,
@@ -270,6 +273,7 @@ fn main() -> Result<()> {
                 gpu_program,
                 gpu_combiner,
                 gpu_method_value,
+                gamepad,
                 watch_write,
                 frame_digest,
                 expect_frame,
@@ -296,6 +300,7 @@ fn main() -> Result<()> {
                     gpu_program,
                     gpu_combiner,
                     gpu_method_value: &gpu_method_value,
+                    gamepad,
                     watch_write,
                     frame_digest,
                     expect_frame: expect_frame.as_deref(),
@@ -618,6 +623,8 @@ struct RunOptions<'a> {
     gpu_combiner: bool,
     /// Graphics methods whose last submitted value should be printed.
     gpu_method_value: &'a [u32],
+    /// Whether a gamepad is attached to the emulated controller.
+    gamepad: bool,
     /// A guest address whose writers should be reported.
     watch_write: Option<u32>,
     /// Whether to print the captured frame's digest.
@@ -642,6 +649,7 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
         gpu_program,
         gpu_combiner,
         gpu_method_value,
+        gamepad,
         watch_write,
         frame_digest,
         expect_frame,
@@ -676,6 +684,9 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
     match hdd_root_for(&bytes) {
         Ok(hdd) => emulator.set_hdd_root(hdd),
         Err(error) => eprintln!("warning: no writable hard-disk mount: {error:#}"),
+    }
+    if gamepad {
+        emulator.attach_gamepad(true);
     }
     if let Some(address) = watch_write {
         emulator.watch_writes(GuestVa(address));
@@ -864,6 +875,21 @@ Graphics methods (object, method, submissions):"
             }
         }
         println!();
+    }
+
+    if gamepad {
+        println!(
+            "USB:          controller {}, communication area {:#010x}",
+            if emulator.usb_operational() { "running" } else { "stopped" },
+            emulator.usb_hcca()
+        );
+        let (status, writes) = emulator.usb_port();
+        println!("              root port {status:#010x}, written {writes} times by the guest");
+        for (index, (reads, writes)) in emulator.usb_accesses().iter().enumerate() {
+            if *reads > 0 || *writes > 0 {
+                println!("              +{:#04x}: {reads} reads, {writes} writes", index * 4);
+            }
+        }
     }
 
     if !gpu_method_value.is_empty() {
