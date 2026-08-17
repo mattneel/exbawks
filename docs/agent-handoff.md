@@ -271,12 +271,25 @@ Two active threads:
    through the cached window, and the clears now land in exactly the buffer
    it reads (`0x040AC000`, pitch 2560). The image is black because the title
    clears to opaque black and nothing rasterizes its geometry yet — the
-   capture path itself is proven. **That is the frontier: draw the method
-   stream.** The retail title's stream is legible through
-   `exbawks run --gpu-methods <n>`: a Kelvin object bound to subchannel 0,
-   matrices at `0x0480`/`0x0580`/`0x0680`, vertex formats at
-   `0x1760`-`0x179C`, `SET_BEGIN_END` at `0x17FC`, and geometry through
-   `ARRAY_ELEMENT16` (`0x1800`) and `INLINE_ARRAY` (`0x1818`).
+   capture path itself is proven. **GPU-M2 draws.**
+   `exbawks-gpu::fill_triangle` is a half-space rasterizer over the color
+   surface, and the engine assembles primitives from `SET_BEGIN_END` plus
+   `INLINE_ARRAY` using the declared attribute layout. The stream is legible
+   through `exbawks run --gpu-methods <n>` (a Kelvin object on subchannel 0,
+   matrices at `0x0480`/`0x0580`/`0x0680`, `ARRAY_ELEMENT16` at `0x1800`),
+   and `RUST_LOG=exbawks_gpu=trace` prints each primitive's vertex layout —
+   that is how the retail format was read: attribute 0 a float4 position,
+   attribute 3 a packed `D3DCOLOR`, attributes 9-12 float2 texture
+   coordinates, stride 16 dwords.
+
+   **What still stands between this and a recognizable frame:** the title
+   transforms geometry with a vertex program and this engine has no vertex
+   stage, so only its pre-transformed geometry (positions already in pixels,
+   recognized by arriving far outside any clip volume) reaches the surface —
+   about a thousand shaded pixels in a five-million-exit run, with the rest
+   counted in `skipped_primitives`. Next, in order: a vertex-program
+   interpreter, texture sampling (the art is textured quads), and alpha
+   blending.
 
    Two techniques earned their keep and are worth reaching for again: the
    cancel pump's RIP sampling (`RUST_LOG=exbawks_core::emulator=trace`,

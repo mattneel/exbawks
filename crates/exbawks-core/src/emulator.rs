@@ -958,35 +958,44 @@ impl Emulator {
         /// The scanline count of the SDTV modes (480i/480p).
         const SDTV_HEIGHT: u32 = 480;
 
-        let mode = self
-            .threads
-            .as_ref()
-            .and_then(ThreadManager::display_mode)
-            .ok_or(CaptureError::NoDisplayMode)?;
-        if mode.format != LINEAR_A8R8G8B8 && mode.format != LINEAR_X8R8G8B8 {
-            return Err(CaptureError::UnsupportedFormat { format: mode.format });
-        }
-        if mode.pitch == 0 || mode.pitch % 4 != 0 {
-            return Err(CaptureError::UnsupportedPitch { pitch: mode.pitch });
-        }
-
-        let width = mode.pitch / 4;
-        let height = SDTV_HEIGHT;
-        let base = KERNEL_WINDOW_BASE | mode.frame_buffer;
+        // The surface the graphics engine drew into last is the frame the
+        // title just finished; its own buffer flip is not modeled, so the
+        // encoder's programmed address can name an older buffer.
+        let drawn = self.gpu_pusher.presented_target();
+        let (frame_buffer, pitch, width, height) = match drawn {
+            Some((base, pitch, width, height)) if pitch % 4 == 0 && pitch != 0 => {
+                (base, pitch, width.min(pitch / 4), height)
+            }
+            _ => {
+                let mode = self
+                    .threads
+                    .as_ref()
+                    .and_then(ThreadManager::display_mode)
+                    .ok_or(CaptureError::NoDisplayMode)?;
+                if mode.format != LINEAR_A8R8G8B8 && mode.format != LINEAR_X8R8G8B8 {
+                    return Err(CaptureError::UnsupportedFormat { format: mode.format });
+                }
+                if mode.pitch == 0 || mode.pitch % 4 != 0 {
+                    return Err(CaptureError::UnsupportedPitch { pitch: mode.pitch });
+                }
+                (mode.frame_buffer, mode.pitch, mode.pitch / 4, SDTV_HEIGHT)
+            }
+        };
+        let base = KERNEL_WINDOW_BASE | frame_buffer;
         let mut pixels = Vec::with_capacity((width * height * 4) as usize);
-        let mut scanline = vec![0_u8; mode.pitch as usize];
+        let mut scanline = vec![0_u8; pitch as usize];
         for row in 0..height {
-            let at = GuestVa(base.wrapping_add(row * mode.pitch));
+            let at = GuestVa(base.wrapping_add(row * pitch));
             self.memory
                 .read(at, &mut scanline)
                 .map_err(|_| CaptureError::Unreadable { address: at })?;
             // The surface stores each pixel as little-endian ARGB, so the
             // bytes arrive blue, green, red, alpha.
-            for pixel in scanline.chunks_exact(4) {
+            for pixel in scanline.chunks_exact(4).take(width as usize) {
                 pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 0xFF]);
             }
         }
-        Ok(CapturedFrame { width, height, pixels, frame_buffer: mode.frame_buffer })
+        Ok(CapturedFrame { width, height, pixels, frame_buffer })
     }
 
     pub fn plan_entry_block(&self) -> Result<EntryBlockPlan, CoreError> {
@@ -1731,6 +1740,9 @@ impl Emulator {
                 end = format_args!("{end:#010x}"),
                 methods = stats.method_dwords,
                 releases = stats.semaphore_releases,
+                triangles = stats.triangles,
+                shaded = stats.shaded_pixels,
+                skipped = stats.skipped_primitives,
                 aborted = stats.aborted,
                 "pushbuffer walked"
             );

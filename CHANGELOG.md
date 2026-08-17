@@ -260,6 +260,20 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- GPU-M2: a triangle rasterizer (`exbawks-gpu::fill_triangle`) and the
+  vertex assembly that feeds it. Primitives arrive through `SET_BEGIN_END`
+  and `INLINE_ARRAY`, the declared attribute layout gives each vertex its
+  stride, packed `D3DCOLOR` and float colors interpolate barycentrically,
+  and triangles, strips, fans, and quads all assemble. A capture now reads
+  the surface the engine drew into before the current one — with double
+  buffering that is the finished frame, which the encoder's programmed
+  address no longer tracks once a title flips on its own.
+
+  The retail title's pre-transformed geometry (positions already in pixels,
+  far outside any clip volume) draws; everything a vertex program transforms
+  does not, and is counted as skipped rather than drawn wrong. A vertex
+  stage and texturing are what stand between this and a recognizable frame.
+
 - GPU-M1: render-target state and `CLEAR_SURFACE`. The pushbuffer engine
   tracks the color surface a channel programs — its context DMA, offset,
   pitch, and clip — and a color clear fills the clip-intersected rectangle

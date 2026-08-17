@@ -82,6 +82,30 @@ struct SurfaceState {
     clear_y: (u32, u32),
 }
 
+/// One vertex attribute's declared layout.
+#[derive(Debug, Default, Clone, Copy)]
+struct AttributeFormat {
+    /// The component type code (`2` is 32-bit float).
+    kind: u32,
+    /// The component count; zero disables the attribute.
+    size: u32,
+}
+
+/// The vertex pipeline's state between `SET_BEGIN_END` pairs.
+#[derive(Debug, Default, Clone)]
+struct VertexState {
+    /// The primitive type a begin selected, or `None` between primitives.
+    primitive: Option<u32>,
+    /// The declared layout of the sixteen vertex attributes.
+    formats: [AttributeFormat; 16],
+    /// Dwords received through `INLINE_ARRAY` for the current primitive.
+    inline: Vec<u32>,
+    /// The viewport's scale, as programmed.
+    viewport_scale: [f32; 4],
+    /// The viewport's offset, as programmed.
+    viewport_offset: [f32; 4],
+}
+
 /// The engine's per-channel decode state.
 #[derive(Debug, Default)]
 struct ChannelState {
@@ -93,6 +117,8 @@ struct ChannelState {
     semaphore_offset: u32,
     /// The render-target state.
     surface: SurfaceState,
+    /// The vertex pipeline state.
+    vertex: VertexState,
 }
 
 /// Aggregate statistics for diagnostics.
@@ -108,6 +134,12 @@ pub struct PusherStats {
     pub surface_clears: u64,
     /// Pixels written by those clears.
     pub cleared_pixels: u64,
+    /// Triangles the rasterizer filled.
+    pub triangles: u64,
+    /// Pixels those triangles wrote.
+    pub shaded_pixels: u64,
+    /// Primitives skipped because their vertex layout is not modeled.
+    pub skipped_primitives: u64,
     /// Submissions abandoned mid-walk (bad word or unreadable memory).
     pub aborted: u64,
 }
@@ -125,6 +157,17 @@ pub struct PushbufferEngine {
     channels: HashMap<u32, ChannelState>,
     /// Per-method dword counts, keyed by (subchannel-bound handle, method).
     method_counts: HashMap<(u32, u16), u64>,
+    /// The color surface the last triangle landed in. A capture reads this
+    /// rather than the encoder's programmed frame buffer: the title's own
+    /// buffer flip is not modeled, so the surface it just drew into is the
+    /// truthful "latest frame".
+    last_draw_target: u32,
+    /// That surface's geometry (pitch, width, height).
+    last_draw_geometry: (u32, u32, u32),
+    /// The surface drawn into before the current one. With double
+    /// buffering that is the finished frame: the title is busy drawing the
+    /// next one over the buffer it just presented.
+    previous_draw: Option<(u32, u32, u32, u32)>,
     stats: PusherStats,
 }
 
@@ -148,6 +191,9 @@ fn ramht_hash(handle: u32, index_bits: u32, channel: u32) -> u32 {
     }
     hash ^ ((channel & 0xF) << (index_bits - 4))
 }
+
+/// The most inline vertex dwords one primitive may carry.
+const MAX_INLINE_DWORDS: usize = 1 << 20;
 
 /// Per-submission dword budget: a runaway or circular pushbuffer must not
 /// hang the emulator.
@@ -184,6 +230,38 @@ const METHOD_SET_CLEAR_RECT_HORIZONTAL: u16 = 0x1D98;
 const METHOD_SET_CLEAR_RECT_VERTICAL: u16 = 0x1D9C;
 /// The `CLEAR_SURFACE` bits selecting the color channels.
 const CLEAR_COLOR_MASK: u32 = 0xF0;
+/// Kelvin `SET_VIEWPORT_OFFSET`: four floats, the first two of which map
+/// clip space onto the surface.
+const METHOD_SET_VIEWPORT_OFFSET: u16 = 0x0A20;
+/// Kelvin `SET_VIEWPORT_SCALE`: four floats.
+const METHOD_SET_VIEWPORT_SCALE: u16 = 0x0AF0;
+/// Kelvin `SET_BEGIN_END`: a primitive type, or zero to end one.
+const METHOD_SET_BEGIN_END: u16 = 0x17FC;
+/// Kelvin `INLINE_ARRAY`: vertex data inline in the pushbuffer.
+const METHOD_INLINE_ARRAY: u16 = 0x1818;
+/// The first `SET_VERTEX_DATA_ARRAY_FORMAT` method; sixteen follow.
+const METHOD_SET_VERTEX_DATA_ARRAY_FORMAT: u16 = 0x1760;
+/// The vertex attribute carrying position.
+const ATTRIBUTE_POSITION: usize = 0;
+/// The vertex attribute carrying the diffuse color.
+const ATTRIBUTE_DIFFUSE: usize = 3;
+/// The attribute component type for a packed `D3DCOLOR` dword (ARGB).
+const ATTRIBUTE_TYPE_D3DCOLOR: u32 = 0;
+/// The attribute component type for 32-bit floats.
+const ATTRIBUTE_TYPE_FLOAT: u32 = 2;
+/// The attribute component type for four packed bytes in RGBA order.
+const ATTRIBUTE_TYPE_UBYTE_RGBA: u32 = 3;
+/// The last method of the four-float viewport offset.
+const VIEWPORT_OFFSET_LAST: u16 = METHOD_SET_VIEWPORT_OFFSET + 12;
+/// The last method of the four-float viewport scale.
+const VIEWPORT_SCALE_LAST: u16 = METHOD_SET_VIEWPORT_SCALE + 12;
+/// The last of the sixteen vertex-attribute format methods.
+const VERTEX_FORMAT_LAST: u16 = METHOD_SET_VERTEX_DATA_ARRAY_FORMAT + 15 * 4;
+/// `SET_BEGIN_END` primitive types.
+const PRIMITIVE_TRIANGLES: u32 = 5;
+const PRIMITIVE_TRIANGLE_STRIP: u32 = 6;
+const PRIMITIVE_TRIANGLE_FAN: u32 = 7;
+const PRIMITIVE_QUADS: u32 = 8;
 /// Kelvin `SET_SEMAPHORE_OFFSET`.
 const METHOD_SET_SEMAPHORE_OFFSET: u16 = 0x1D6C;
 /// Kelvin `BACK_END_WRITE_SEMAPHORE_RELEASE`.
@@ -428,6 +506,35 @@ impl PushbufferEngine {
                     self.clear_color_surface(memory, &surface);
                 }
             }
+            METHOD_SET_VIEWPORT_OFFSET..=VIEWPORT_OFFSET_LAST => {
+                let index = ((method - METHOD_SET_VIEWPORT_OFFSET) / 4) as usize;
+                state.vertex.viewport_offset[index & 3] = f32::from_bits(argument);
+            }
+            METHOD_SET_VIEWPORT_SCALE..=VIEWPORT_SCALE_LAST => {
+                let index = ((method - METHOD_SET_VIEWPORT_SCALE) / 4) as usize;
+                state.vertex.viewport_scale[index & 3] = f32::from_bits(argument);
+            }
+            METHOD_SET_VERTEX_DATA_ARRAY_FORMAT..=VERTEX_FORMAT_LAST => {
+                let index = ((method - METHOD_SET_VERTEX_DATA_ARRAY_FORMAT) / 4) as usize;
+                state.vertex.formats[index & 15] =
+                    AttributeFormat { kind: argument & 0xF, size: (argument >> 4) & 0xF };
+            }
+            METHOD_SET_BEGIN_END => {
+                if argument == 0 {
+                    self.end_primitive(memory, channel);
+                } else {
+                    state.vertex.primitive = Some(argument);
+                    state.vertex.inline.clear();
+                }
+            }
+            METHOD_INLINE_ARRAY => {
+                // A primitive's vertex data can be long; the budget bounds a
+                // runaway stream, not the geometry.
+                if state.vertex.primitive.is_some() && state.vertex.inline.len() < MAX_INLINE_DWORDS
+                {
+                    state.vertex.inline.push(argument);
+                }
+            }
             METHOD_BACK_END_WRITE_SEMAPHORE_RELEASE => {
                 let (target, offset) = {
                     let state = self.channels.entry(channel).or_default();
@@ -447,6 +554,190 @@ impl PushbufferEngine {
             }
             _ => {}
         }
+    }
+
+    /// Assembles and draws the primitive a `SET_BEGIN_END(0)` closed.
+    ///
+    /// Only inline vertex data with a float position attribute is modeled;
+    /// anything else is counted and skipped, so what is missing stays
+    /// visible in the statistics rather than quietly drawing nothing.
+    fn end_primitive(&mut self, memory: &dyn Nv2aMemory, channel: u32) {
+        let (primitive, vertices, surface) = {
+            let state = self.channels.entry(channel).or_default();
+            let Some(primitive) = state.vertex.primitive.take() else {
+                return;
+            };
+            let vertices = Self::assemble_inline(&state.vertex);
+            state.vertex.inline.clear();
+            (primitive, vertices, state.surface)
+        };
+        let Some(target) = Self::render_target(&surface).filter(|_| !vertices.is_empty()) else {
+            self.stats.skipped_primitives += 1;
+            return;
+        };
+
+        struct Sink<'a>(&'a dyn Nv2aMemory);
+        impl crate::PixelSink for Sink<'_> {
+            fn write_pixel(&self, physical: u32, color: u32) {
+                self.0.write_dword(physical, color);
+            }
+        }
+        let sink = Sink(memory);
+
+        // Primitive assembly follows the hardware's numbering; triangles,
+        // strips, fans, and quads are what a title draws with.
+        let count = vertices.len();
+        let triangles: Vec<[usize; 3]> = match primitive {
+            PRIMITIVE_TRIANGLES => (0..count / 3).map(|i| [i * 3, i * 3 + 1, i * 3 + 2]).collect(),
+            PRIMITIVE_TRIANGLE_STRIP => (0..count.saturating_sub(2))
+                .map(|i| if i % 2 == 0 { [i, i + 1, i + 2] } else { [i + 1, i, i + 2] })
+                .collect(),
+            PRIMITIVE_TRIANGLE_FAN => (1..count.saturating_sub(1)).map(|i| [0, i, i + 1]).collect(),
+            PRIMITIVE_QUADS => (0..count / 4)
+                .flat_map(|q| [[q * 4, q * 4 + 1, q * 4 + 2], [q * 4, q * 4 + 2, q * 4 + 3]])
+                .collect(),
+            _ => {
+                self.stats.skipped_primitives += 1;
+                return;
+            }
+        };
+        if self.last_draw_target != target.base {
+            let (pitch, width, height) = self.last_draw_geometry;
+            if pitch != 0 {
+                self.previous_draw = Some((self.last_draw_target, pitch, width, height));
+            }
+            self.last_draw_target = target.base;
+            tracing::debug!(
+                base = format_args!("{:#010x}", target.base),
+                pitch = target.pitch,
+                width = target.width,
+                height = target.height,
+                "nv2a draws into a new target"
+            );
+        }
+        self.last_draw_geometry = (target.pitch, target.width, target.height);
+        for [a, b, c] in triangles {
+            let written =
+                crate::fill_triangle(&sink, &target, [vertices[a], vertices[b], vertices[c]]);
+            self.stats.triangles += 1;
+            self.stats.shaded_pixels += written;
+        }
+    }
+
+    /// The rasterizer's view of the current color surface.
+    fn render_target(surface: &SurfaceState) -> Option<crate::RenderTarget> {
+        let color = surface.color_dma?;
+        if surface.color_pitch == 0 || surface.clip_width == 0 || surface.clip_height == 0 {
+            return None;
+        }
+        Some(crate::RenderTarget {
+            base: color.base.wrapping_add(surface.color_offset),
+            pitch: surface.color_pitch,
+            clip_x: surface.clip_x,
+            clip_y: surface.clip_y,
+            width: surface.clip_width,
+            height: surface.clip_height,
+        })
+    }
+
+    /// The dword count one attribute occupies in a vertex.
+    fn attribute_dwords(format: AttributeFormat) -> u32 {
+        match format.kind {
+            _ if format.size == 0 => 0,
+            // Packed colors arrive as one dword whatever their size says.
+            ATTRIBUTE_TYPE_D3DCOLOR | ATTRIBUTE_TYPE_UBYTE_RGBA => 1,
+            _ => format.size,
+        }
+    }
+
+    /// Builds screen-space vertices from the inline dword stream.
+    ///
+    /// The declared attribute layout gives each vertex its stride. Positions
+    /// arrive in clip space, and the viewport scale and offset place them on
+    /// the surface — the same transform the hardware applies after the
+    /// vertex stage.
+    fn assemble_inline(state: &VertexState) -> Vec<crate::ScreenVertex> {
+        let position = state.formats[ATTRIBUTE_POSITION];
+        if position.kind != ATTRIBUTE_TYPE_FLOAT || position.size < 2 {
+            return Vec::new();
+        }
+        let stride: u32 = state.formats.iter().copied().map(Self::attribute_dwords).sum();
+        if stride == 0 || state.inline.len() < stride as usize {
+            return Vec::new();
+        }
+        let diffuse = state.formats[ATTRIBUTE_DIFFUSE];
+        let diffuse_offset: usize = state.formats[..ATTRIBUTE_DIFFUSE]
+            .iter()
+            .copied()
+            .map(Self::attribute_dwords)
+            .sum::<u32>() as usize;
+
+        // The declared layout, once per primitive: it is the only record of
+        // what a title's vertices actually contain.
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let formats: Vec<String> = state
+                .formats
+                .iter()
+                .enumerate()
+                .filter(|(_, format)| format.size != 0)
+                .map(|(index, format)| format!("{index}:t{}s{}", format.kind, format.size))
+                .collect();
+            tracing::trace!(
+                stride,
+                formats = formats.join(" "),
+                first = format_args!("{:08x?}", &state.inline[..stride.min(16) as usize]),
+                scale = format_args!("{:?}", state.viewport_scale),
+                offset = format_args!("{:?}", state.viewport_offset),
+                "nv2a vertex layout"
+            );
+        }
+        let [scale_x, scale_y, ..] = state.viewport_scale;
+        let [offset_x, offset_y, ..] = state.viewport_offset;
+        // A vertex program owns the transform, and this engine has none, so
+        // the only positions it can place truthfully are the ones already
+        // in pixels: a title's pre-transformed geometry (`D3DFVF_XYZRHW`)
+        // arrives far outside any clip volume, which is exactly how it is
+        // recognized. Everything else keeps the viewport transform, which
+        // is right once a transform stage exists to feed it.
+        let pretransformed = state.inline.chunks_exact(stride as usize).take(3).any(|chunk| {
+            let x = f32::from_bits(chunk[0]).abs();
+            let y = f32::from_bits(chunk[1]).abs();
+            let w = if position.size >= 4 { f32::from_bits(chunk[3]).abs().max(1.0) } else { 1.0 };
+            x > w * 2.0 || y > w * 2.0
+        });
+        let mut vertices = Vec::with_capacity(state.inline.len() / stride as usize);
+        for chunk in state.inline.chunks_exact(stride as usize) {
+            let color = match diffuse.kind {
+                ATTRIBUTE_TYPE_D3DCOLOR if diffuse.size != 0 => {
+                    chunk.get(diffuse_offset).copied().unwrap_or(0xFFFF_FFFF)
+                }
+                ATTRIBUTE_TYPE_UBYTE_RGBA if diffuse.size != 0 => {
+                    // RGBA bytes in memory order become ARGB.
+                    let packed = chunk.get(diffuse_offset).copied().unwrap_or(0xFFFF_FFFF);
+                    packed.rotate_right(8)
+                }
+                ATTRIBUTE_TYPE_FLOAT if diffuse.size >= 3 => {
+                    let component = |index: usize| {
+                        let value = chunk
+                            .get(diffuse_offset + index)
+                            .map_or(1.0, |bits| f32::from_bits(*bits));
+                        ((value.clamp(0.0, 1.0) * 255.0) as u32) & 0xFF
+                    };
+                    0xFF00_0000 | (component(0) << 16) | (component(1) << 8) | component(2)
+                }
+                // No color attribute: white keeps the geometry visible.
+                _ => 0xFFFF_FFFF,
+            };
+            let x = f32::from_bits(chunk[0]);
+            let y = f32::from_bits(chunk[1]);
+            let (x, y) = if pretransformed {
+                (x, y)
+            } else {
+                (x.mul_add(scale_x, offset_x), y.mul_add(scale_y, offset_y))
+            };
+            vertices.push(crate::ScreenVertex { x, y, color });
+        }
+        vertices
     }
 
     /// Fills the clear rectangle of the color surface with its clear value.
@@ -495,6 +786,20 @@ impl PushbufferEngine {
             self.stats.surface_clears += 1;
             self.stats.cleared_pixels += written;
         }
+    }
+
+    /// The finished frame's color surface, as `(base, pitch, width,
+    /// height)`.
+    ///
+    /// That is the surface drawn into *before* the current one: a title
+    /// double-buffers, so while it draws into one the other is on screen.
+    /// Before a second surface appears, the only drawn one is reported.
+    #[must_use]
+    pub fn presented_target(&self) -> Option<(u32, u32, u32, u32)> {
+        self.previous_draw.or_else(|| {
+            let (pitch, width, height) = self.last_draw_geometry;
+            (pitch != 0).then_some((self.last_draw_target, pitch, width, height))
+        })
     }
 
     /// The aggregate statistics.
@@ -732,6 +1037,91 @@ mod tests {
 
         assert_eq!(engine.stats().surface_clears, 0);
         assert_eq!(memory.read_word(0xC000), 0, "the color surface is untouched");
+    }
+
+    #[test]
+    fn an_inline_triangle_shades_the_surface() {
+        let memory = FakeMemory::new(0x2_0000);
+        let pramin = 0x8000_u32;
+        let handle = 0x1234_u32;
+        let hash = ramht_hash(handle, 9, 0) % 512;
+        memory.write_words(pramin + hash * 8, &[handle, 0x100]);
+        memory.write_words(pramin + 0x1000, &[0x0000_003D, 0xFFFF, 0xC000]);
+
+        // An 8x8 surface, a viewport mapping clip space straight through,
+        // one float3 position attribute, and a triangle over the top-left.
+        let float3 = 0x32_u32; // type 2 (float), size 3.
+        let mut words = vec![
+            header(1, 0, METHOD_SET_CONTEXT_DMA_COLOR),
+            handle,
+            header(1, 0, METHOD_SET_SURFACE_CLIP_HORIZONTAL),
+            8 << 16,
+            header(1, 0, METHOD_SET_SURFACE_CLIP_VERTICAL),
+            8 << 16,
+            header(1, 0, METHOD_SET_SURFACE_PITCH),
+            32,
+            header(1, 0, METHOD_SET_SURFACE_COLOR_OFFSET),
+            0,
+            header(1, 0, METHOD_SET_VIEWPORT_SCALE),
+            1.0_f32.to_bits(),
+            header(1, 0, METHOD_SET_VIEWPORT_SCALE + 4),
+            1.0_f32.to_bits(),
+            header(1, 0, METHOD_SET_VIEWPORT_OFFSET),
+            0.0_f32.to_bits(),
+            header(1, 0, METHOD_SET_VIEWPORT_OFFSET + 4),
+            0.0_f32.to_bits(),
+            header(1, 0, METHOD_SET_VERTEX_DATA_ARRAY_FORMAT),
+            float3,
+            header(1, 0, METHOD_SET_BEGIN_END),
+            PRIMITIVE_TRIANGLES,
+        ];
+        // Three vertices of three floats each, through one non-increasing
+        // INLINE_ARRAY run.
+        let vertices: [f32; 9] = [0.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 8.0, 0.0];
+        words.push((9 << 18) | (1 << 30) | u32::from(METHOD_INLINE_ARRAY));
+        words.extend(vertices.iter().map(|value| value.to_bits()));
+        words.push(header(1, 0, METHOD_SET_BEGIN_END));
+        words.push(0);
+        memory.write_words(0x1000, &words);
+        let mut engine = PushbufferEngine::default();
+
+        engine.submit(&memory, 0, pramin, 0, 0x1000, 0x1000 + words.len() as u32 * 4);
+
+        assert_eq!(engine.stats().triangles, 1, "one triangle was assembled");
+        assert!(engine.stats().shaded_pixels > 20, "it covered its half of the surface");
+        assert_eq!(engine.stats().skipped_primitives, 0);
+        // The top-left pixel is inside the triangle; the bottom-right is not.
+        assert_eq!(memory.read_word(0xC000), 0xFFFF_FFFF, "geometry with no color draws white");
+        assert_eq!(memory.read_word(0xC000 + 7 * 32 + 7 * 4), 0, "the far corner stays clear");
+    }
+
+    #[test]
+    fn a_primitive_without_a_position_attribute_is_skipped() {
+        let memory = FakeMemory::new(0x2_0000);
+        let pramin = 0x8000_u32;
+        let handle = 0x1234_u32;
+        let hash = ramht_hash(handle, 9, 0) % 512;
+        memory.write_words(pramin + hash * 8, &[handle, 0x100]);
+        memory.write_words(pramin + 0x1000, &[0x0000_003D, 0xFFFF, 0xC000]);
+        let words = [
+            header(1, 0, METHOD_SET_CONTEXT_DMA_COLOR),
+            handle,
+            header(1, 0, METHOD_SET_SURFACE_PITCH),
+            32,
+            header(1, 0, METHOD_SET_BEGIN_END),
+            PRIMITIVE_TRIANGLES,
+            header(1, 0, METHOD_INLINE_ARRAY),
+            0,
+            header(1, 0, METHOD_SET_BEGIN_END),
+            0,
+        ];
+        memory.write_words(0x1000, &words);
+        let mut engine = PushbufferEngine::default();
+
+        engine.submit(&memory, 0, pramin, 0, 0x1000, 0x1000 + words.len() as u32 * 4);
+
+        assert_eq!(engine.stats().triangles, 0);
+        assert_eq!(engine.stats().skipped_primitives, 1, "the gap is counted, not hidden");
     }
 
     #[test]
