@@ -1032,6 +1032,12 @@ impl Emulator {
         self.gpu_pusher.transform_program(NV_USER_CHANNEL)
     }
 
+    /// The register-combiner configuration the last draw ran under.
+    #[must_use]
+    pub fn gpu_combiner(&self) -> &exbawks_gpu::CombinerState {
+        self.gpu_pusher.last_combiner()
+    }
+
     /// The color surfaces that received the most drawn pixels.
     #[must_use]
     pub fn gpu_busiest_targets(&self, limit: usize) -> Vec<(u32, u64)> {

@@ -386,11 +386,28 @@ Two active threads:
    an immediate displacement, so it is reached through a pointer; the
    watchpoint is the right instrument once it can step x87.
 
-   Still ahead: the pixel combiner, which this engine approximates as
-   texture times vertex color. The title programs all eight stages
-   (`0x0260`/`0x0AC0` input words, `0x0A60` factors, `0x1E60` control,
-   ~192,000 updates each), so it is the last large piece of shading
-   fidelity outstanding.
+   **The register combiners now run per pixel**, and they were the reason
+   the title screen came out nearly black: the fixed texture-times-diffuse
+   this engine assumed multiplies by a diffuse color the title's own program
+   never applies. Its actual program, read off the retail stream with
+   `--gpu-combiner`, is one stage computing `spare0 = diffuse` (`ICW`
+   `0x04200000`, `OCW` `0x00000C00`) and a final stage of `spare0 +
+   specular` with alpha from `spare0` (`0x0000000E` / `0x00001C80`). The
+   golden digest moved to `ef73c1a20b4e0234`, and the frame is now lit.
+
+   Method numbering, confirmed against that stream: alpha `ICW` `0x0260`,
+   final words `0x0288`/`0x028C`, factors `0x0A60` and `0x0A80`, alpha `OCW`
+   `0x0AA0`, colour `ICW` `0x0AC0`, colour `OCW` `0x1E40`, control `0x1E60`
+   — each an eight-entry block, and the control word's **low byte is a
+   plain stage count** (not the nibble the first attempt assumed, which
+   silently produced zero stages and a black frame). In the final stage the
+   variables sit one byte higher than in a general stage: `E` at 24, `F` at
+   16, `G` at 8, flags in the low byte.
+
+   Two combiner details are still approximate and worth measuring before
+   trusting: `specular` reads black because no separate specular attribute
+   is interpolated yet, and all four texture registers read the one bound
+   sampler. Both matter only once a draw programs more than one stage.
 
    Two techniques earned their keep and are worth reaching for again: the
    cancel pump's RIP sampling (`RUST_LOG=exbawks_core::emulator=trace`,

@@ -260,6 +260,20 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- The NV2A register combiners run for every shaded pixel, replacing the
+  fixed texture-times-diffuse the rasterizer assumed. A title programs up to
+  eight general stages and a final one; each reads four variables from a
+  small register file, maps them through signed or unsigned transforms, and
+  writes back products, sums, muxes, or dot products with a scale and bias.
+  Dino Crisis 3's title screen was rendering nearly black, because the fixed
+  modulate multiplied by a diffuse color its own program never applies. Its
+  frame now comes out lit, and the recorded golden digest moves with it.
+
+- `exbawks run --gpu-combiner` prints the decoded combiner program of the
+  last draw. It is what confirmed the method numbering against the retail
+  stream: the title's own words decode to one stage passing the diffuse into
+  a spare register and a final stage adding the specular to it.
+
 - `exbawks run --watch-write <address>` reports every guest instruction that
   writes a chosen address. The page holding it is mapped read-only, so each
   write leaves the processor and is stepped on the interpreter, which turns

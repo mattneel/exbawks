@@ -302,6 +302,8 @@ struct ChannelState {
     alpha_test: bool,
     alpha_function: u32,
     alpha_reference: u32,
+    /// The register combiners a fragment's color is computed by.
+    combiner: crate::CombinerState,
     /// The first texture unit's state.
     texture: TextureState,
     /// The context-DMA objects textures address through (`A` and `B`).
@@ -482,6 +484,10 @@ pub struct PushbufferEngine {
     /// Dumping it answers whether a black frame is bad addressing or a
     /// texture that is genuinely empty.
     last_texture: Option<(TextureState, Option<DmaObject>)>,
+    /// The combiner configuration the last draw ran under. Printing it is
+    /// how a decode of the title's own program gets checked against what
+    /// the color on screen looks like.
+    last_combiner: crate::CombinerState,
     /// The color surface the last triangle landed in. A capture reads this
     /// rather than the encoder's programmed frame buffer: the title's own
     /// buffer flip is not modeled, so the surface it just drew into is the
@@ -653,6 +659,43 @@ const TRANSFORM_MODE_PROGRAM: u32 = 2;
 const METHOD_SET_BLEND_ENABLE: u16 = 0x0304;
 /// Kelvin `SET_ALPHA_TEST_ENABLE`.
 const METHOD_SET_ALPHA_TEST_ENABLE: u16 = 0x0300;
+/// Splits a packed ARGB constant into the combiner's float channels.
+fn unpack_color(color: u32) -> [f32; 4] {
+    [
+        ((color >> 16) & 0xFF) as f32 / 255.0,
+        ((color >> 8) & 0xFF) as f32 / 255.0,
+        (color & 0xFF) as f32 / 255.0,
+        ((color >> 24) & 0xFF) as f32 / 255.0,
+    ]
+}
+
+/// Kelvin `SET_COMBINER_ALPHA_ICW`, eight consecutive stages.
+const METHOD_SET_COMBINER_ALPHA_ICW: u16 = 0x0260;
+/// Kelvin `SET_COMBINER_SPECULAR_FOG_CW0`, the final stage's first word.
+const METHOD_SET_COMBINER_FINAL0: u16 = 0x0288;
+/// Kelvin `SET_COMBINER_SPECULAR_FOG_CW1`.
+const METHOD_SET_COMBINER_FINAL1: u16 = 0x028C;
+/// Kelvin `SET_COMBINER_FACTOR0`, eight stages.
+const METHOD_SET_COMBINER_FACTOR0: u16 = 0x0A60;
+/// Kelvin `SET_COMBINER_FACTOR1`, eight stages.
+const METHOD_SET_COMBINER_FACTOR1: u16 = 0x0A80;
+/// Kelvin `SET_COMBINER_ALPHA_OCW`, eight stages.
+const METHOD_SET_COMBINER_ALPHA_OCW: u16 = 0x0AA0;
+/// Kelvin `SET_COMBINER_COLOR_ICW`, eight stages.
+const METHOD_SET_COMBINER_COLOR_ICW: u16 = 0x0AC0;
+/// Kelvin `SET_COMBINER_COLOR_OCW`, eight stages.
+const METHOD_SET_COMBINER_COLOR_OCW: u16 = 0x1E40;
+/// Kelvin `SET_COMBINER_CONTROL`.
+const METHOD_SET_COMBINER_CONTROL: u16 = 0x1E60;
+/// One past the last method of each eight-stage combiner block. A range
+/// pattern takes no arithmetic, so each end is named.
+const METHOD_SET_COMBINER_ALPHA_ICW_END: u16 = METHOD_SET_COMBINER_ALPHA_ICW + 8 * 4;
+const METHOD_SET_COMBINER_FACTOR0_END: u16 = METHOD_SET_COMBINER_FACTOR0 + 8 * 4;
+const METHOD_SET_COMBINER_FACTOR1_END: u16 = METHOD_SET_COMBINER_FACTOR1 + 8 * 4;
+const METHOD_SET_COMBINER_ALPHA_OCW_END: u16 = METHOD_SET_COMBINER_ALPHA_OCW + 8 * 4;
+const METHOD_SET_COMBINER_COLOR_ICW_END: u16 = METHOD_SET_COMBINER_COLOR_ICW + 8 * 4;
+const METHOD_SET_COMBINER_COLOR_OCW_END: u16 = METHOD_SET_COMBINER_COLOR_OCW + 8 * 4;
+
 /// Kelvin `SET_ALPHA_FUNC`.
 const METHOD_SET_ALPHA_FUNC: u16 = 0x033C;
 /// Kelvin `SET_ALPHA_REF`.
@@ -1093,6 +1136,43 @@ impl PushbufferEngine {
                 // program's constant field indexes the same bank.
                 state.transform.constant_load = argument.wrapping_mul(4);
             }
+            METHOD_SET_COMBINER_ALPHA_ICW..METHOD_SET_COMBINER_ALPHA_ICW_END => {
+                let stage = usize::from((method - METHOD_SET_COMBINER_ALPHA_ICW) / 4);
+                state.combiner.stages[stage].alpha_inputs = argument;
+            }
+            METHOD_SET_COMBINER_COLOR_ICW..METHOD_SET_COMBINER_COLOR_ICW_END => {
+                let stage = usize::from((method - METHOD_SET_COMBINER_COLOR_ICW) / 4);
+                state.combiner.stages[stage].color_inputs = argument;
+            }
+            METHOD_SET_COMBINER_ALPHA_OCW..METHOD_SET_COMBINER_ALPHA_OCW_END => {
+                let stage = usize::from((method - METHOD_SET_COMBINER_ALPHA_OCW) / 4);
+                state.combiner.stages[stage].alpha_outputs = argument;
+            }
+            METHOD_SET_COMBINER_COLOR_OCW..METHOD_SET_COMBINER_COLOR_OCW_END => {
+                let stage = usize::from((method - METHOD_SET_COMBINER_COLOR_OCW) / 4);
+                state.combiner.stages[stage].color_outputs = argument;
+            }
+            METHOD_SET_COMBINER_FACTOR0..METHOD_SET_COMBINER_FACTOR0_END => {
+                let stage = usize::from((method - METHOD_SET_COMBINER_FACTOR0) / 4);
+                state.combiner.factor0[stage] = unpack_color(argument);
+            }
+            METHOD_SET_COMBINER_FACTOR1..METHOD_SET_COMBINER_FACTOR1_END => {
+                let stage = usize::from((method - METHOD_SET_COMBINER_FACTOR1) / 4);
+                state.combiner.factor1[stage] = unpack_color(argument);
+            }
+            METHOD_SET_COMBINER_FINAL0 => {
+                state.combiner.final_first = argument;
+            }
+            METHOD_SET_COMBINER_FINAL1 => {
+                state.combiner.final_second = argument;
+            }
+            METHOD_SET_COMBINER_CONTROL => {
+                state.combiner.control = argument;
+                // The low byte is the number of stages that run; the
+                // higher bits pick whether the two constant colors are
+                // shared, which this engine reads per stage regardless.
+                state.combiner.active = ((argument & 0xFF) as usize).min(crate::COMBINER_STAGES);
+            }
             METHOD_SET_BLEND_ENABLE => {
                 state.blend = argument != 0;
             }
@@ -1166,7 +1246,7 @@ impl PushbufferEngine {
     /// anything else is counted and skipped, so what is missing stays
     /// visible in the statistics rather than quietly drawing nothing.
     fn end_primitive(&mut self, memory: &dyn Nv2aMemory, channel: u32) {
-        let (primitive, vertices, surface, texture, texture_dma, pipeline) = {
+        let (primitive, vertices, surface, texture, texture_dma, pipeline, combiner) = {
             let state = self.channels.entry(channel).or_default();
             let Some(primitive) = state.vertex.primitive.take() else {
                 return;
@@ -1203,8 +1283,9 @@ impl PushbufferEngine {
                     reference: state.alpha_reference & 0xFF,
                 },
             };
-            (primitive, vertices, state.surface, state.texture, dma, pipeline)
+            (primitive, vertices, state.surface, state.texture, dma, pipeline, state.combiner)
         };
+        self.last_combiner = combiner;
         let Some(target) = Self::render_target(&surface).filter(|_| !vertices.is_empty()) else {
             self.stats.skipped_primitives += 1;
             return;
@@ -1288,6 +1369,7 @@ impl PushbufferEngine {
                 [vertices[a], vertices[b], vertices[c]],
                 sampler,
                 pipeline,
+                Some(&combiner),
             );
             self.stats.triangles += 1;
             self.stats.shaded_pixels += written;
@@ -1739,6 +1821,12 @@ impl PushbufferEngine {
             history.cleared = operation;
             history.blended = 0;
         }
+    }
+
+    /// The combiner configuration the most recent draw ran under.
+    #[must_use]
+    pub fn last_combiner(&self) -> &crate::CombinerState {
+        &self.last_combiner
     }
 
     /// Decodes the most recently sampled texture into 8-bit RGBA pixels.
@@ -2334,6 +2422,48 @@ mod tests {
             engine.top_methods(usize::MAX).len() <= MAX_CENSUS_ENTRIES,
             "the census is capped at {MAX_CENSUS_ENTRIES}"
         );
+    }
+
+    #[test]
+    fn the_combiner_methods_decode_the_title_s_own_program() {
+        // The words below are what Dino Crisis 3 submits: one stage that
+        // passes the diffuse color into the first spare register, and a
+        // final stage that adds the specular to it. Reading them back is
+        // what confirms the method numbering against a real stream.
+        let (engine, _) = submit_words(&[
+            header(1, 0, METHOD_SET_COMBINER_CONTROL),
+            0x0000_0001,
+            header(1, 0, METHOD_SET_COMBINER_COLOR_ICW),
+            0x0420_0000,
+            header(1, 0, METHOD_SET_COMBINER_COLOR_OCW),
+            0x0000_0C00,
+            header(1, 0, METHOD_SET_COMBINER_ALPHA_ICW),
+            0x1420_0000,
+            header(1, 0, METHOD_SET_COMBINER_ALPHA_OCW),
+            0x0000_0C00,
+            header(1, 0, METHOD_SET_COMBINER_FINAL0),
+            0x0000_000E,
+            header(1, 0, METHOD_SET_COMBINER_FINAL1),
+            0x0000_1C80,
+            header(1, 0, METHOD_SET_COMBINER_FACTOR0 + 4),
+            0x8040_2010,
+        ]);
+        let combiner = engine.channels[&0].combiner;
+        assert_eq!(combiner.active, 1, "the control word counts the stages");
+        assert_eq!(combiner.stages[0].color_inputs, 0x0420_0000);
+        assert_eq!(combiner.stages[0].color_outputs, 0x0000_0C00);
+        assert_eq!(combiner.stages[0].alpha_inputs, 0x1420_0000);
+        assert_eq!(combiner.final_first, 0x0000_000E);
+        assert_eq!(combiner.final_second, 0x0000_1C80);
+        assert_eq!(combiner.factor0[1][3], 128.0 / 255.0, "the factor unpacks to floats");
+
+        // Running it: with a white diffuse the pixel comes out white, which
+        // is what the two words above describe.
+        let registers = crate::CombinerRegisters {
+            diffuse: [1.0, 1.0, 1.0, 1.0],
+            ..crate::CombinerRegisters::default()
+        };
+        assert_eq!(crate::evaluate_combiner(&combiner, &registers), Some(0xFFFF_FFFF));
     }
 
     #[test]

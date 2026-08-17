@@ -139,6 +139,9 @@ struct RunArgs {
     /// Prints the transform program's instruction words.
     #[arg(long)]
     gpu_program: bool,
+    /// Prints the register-combiner program the last draw ran under.
+    #[arg(long)]
+    gpu_combiner: bool,
     /// Reports every guest write to this address, with its writer.
     #[arg(long, value_parser = parse_u32)]
     watch_write: Option<u32>,
@@ -258,6 +261,7 @@ fn main() -> Result<()> {
                 dump_texture,
                 screenshot_address,
                 gpu_program,
+                gpu_combiner,
                 watch_write,
                 frame_digest,
                 expect_frame,
@@ -281,6 +285,7 @@ fn main() -> Result<()> {
                     dump_texture: dump_texture.as_deref(),
                     screenshot_address,
                     gpu_program,
+                    gpu_combiner,
                     watch_write,
                     frame_digest,
                     expect_frame: expect_frame.as_deref(),
@@ -597,6 +602,8 @@ struct RunOptions<'a> {
     screenshot_address: Option<u32>,
     /// Whether to print the transform program's instruction words.
     gpu_program: bool,
+    /// Whether to print the register-combiner program.
+    gpu_combiner: bool,
     /// A guest address whose writers should be reported.
     watch_write: Option<u32>,
     /// Whether to print the captured frame's digest.
@@ -618,6 +625,7 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
         dump_texture,
         screenshot_address,
         gpu_program,
+        gpu_combiner,
         watch_write,
         frame_digest,
         expect_frame,
@@ -753,6 +761,26 @@ Graphics methods (object, method, submissions):"
                 words[0], words[1], words[2], words[3]
             );
         }
+        println!();
+    }
+
+    if gpu_combiner {
+        let combiner = emulator.gpu_combiner();
+        println!(
+            "Register combiners ({} stages, control {:08x}):",
+            combiner.active, combiner.control
+        );
+        for stage in 0..combiner.stages.len() {
+            let programmed = combiner.stages[stage];
+            println!(
+                "  {stage}: color in {:08x} out {:08x}  alpha in {:08x} out {:08x}",
+                programmed.color_inputs,
+                programmed.color_outputs,
+                programmed.alpha_inputs,
+                programmed.alpha_outputs
+            );
+        }
+        println!("  final: {:08x} {:08x}", combiner.final_first, combiner.final_second);
         println!();
     }
 

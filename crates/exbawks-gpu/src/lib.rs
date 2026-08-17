@@ -2,6 +2,7 @@
 #![doc = "Graphics high-level emulation interfaces for Exbawks."]
 
 mod backend;
+mod combiner;
 mod command;
 mod error;
 mod frontend;
@@ -11,6 +12,10 @@ mod shader;
 mod texture;
 
 pub use backend::{GraphicsBackend, NullGraphicsBackend, NullGraphicsStats};
+pub use combiner::{
+    CombinerState, Registers as CombinerRegisters, STAGES as COMBINER_STAGES,
+    Stage as CombinerStage, evaluate as evaluate_combiner,
+};
 pub use command::{ClearMask, GraphicsCommand, PrimitiveType, ResourceHandle};
 pub use error::GraphicsError;
 pub use frontend::GraphicsFrontend;
