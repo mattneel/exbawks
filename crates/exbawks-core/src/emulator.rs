@@ -82,6 +82,40 @@ const GUEST_STACK_SCRATCH: u32 = 16;
 /// address `pa` is readable at `0x8000_0000 | pa`.
 const KERNEL_WINDOW_BASE: u32 = 0x8000_0000;
 
+/// Guest physical memory as the graphics engine addresses it: physical
+/// address `pa` is the window alias `0x8000_0000 | pa` (ADR 0010).
+struct WindowMemory<'a>(&'a SoftwareAddressSpace);
+
+/// Guest physical memory through the cached window (ADR 0010).
+impl exbawks_gpu::Nv2aMemory for WindowMemory<'_> {
+    fn read_dword(&self, physical: u32) -> Option<u32> {
+        if physical >= 0x2000_0000 {
+            return None;
+        }
+        self.0.read_u32(GuestVa(0x8000_0000 | physical)).ok()
+    }
+
+    fn write_dword(&self, physical: u32, value: u32) -> bool {
+        physical < 0x2000_0000 && self.0.write_u32(GuestVa(0x8000_0000 | physical), value).is_ok()
+    }
+
+    fn fill_dwords(&self, physical: u32, value: u32, count: u32) -> u32 {
+        // A clear covers a whole scanline; one buffered write beats
+        // a call per pixel by orders of magnitude.
+        let Some(bytes) = count.checked_mul(4) else {
+            return 0;
+        };
+        if physical >= 0x2000_0000 || physical.saturating_add(bytes) > 0x2000_0000 {
+            return 0;
+        }
+        let filled = value.to_le_bytes().repeat(count as usize);
+        match self.0.write(GuestVa(0x8000_0000 | physical), &filled) {
+            Ok(()) => count,
+            Err(_) => 0,
+        }
+    }
+}
+
 /// One captured frame's pixels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedFrame {
@@ -120,6 +154,10 @@ pub enum CaptureError {
         address: GuestVa,
     },
 }
+
+/// The console's time-stamp counter ticks per millisecond: a 733 MHz CPU
+/// clock, which is what a title's `rdtsc`-based pacing expects.
+const XBOX_TSC_PER_MILLISECOND: u64 = 733_333;
 
 /// The guest address of the global descriptor table.
 ///
@@ -943,6 +981,24 @@ impl Emulator {
         self.gpu_pusher.top_methods(limit)
     }
 
+    /// Decodes the most recently sampled texture into 8-bit RGBA pixels.
+    ///
+    /// A frame that comes out empty is either badly addressed geometry or a
+    /// texture read from the wrong place; this tells the two apart.
+    #[must_use]
+    pub fn capture_last_texture(&self) -> Option<CapturedFrame> {
+        let memory = self.memory.clone();
+        let view = WindowMemory(&memory);
+        let (width, height, pixels) = self.gpu_pusher.dump_last_texture(&view)?;
+        Some(CapturedFrame { width, height, pixels, frame_buffer: 0 })
+    }
+
+    /// The color surfaces that received the most drawn pixels.
+    #[must_use]
+    pub fn gpu_busiest_targets(&self, limit: usize) -> Vec<(u32, u64)> {
+        self.gpu_pusher.busiest_targets(limit)
+    }
+
     /// Captures the scanned-out frame as 8-bit RGBA pixels.
     ///
     /// The title programs the encoder with a **physical** frame-buffer
@@ -951,6 +1007,48 @@ impl Emulator {
     /// the SDTV modes use are decoded; anything else reports its format so
     /// the caller can say why no image came back.
     pub fn capture_frame(&self) -> Result<CapturedFrame, CaptureError> {
+        self.capture_surface(None)
+    }
+
+    /// Chooses the display-sized surface that holds a finished frame.
+    ///
+    /// A title alternates buffers, so which one is on screen cannot be read
+    /// off the draw order alone: the buffer it has moved on to has been
+    /// cleared and barely drawn. Sampling the surfaces settles it — the one
+    /// carrying picture is the frame.
+    fn presented_surface_by_content(&self) -> Option<(u32, u32, u32, u32)> {
+        let candidates = self.gpu_pusher.presentable_targets();
+        let mut best: Option<((u32, u32, u32, u32), u32)> = None;
+        for candidate in candidates {
+            let (base, pitch, width, height) = candidate;
+            let mut lit = 0;
+            // A sparse sample is enough to tell a drawn frame from a
+            // cleared buffer, and costs a few thousand reads.
+            for row in (0..height).step_by(8) {
+                for column in (0..width).step_by(8) {
+                    let at = KERNEL_WINDOW_BASE | base.wrapping_add(row * pitch + column * 4);
+                    if let Ok(value) = self.memory.read_u32(GuestVa(at))
+                        && value & 0x00FF_FFFF != 0
+                    {
+                        lit += 1;
+                    }
+                }
+            }
+            if best.is_none_or(|(_, best_lit)| lit > best_lit) {
+                best = Some((candidate, lit));
+            }
+        }
+        best.map(|(candidate, _)| candidate)
+    }
+
+    /// Captures a specific color surface by physical address, at the
+    /// display geometry. A frame that lands somewhere unexpected is easier
+    /// to find by looking than by reasoning about buffer rotation.
+    pub fn capture_surface_at(&self, physical: u32) -> Result<CapturedFrame, CaptureError> {
+        self.capture_surface(Some(physical))
+    }
+
+    fn capture_surface(&self, forced: Option<u32>) -> Result<CapturedFrame, CaptureError> {
         /// `D3DFMT_LIN_A8R8G8B8`, the format every SDTV mode scans out.
         const LINEAR_A8R8G8B8: u32 = 0x12;
         /// `D3DFMT_LIN_X8R8G8B8`: the same bytes with the alpha ignored.
@@ -961,7 +1059,9 @@ impl Emulator {
         // The surface the graphics engine drew into last is the frame the
         // title just finished; its own buffer flip is not modeled, so the
         // encoder's programmed address can name an older buffer.
-        let drawn = self.gpu_pusher.presented_target();
+        let drawn = forced
+            .map(|base| (base, 2560, 640, 480))
+            .or_else(|| self.presented_surface_by_content());
         let (frame_buffer, pitch, width, height) = match drawn {
             Some((base, pitch, width, height)) if pitch % 4 == 0 && pitch != 0 => {
                 (base, pitch, width.min(pitch / 4), height)
@@ -1121,7 +1221,10 @@ impl Emulator {
                 {
                     let _ = memory.write_u32(cell, current.wrapping_add(ticks));
                 }
-                cpu.tsc = cpu.tsc.wrapping_add(u64::from(ticks) * 10_000);
+                // The console's time-stamp counter runs at the CPU clock, and
+                // a title paces animation by it: at any slower rate its
+                // fades and timers crawl.
+                cpu.tsc = cpu.tsc.wrapping_add(u64::from(ticks) * XBOX_TSC_PER_MILLISECOND);
                 *last_tick += std::time::Duration::from_millis(u64::from(ticks));
             }
         }
@@ -1688,38 +1791,6 @@ impl Emulator {
     /// Walks any pushbuffer ranges submitted since the last call (GPU-M0).
     #[cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
     fn consume_gpu_submissions(&mut self) {
-        /// Guest physical memory through the cached window (ADR 0010).
-        struct WindowMemory<'a>(&'a SoftwareAddressSpace);
-        impl exbawks_gpu::Nv2aMemory for WindowMemory<'_> {
-            fn read_dword(&self, physical: u32) -> Option<u32> {
-                if physical >= 0x2000_0000 {
-                    return None;
-                }
-                self.0.read_u32(GuestVa(0x8000_0000 | physical)).ok()
-            }
-
-            fn write_dword(&self, physical: u32, value: u32) -> bool {
-                physical < 0x2000_0000
-                    && self.0.write_u32(GuestVa(0x8000_0000 | physical), value).is_ok()
-            }
-
-            fn fill_dwords(&self, physical: u32, value: u32, count: u32) -> u32 {
-                // A clear covers a whole scanline; one buffered write beats
-                // a call per pixel by orders of magnitude.
-                let Some(bytes) = count.checked_mul(4) else {
-                    return 0;
-                };
-                if physical >= 0x2000_0000 || physical.saturating_add(bytes) > 0x2000_0000 {
-                    return 0;
-                }
-                let filled = value.to_le_bytes().repeat(count as usize);
-                match self.0.write(GuestVa(0x8000_0000 | physical), &filled) {
-                    Ok(()) => count,
-                    Err(_) => 0,
-                }
-            }
-        }
-
         /// `NV_PFIFO_RAMHT`: the object hash table's location register.
         const PFIFO_RAMHT: u32 = 0xFD00_2210;
 
@@ -1743,6 +1814,8 @@ impl Emulator {
                 triangles = stats.triangles,
                 shaded = stats.shaded_pixels,
                 skipped = stats.skipped_primitives,
+                textured = stats.textured_primitives,
+                unsupported = stats.unsupported_textures,
                 aborted = stats.aborted,
                 "pushbuffer walked"
             );

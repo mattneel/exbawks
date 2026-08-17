@@ -282,14 +282,29 @@ Two active threads:
    attribute 3 a packed `D3DCOLOR`, attributes 9-12 float2 texture
    coordinates, stride 16 dwords.
 
-   **What still stands between this and a recognizable frame:** the title
-   transforms geometry with a vertex program and this engine has no vertex
-   stage, so only its pre-transformed geometry (positions already in pixels,
-   recognized by arriving far outside any clip volume) reaches the surface —
-   about a thousand shaded pixels in a five-million-exit run, with the rest
-   counted in `skipped_primitives`. Next, in order: a vertex-program
-   interpreter, texture sampling (the art is textured quads), and alpha
-   blending.
+   **GPU-M3 textures and blends, and the title screen renders.** The engine
+   follows the first texture unit's state and samples linear and swizzled
+   `A8R8G8B8` plus `DXT1`/`DXT3`/`DXT5`, modulates by the vertex color, and
+   blends by source alpha when the title asks for it. That last part is what
+   made the difference: the art is mostly transparent, and writing those
+   texels opaquely painted black over every frame.
+   `exbawks run --dump-texture <file.png>` writes the most recently sampled
+   texture — the retail title's atlas comes out as its own title screen,
+   logo and menu text intact, which is how the decode was proven.
+
+   A capture picks its frame by looking at the display-sized surfaces the
+   engine drew into and taking the one carrying picture; which buffer is on
+   screen otherwise depends on where the title sits in its rotation.
+
+   **What is left before a golden screenshot means anything:** the title
+   still transforms most geometry with a vertex program this engine has no
+   stage for (counted in `skipped_primitives`), so what renders is its
+   pre-transformed interface art over a black background. The frame is also
+   captured mid-fade — the title draws a near-opaque black quad over the
+   screen while fading in, and the same phase comes up every run because the
+   pacing is deterministic. Next, in order: a vertex-program interpreter,
+   the pixel combiner (this engine approximates it as texture times vertex
+   color), and picking the brightest completed frame for the capture.
 
    Two techniques earned their keep and are worth reaching for again: the
    cancel pump's RIP sampling (`RUST_LOG=exbawks_core::emulator=trace`,

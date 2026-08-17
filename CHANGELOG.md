@@ -260,6 +260,27 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- GPU-M3: texture sampling and blending — **the retail title's screen now
+  renders**. The engine follows the first texture unit's state (offset,
+  format, pitch, image rectangle, and the context DMA its offset is
+  relative to), samples linear and swizzled `A8R8G8B8` as well as `DXT1`,
+  `DXT3`, and `DXT5` blocks, modulates the texel by the interpolated vertex
+  color, and blends by source alpha when the title enables blending — which
+  is what stops its transparent art from painting black over the frame.
+  `exbawks run --dump-texture <file.png>` writes the most recently sampled
+  texture, which is how the retail atlas was proven to decode; `--gpu-methods`
+  additionally reports which color surfaces received drawing, and
+  `--screenshot-address` captures a chosen surface.
+- A capture now chooses the frame by looking: of the display-sized surfaces
+  the engine drew into, it takes the one carrying picture, because which
+  buffer is on screen depends on where the title sits in its rotation.
+- The guest time-stamp counter advances at the console's 733 MHz clock
+  rather than 10 MHz, so `rdtsc`-paced animation runs at its own speed.
+- An event wait nothing can signal now completes instead of reporting a
+  timeout. A title paces frames on events a device interrupt would set;
+  with no interrupts and synchronous device work, the wait is satisfied in
+  fact, and a timeout only made the caller spin on it forever.
+
 - GPU-M2: a triangle rasterizer (`exbawks-gpu::fill_triangle`) and the
   vertex assembly that feeds it. Primitives arrive through `SET_BEGIN_END`
   and `INLINE_ARRAY`, the declared attribute layout gives each vertex its

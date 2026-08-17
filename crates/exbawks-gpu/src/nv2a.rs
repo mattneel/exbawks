@@ -82,6 +82,48 @@ struct SurfaceState {
     clear_y: (u32, u32),
 }
 
+/// The first texture unit's programmed state.
+///
+/// Only unit zero is modeled: a title's background and interface art come
+/// through it, and the later units feed combiner stages this engine does
+/// not run.
+#[derive(Debug, Default, Clone, Copy)]
+struct TextureState {
+    /// The texture's byte offset inside its context DMA.
+    offset: u32,
+    /// The raw format word: color code, dimensions, and mip levels.
+    format: u32,
+    /// The distance between texture rows in bytes, for linear formats.
+    pitch: u32,
+    /// The width and height a linear format carries separately.
+    rect: (u32, u32),
+    /// Whether the unit is enabled by its control word.
+    enabled: bool,
+}
+
+impl TextureState {
+    /// The color format code the hardware samples with.
+    fn color_format(self) -> u32 {
+        (self.format >> 8) & 0xFF
+    }
+
+    /// The texture's extent in texels.
+    ///
+    /// Swizzled and compressed formats carry base-two logarithms in the
+    /// format word, and those are authoritative: a linear texture cannot
+    /// express its size that way and leaves them zero, carrying an explicit
+    /// rectangle instead — which stays behind in the register when the next
+    /// texture is a compressed one, so reading it first mis-sizes the image.
+    fn extent(self) -> (u32, u32) {
+        let width_log2 = (self.format >> 20) & 0xF;
+        let height_log2 = (self.format >> 24) & 0xF;
+        if width_log2 != 0 || height_log2 != 0 {
+            return (1 << width_log2, 1 << height_log2);
+        }
+        self.rect
+    }
+}
+
 /// One vertex attribute's declared layout.
 #[derive(Debug, Default, Clone, Copy)]
 struct AttributeFormat {
@@ -106,6 +148,20 @@ struct VertexState {
     viewport_offset: [f32; 4],
 }
 
+/// When a color surface was last drawn into and last cleared.
+#[derive(Debug, Default, Clone, Copy)]
+struct SurfaceHistory {
+    /// The operation at which a triangle last wrote to it.
+    drawn: u64,
+    /// The operation at which a clear last wiped it.
+    cleared: u64,
+    /// Its geometry, as `(pitch, width, height)`.
+    geometry: (u32, u32, u32),
+    /// Pixels drawn into it since its last clear. A frame the title
+    /// finished has content; one it has only started has almost none.
+    blended: u64,
+}
+
 /// The engine's per-channel decode state.
 #[derive(Debug, Default)]
 struct ChannelState {
@@ -119,6 +175,12 @@ struct ChannelState {
     surface: SurfaceState,
     /// The vertex pipeline state.
     vertex: VertexState,
+    /// Whether blending is enabled.
+    blend: bool,
+    /// The first texture unit's state.
+    texture: TextureState,
+    /// The context-DMA objects textures address through (`A` and `B`).
+    texture_dma: [Option<DmaObject>; 2],
 }
 
 /// Aggregate statistics for diagnostics.
@@ -140,6 +202,10 @@ pub struct PusherStats {
     pub shaded_pixels: u64,
     /// Primitives skipped because their vertex layout is not modeled.
     pub skipped_primitives: u64,
+    /// Primitives drawn with a texture bound.
+    pub textured_primitives: u64,
+    /// Primitives whose texture format this engine cannot sample.
+    pub unsupported_textures: u64,
     /// Submissions abandoned mid-walk (bad word or unreadable memory).
     pub aborted: u64,
 }
@@ -151,12 +217,133 @@ struct SubmitContext {
     ramht_raw: u32,
 }
 
+/// A bound texture the rasterizer samples through guest memory.
+///
+/// Two layouts cover a title's own surfaces and its uncompressed art: a
+/// linear one, whose rows sit a programmed pitch apart, and a swizzled one,
+/// whose texels are ordered by interleaving the bits of their coordinates
+/// (Morton order), which is how the hardware stores a power-of-two texture.
+struct MemoryTexture<'a> {
+    memory: &'a dyn Nv2aMemory,
+    base: u32,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    layout: TextureLayout,
+    /// Whether the format's alpha channel is meaningful.
+    has_alpha: bool,
+}
+
+/// How a bound texture's texels are arranged in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextureLayout {
+    /// Rows a programmed pitch apart.
+    Linear,
+    /// Texels in Morton order, as the hardware stores a power-of-two image.
+    Swizzled,
+    /// Four-by-four blocks of `DXT1` color.
+    Dxt1,
+    /// Blocks of explicit alpha followed by `DXT1` color.
+    Dxt3,
+    /// Blocks of interpolated alpha followed by `DXT1` color.
+    Dxt5,
+}
+
+/// Interleaves the low bits of two coordinates into a Morton index.
+fn swizzle_index(x: u32, y: u32, width_bits: u32, height_bits: u32) -> u32 {
+    let mut index = 0;
+    let mut bit = 0;
+    let (mut x_bit, mut y_bit) = (0, 0);
+    while x_bit < width_bits || y_bit < height_bits {
+        if x_bit < width_bits {
+            index |= ((x >> x_bit) & 1) << bit;
+            x_bit += 1;
+            bit += 1;
+        }
+        if y_bit < height_bits {
+            index |= ((y >> y_bit) & 1) << bit;
+            y_bit += 1;
+            bit += 1;
+        }
+    }
+    index
+}
+
+impl MemoryTexture<'_> {
+    /// Reads the block containing a texel, as two dwords at `offset`.
+    fn block(&self, x: u32, y: u32, block_bytes: u32, offset: u32) -> [u32; 2] {
+        let blocks_across = self.width.div_ceil(4);
+        let index = (y / 4) * blocks_across + (x / 4);
+        let address = self.base.wrapping_add(index * block_bytes).wrapping_add(offset);
+        [
+            self.memory.read_dword(address).unwrap_or(0),
+            self.memory.read_dword(address.wrapping_add(4)).unwrap_or(0),
+        ]
+    }
+}
+
+impl crate::TextureSource for MemoryTexture<'_> {
+    fn texel(&self, x: u32, y: u32) -> u32 {
+        use crate::texture::{DXT_ALPHA_BLOCK_BYTES, DXT1_BLOCK_BYTES};
+
+        let address = match self.layout {
+            TextureLayout::Swizzled => {
+                let index =
+                    swizzle_index(x, y, self.width.trailing_zeros(), self.height.trailing_zeros());
+                self.base.wrapping_add(index * 4)
+            }
+            TextureLayout::Linear => {
+                self.base.wrapping_add(y.wrapping_mul(self.pitch)).wrapping_add(x * 4)
+            }
+            TextureLayout::Dxt1 => {
+                let block = self.block(x, y, DXT1_BLOCK_BYTES, 0);
+                return crate::dxt1_texel(block, x, y);
+            }
+            // The color half of an alpha-carrying block follows its alpha.
+            TextureLayout::Dxt3 => {
+                let alpha = crate::dxt3_alpha(self.block(x, y, DXT_ALPHA_BLOCK_BYTES, 0), x, y);
+                let color = crate::dxt1_texel(self.block(x, y, DXT_ALPHA_BLOCK_BYTES, 8), x, y);
+                return (color & 0x00FF_FFFF) | (alpha << 24);
+            }
+            TextureLayout::Dxt5 => {
+                let alpha = crate::dxt5_alpha(self.block(x, y, DXT_ALPHA_BLOCK_BYTES, 0), x, y);
+                let color = crate::dxt1_texel(self.block(x, y, DXT_ALPHA_BLOCK_BYTES, 8), x, y);
+                return (color & 0x00FF_FFFF) | (alpha << 24);
+            }
+        };
+        let texel = self.memory.read_dword(address).unwrap_or(0);
+        if self.has_alpha { texel } else { texel | 0xFF00_0000 }
+    }
+
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+}
+
 /// The DMA pusher: walks submitted command ranges and applies effects.
 #[derive(Debug, Default)]
 pub struct PushbufferEngine {
     channels: HashMap<u32, ChannelState>,
     /// Per-method dword counts, keyed by (subchannel-bound handle, method).
     method_counts: HashMap<(u32, u16), u64>,
+    /// Pixels written per color surface, for diagnostics: it answers where
+    /// a frame's drawing actually landed.
+    pixels_by_target: HashMap<u32, u64>,
+    /// When each color surface was last drawn into and last cleared, on a
+    /// counter of graphics operations. A surface whose last draw came after
+    /// its last clear holds a finished frame; one cleared since is the
+    /// buffer the title has started drawing the next frame into.
+    surface_history: HashMap<u32, SurfaceHistory>,
+    /// The operation counter those timestamps come from.
+    operations: u64,
+    /// The texture most recently sampled, as `(state, context object)`.
+    /// Dumping it answers whether a black frame is bad addressing or a
+    /// texture that is genuinely empty.
+    last_texture: Option<(TextureState, Option<DmaObject>)>,
     /// The color surface the last triangle landed in. A capture reads this
     /// rather than the encoder's programmed frame buffer: the title's own
     /// buffer flip is not modeled, so the surface it just drew into is the
@@ -191,6 +378,9 @@ fn ramht_hash(handle: u32, index_bits: u32, channel: u32) -> u32 {
     }
     hash ^ ((channel & 0xF) << (index_bits - 4))
 }
+
+/// The narrowest surface a capture treats as a displayable frame.
+const PRESENTABLE_WIDTH: u32 = 512;
 
 /// The most inline vertex dwords one primitive may carry.
 const MAX_INLINE_DWORDS: usize = 1 << 20;
@@ -257,6 +447,41 @@ const VIEWPORT_OFFSET_LAST: u16 = METHOD_SET_VIEWPORT_OFFSET + 12;
 const VIEWPORT_SCALE_LAST: u16 = METHOD_SET_VIEWPORT_SCALE + 12;
 /// The last of the sixteen vertex-attribute format methods.
 const VERTEX_FORMAT_LAST: u16 = METHOD_SET_VERTEX_DATA_ARRAY_FORMAT + 15 * 4;
+/// Kelvin `SET_BLEND_ENABLE`.
+const METHOD_SET_BLEND_ENABLE: u16 = 0x0304;
+/// Kelvin `SET_TEXTURE_OFFSET` for unit zero; units are 64 bytes apart.
+const METHOD_SET_TEXTURE_OFFSET: u16 = 0x1B00;
+/// Kelvin `SET_TEXTURE_FORMAT` for unit zero.
+const METHOD_SET_TEXTURE_FORMAT: u16 = 0x1B04;
+/// Kelvin `SET_TEXTURE_CONTROL0` for unit zero: the enable bit lives here.
+const METHOD_SET_TEXTURE_CONTROL0: u16 = 0x1B0C;
+/// Kelvin `SET_TEXTURE_CONTROL1` for unit zero: the row pitch, in the high
+/// half of the word.
+const METHOD_SET_TEXTURE_CONTROL1: u16 = 0x1B10;
+/// Kelvin `SET_TEXTURE_IMAGE_RECT` for unit zero: width and height a linear
+/// format cannot express as logarithms.
+const METHOD_SET_TEXTURE_IMAGE_RECT: u16 = 0x1B1C;
+/// Kelvin `SET_CONTEXT_DMA_A`, the first texture context.
+const METHOD_SET_CONTEXT_DMA_A: u16 = 0x0184;
+/// Kelvin `SET_CONTEXT_DMA_B`, the second texture context.
+const METHOD_SET_CONTEXT_DMA_B: u16 = 0x0188;
+/// `SET_TEXTURE_CONTROL0` enable bit.
+const TEXTURE_ENABLE: u32 = 0x4000_0000;
+/// The texture color format for linear 8-bit ARGB.
+const TEXTURE_FORMAT_LINEAR_A8R8G8B8: u32 = 0x12;
+/// The texture color format for linear 8-bit XRGB (alpha reads as one).
+const TEXTURE_FORMAT_LINEAR_X8R8G8B8: u32 = 0x11;
+/// The texture color format for swizzled 8-bit ARGB.
+const TEXTURE_FORMAT_SWIZZLED_A8R8G8B8: u32 = 0x06;
+/// The texture color format for `DXT1` blocks.
+const TEXTURE_FORMAT_DXT1: u32 = 0x0C;
+/// The texture color format for `DXT3` blocks.
+const TEXTURE_FORMAT_DXT3: u32 = 0x0E;
+/// The texture color format for `DXT5` blocks.
+const TEXTURE_FORMAT_DXT5: u32 = 0x0F;
+/// The vertex attribute carrying the first texture coordinate set.
+const ATTRIBUTE_TEXCOORD0: usize = 9;
+
 /// `SET_BEGIN_END` primitive types.
 const PRIMITIVE_TRIANGLES: u32 = 5;
 const PRIMITIVE_TRIANGLE_STRIP: u32 = 6;
@@ -519,6 +744,35 @@ impl PushbufferEngine {
                 state.vertex.formats[index & 15] =
                     AttributeFormat { kind: argument & 0xF, size: (argument >> 4) & 0xF };
             }
+            METHOD_SET_BLEND_ENABLE => {
+                state.blend = argument != 0;
+            }
+            METHOD_SET_TEXTURE_OFFSET => {
+                state.texture.offset = argument;
+            }
+            METHOD_SET_TEXTURE_FORMAT => {
+                state.texture.format = argument;
+            }
+            METHOD_SET_TEXTURE_CONTROL0 => {
+                state.texture.enabled = argument & TEXTURE_ENABLE != 0;
+            }
+            METHOD_SET_TEXTURE_CONTROL1 => {
+                state.texture.pitch = argument >> 16;
+            }
+            METHOD_SET_TEXTURE_IMAGE_RECT => {
+                state.texture.rect = (argument >> 16, argument & 0xFFFF);
+            }
+            METHOD_SET_CONTEXT_DMA_A | METHOD_SET_CONTEXT_DMA_B => {
+                let resolved = Self::resolve_dma_object(
+                    memory,
+                    context.pramin,
+                    context.ramht_raw,
+                    channel,
+                    argument,
+                );
+                let state = self.channels.entry(channel).or_default();
+                state.texture_dma[usize::from(method == METHOD_SET_CONTEXT_DMA_B)] = resolved;
+            }
             METHOD_SET_BEGIN_END => {
                 if argument == 0 {
                     self.end_primitive(memory, channel);
@@ -562,14 +816,15 @@ impl PushbufferEngine {
     /// anything else is counted and skipped, so what is missing stays
     /// visible in the statistics rather than quietly drawing nothing.
     fn end_primitive(&mut self, memory: &dyn Nv2aMemory, channel: u32) {
-        let (primitive, vertices, surface) = {
+        let (primitive, vertices, surface, texture, texture_dma, blend) = {
             let state = self.channels.entry(channel).or_default();
             let Some(primitive) = state.vertex.primitive.take() else {
                 return;
             };
             let vertices = Self::assemble_inline(&state.vertex);
             state.vertex.inline.clear();
-            (primitive, vertices, state.surface)
+            let dma = state.texture_dma[(state.texture.format & 3).saturating_sub(1) as usize & 1];
+            (primitive, vertices, state.surface, state.texture, dma, state.blend)
         };
         let Some(target) = Self::render_target(&surface).filter(|_| !vertices.is_empty()) else {
             self.stats.skipped_primitives += 1;
@@ -581,8 +836,34 @@ impl PushbufferEngine {
             fn write_pixel(&self, physical: u32, color: u32) {
                 self.0.write_dword(physical, color);
             }
+
+            fn read_pixel(&self, physical: u32) -> u32 {
+                self.0.read_dword(physical).unwrap_or(0)
+            }
         }
         let sink = Sink(memory);
+
+        // The bound texture, when this engine can address and read it.
+        let bound = texture.enabled.then(|| Self::bind_texture(memory, &texture, texture_dma));
+        match bound {
+            Some(Some(_)) => {
+                self.stats.textured_primitives += 1;
+                self.last_texture = Some((texture, texture_dma));
+            }
+            Some(None) => {
+                // The primitive is textured with a format this engine
+                // cannot decode. Drawing it flat would paint its vertex
+                // color over the frame — and over the render targets a
+                // title composites from — so it is left undrawn and
+                // counted instead.
+                self.stats.unsupported_textures += 1;
+                return;
+            }
+            None => {}
+        }
+        let bound = bound.flatten();
+        let sampler = bound.as_ref().map(|texture| texture as &dyn crate::TextureSource);
+        let mode = if blend { crate::BlendMode::SourceAlpha } else { crate::BlendMode::Replace };
 
         // Primitive assembly follows the hardware's numbering; triangles,
         // strips, fans, and quads are what a title draws with.
@@ -602,8 +883,12 @@ impl PushbufferEngine {
             }
         };
         if self.last_draw_target != target.base {
+            // Only a display-sized surface is a frame; the smaller ones a
+            // title renders into are effect and composite textures, and
+            // capturing one of those would report an intermediate step as
+            // the picture.
             let (pitch, width, height) = self.last_draw_geometry;
-            if pitch != 0 {
+            if pitch != 0 && width >= PRESENTABLE_WIDTH {
                 self.previous_draw = Some((self.last_draw_target, pitch, width, height));
             }
             self.last_draw_target = target.base;
@@ -617,11 +902,63 @@ impl PushbufferEngine {
         }
         self.last_draw_geometry = (target.pitch, target.width, target.height);
         for [a, b, c] in triangles {
-            let written =
-                crate::fill_triangle(&sink, &target, [vertices[a], vertices[b], vertices[c]]);
+            let written = crate::fill_triangle(
+                &sink,
+                &target,
+                [vertices[a], vertices[b], vertices[c]],
+                sampler,
+                mode,
+            );
             self.stats.triangles += 1;
             self.stats.shaded_pixels += written;
+            *self.pixels_by_target.entry(target.base).or_insert(0) += written;
+            if written > 0 {
+                self.operations += 1;
+                let operation = self.operations;
+                let history = self.surface_history.entry(target.base).or_default();
+                history.drawn = operation;
+                history.geometry = (target.pitch, target.width, target.height);
+                history.blended += written;
+            }
         }
+    }
+
+    /// Resolves the bound texture into something the rasterizer can read.
+    ///
+    /// Returns `None` when the format is one this engine does not decode
+    /// yet — the compressed ones — so the caller can count the gap instead
+    /// of sampling nonsense.
+    fn bind_texture<'a>(
+        memory: &'a dyn Nv2aMemory,
+        texture: &TextureState,
+        dma: Option<DmaObject>,
+    ) -> Option<MemoryTexture<'a>> {
+        let (width, height) = texture.extent();
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let layout = match texture.color_format() {
+            TEXTURE_FORMAT_LINEAR_A8R8G8B8 | TEXTURE_FORMAT_LINEAR_X8R8G8B8 => {
+                TextureLayout::Linear
+            }
+            TEXTURE_FORMAT_SWIZZLED_A8R8G8B8 => TextureLayout::Swizzled,
+            TEXTURE_FORMAT_DXT1 => TextureLayout::Dxt1,
+            TEXTURE_FORMAT_DXT3 => TextureLayout::Dxt3,
+            TEXTURE_FORMAT_DXT5 => TextureLayout::Dxt5,
+            _ => return None,
+        };
+        if layout == TextureLayout::Linear && texture.pitch == 0 {
+            return None;
+        }
+        Some(MemoryTexture {
+            memory,
+            base: dma.map_or(0, |object| object.base).wrapping_add(texture.offset),
+            pitch: texture.pitch,
+            width,
+            height,
+            layout,
+            has_alpha: texture.color_format() != TEXTURE_FORMAT_LINEAR_X8R8G8B8,
+        })
     }
 
     /// The rasterizer's view of the current color surface.
@@ -671,6 +1008,12 @@ impl PushbufferEngine {
             .copied()
             .map(Self::attribute_dwords)
             .sum::<u32>() as usize;
+        let texcoord = state.formats[ATTRIBUTE_TEXCOORD0];
+        let texcoord_offset: usize = state.formats[..ATTRIBUTE_TEXCOORD0]
+            .iter()
+            .copied()
+            .map(Self::attribute_dwords)
+            .sum::<u32>() as usize;
 
         // The declared layout, once per primitive: it is the only record of
         // what a title's vertices actually contain.
@@ -691,20 +1034,23 @@ impl PushbufferEngine {
                 "nv2a vertex layout"
             );
         }
-        let [scale_x, scale_y, ..] = state.viewport_scale;
-        let [offset_x, offset_y, ..] = state.viewport_offset;
-        // A vertex program owns the transform, and this engine has none, so
-        // the only positions it can place truthfully are the ones already
-        // in pixels: a title's pre-transformed geometry (`D3DFVF_XYZRHW`)
-        // arrives far outside any clip volume, which is exactly how it is
-        // recognized. Everything else keeps the viewport transform, which
-        // is right once a transform stage exists to feed it.
+        // A vertex program owns the transform, and this engine has no
+        // vertex stage, so the only positions it can place truthfully are
+        // the ones already in pixels: pre-transformed geometry
+        // (`D3DFVF_XYZRHW`) arrives far outside any clip volume, which is
+        // exactly how it is recognized. Everything else is left undrawn —
+        // running it through the viewport transform alone would paint
+        // object-space coordinates over the frame, which is worse than a
+        // gap, because a gap is visible in `skipped_primitives`.
         let pretransformed = state.inline.chunks_exact(stride as usize).take(3).any(|chunk| {
             let x = f32::from_bits(chunk[0]).abs();
             let y = f32::from_bits(chunk[1]).abs();
             let w = if position.size >= 4 { f32::from_bits(chunk[3]).abs().max(1.0) } else { 1.0 };
             x > w * 2.0 || y > w * 2.0
         });
+        if !pretransformed {
+            return Vec::new();
+        }
         let mut vertices = Vec::with_capacity(state.inline.len() / stride as usize);
         for chunk in state.inline.chunks_exact(stride as usize) {
             let color = match diffuse.kind {
@@ -728,14 +1074,21 @@ impl PushbufferEngine {
                 // No color attribute: white keeps the geometry visible.
                 _ => 0xFFFF_FFFF,
             };
-            let x = f32::from_bits(chunk[0]);
-            let y = f32::from_bits(chunk[1]);
-            let (x, y) = if pretransformed {
-                (x, y)
+            let (u, v) = if texcoord.kind == ATTRIBUTE_TYPE_FLOAT && texcoord.size >= 2 {
+                (
+                    chunk.get(texcoord_offset).map_or(0.0, |bits| f32::from_bits(*bits)),
+                    chunk.get(texcoord_offset + 1).map_or(0.0, |bits| f32::from_bits(*bits)),
+                )
             } else {
-                (x.mul_add(scale_x, offset_x), y.mul_add(scale_y, offset_y))
+                (0.0, 0.0)
             };
-            vertices.push(crate::ScreenVertex { x, y, color });
+            vertices.push(crate::ScreenVertex {
+                x: f32::from_bits(chunk[0]),
+                y: f32::from_bits(chunk[1]),
+                color,
+                u,
+                v,
+            });
         }
         vertices
     }
@@ -785,7 +1138,55 @@ impl PushbufferEngine {
         if written > 0 {
             self.stats.surface_clears += 1;
             self.stats.cleared_pixels += written;
+            self.operations += 1;
+            let operation = self.operations;
+            let history = self.surface_history.entry(base).or_default();
+            history.cleared = operation;
+            history.blended = 0;
         }
+    }
+
+    /// Decodes the most recently sampled texture into 8-bit RGBA pixels.
+    ///
+    /// Returns its width, height, and `width * height * 4` bytes.
+    #[must_use]
+    pub fn dump_last_texture(&self, memory: &dyn Nv2aMemory) -> Option<(u32, u32, Vec<u8>)> {
+        use crate::TextureSource;
+
+        let (state, dma) = self.last_texture?;
+        let texture = Self::bind_texture(memory, &state, dma)?;
+        let (width, height) = (texture.width(), texture.height());
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let texel = texture.texel(x, y);
+                pixels.extend_from_slice(&[
+                    ((texel >> 16) & 0xFF) as u8,
+                    ((texel >> 8) & 0xFF) as u8,
+                    (texel & 0xFF) as u8,
+                    ((texel >> 24) & 0xFF) as u8,
+                ]);
+            }
+        }
+        tracing::debug!(
+            width,
+            height,
+            format = format_args!("{:#04x}", state.color_format()),
+            offset = format_args!("{:#010x}", state.offset),
+            base = format_args!("{:#010x}", dma.map_or(0, |object| object.base)),
+            "nv2a texture dumped"
+        );
+        Some((width, height, pixels))
+    }
+
+    /// The color surfaces that received the most pixels, most first.
+    #[must_use]
+    pub fn busiest_targets(&self, limit: usize) -> Vec<(u32, u64)> {
+        let mut entries: Vec<(u32, u64)> =
+            self.pixels_by_target.iter().map(|(base, count)| (*base, *count)).collect();
+        entries.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        entries.truncate(limit);
+        entries
     }
 
     /// The finished frame's color surface, as `(base, pitch, width,
@@ -796,10 +1197,30 @@ impl PushbufferEngine {
     /// Before a second surface appears, the only drawn one is reported.
     #[must_use]
     pub fn presented_target(&self) -> Option<(u32, u32, u32, u32)> {
-        self.previous_draw.or_else(|| {
-            let (pitch, width, height) = self.last_draw_geometry;
-            (pitch != 0).then_some((self.last_draw_target, pitch, width, height))
-        })
+        self.presentable_targets().into_iter().next()
+    }
+
+    /// Every display-sized surface the engine has drawn into, the most
+    /// recently drawn first.
+    ///
+    /// Which one is on screen depends on where the title is in its buffer
+    /// rotation, and a caller that can read the surfaces settles that by
+    /// looking at them.
+    #[must_use]
+    pub fn presentable_targets(&self) -> Vec<(u32, u32, u32, u32)> {
+        let mut candidates: Vec<(&u32, &SurfaceHistory)> = self
+            .surface_history
+            .iter()
+            .filter(|(_, history)| history.geometry.1 >= PRESENTABLE_WIDTH && history.drawn > 0)
+            .collect();
+        candidates.sort_by_key(|(_, history)| std::cmp::Reverse(history.drawn));
+        candidates
+            .into_iter()
+            .map(|(base, history)| {
+                let (pitch, width, height) = history.geometry;
+                (*base, pitch, width, height)
+            })
+            .collect()
     }
 
     /// The aggregate statistics.

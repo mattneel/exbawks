@@ -110,6 +110,12 @@ enum Command {
         /// Prints the most-submitted graphics methods after the stop.
         #[arg(long)]
         gpu_methods: Option<usize>,
+        /// Writes the most recently sampled texture to this PNG file.
+        #[arg(long)]
+        dump_texture: Option<PathBuf>,
+        /// Captures this color surface instead of the presented one.
+        #[arg(long, value_parser = parse_u32)]
+        screenshot_address: Option<u32>,
     },
     /// Reports the implementation burndown across emulator surfaces.
     Coverage {
@@ -229,6 +235,8 @@ fn main() -> Result<()> {
             peek,
             screenshot,
             gpu_methods,
+            dump_texture,
+            screenshot_address,
         } => {
             let tracing = TraceOptions {
                 path: trace.as_deref(),
@@ -245,6 +253,8 @@ fn main() -> Result<()> {
                     peek: &peek,
                     screenshot: screenshot.as_deref(),
                     gpu_methods,
+                    dump_texture: dump_texture.as_deref(),
+                    screenshot_address,
                     json: cli.json,
                 },
             )
@@ -552,12 +562,26 @@ struct RunOptions<'a> {
     screenshot: Option<&'a Path>,
     /// How many graphics methods to report, when asked for.
     gpu_methods: Option<usize>,
+    /// Where the most recently sampled texture is written, when asked for.
+    dump_texture: Option<&'a Path>,
+    /// A specific color surface to capture instead of the presented one.
+    screenshot_address: Option<u32>,
     /// Whether the report prints as JSON.
     json: bool,
 }
 
 fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Result<()> {
-    let RunOptions { ram_mib, max_blocks, engine, peek, screenshot, gpu_methods, json } = *options;
+    let RunOptions {
+        ram_mib,
+        max_blocks,
+        engine,
+        peek,
+        screenshot,
+        gpu_methods,
+        dump_texture,
+        screenshot_address,
+        json,
+    } = *options;
     let bytes = read_file(path)?;
     let config = EmulatorConfig {
         physical_memory_bytes: mib_to_bytes(ram_mib)?,
@@ -652,8 +676,48 @@ Graphics methods (object, method, submissions):"
         println!();
     }
 
+    if gpu_methods.is_some() {
+        use exbawks_memory::GuestMemory;
+
+        // A surface's pixel count says where drawing landed; its share of
+        // non-black pixels says whether anything survived there.
+        println!("Busiest color surfaces (address, pixels drawn, non-black sample):");
+        for (base, pixels) in emulator.gpu_busiest_targets(8) {
+            let mut sampled = 0_u32;
+            let mut lit = 0_u32;
+            for index in (0..640 * 480).step_by(16) {
+                let address = 0x8000_0000 | base.wrapping_add(index * 4);
+                if let Ok(value) = emulator.memory().read_u32(GuestVa(address)) {
+                    sampled += 1;
+                    if value & 0x00FF_FFFF != 0 {
+                        lit += 1;
+                    }
+                }
+            }
+            let percent = (lit * 100).checked_div(sampled).unwrap_or(0);
+            println!("  {}  {pixels}  {percent}%", GuestVa(base));
+        }
+        println!();
+    }
+
+    if let Some(path) = dump_texture {
+        match emulator.capture_last_texture() {
+            Some(frame) => {
+                let png = exbawks_debug::encode_rgba(frame.width, frame.height, &frame.pixels);
+                fs::write(path, &png)
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+                println!("Texture:      {}x{} -> {}", frame.width, frame.height, path.display());
+            }
+            None => eprintln!("warning: no texture was sampled"),
+        }
+    }
+
     if let Some(path) = screenshot {
-        match emulator.capture_frame() {
+        let captured = match screenshot_address {
+            Some(address) => emulator.capture_surface_at(address),
+            None => emulator.capture_frame(),
+        };
+        match captured {
             Ok(frame) => {
                 let png = exbawks_debug::encode_rgba(frame.width, frame.height, &frame.pixels);
                 fs::write(path, &png)

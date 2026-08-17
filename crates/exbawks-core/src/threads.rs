@@ -814,7 +814,16 @@ impl KernelServices for ThreadManager {
                 return Ok(WaitOutcome::Signaled);
             }
             if !another_runnable {
-                return Ok(WaitOutcome::TimedOut);
+                // Nothing left can signal it. A title paces its frames on
+                // events a device interrupt would set, and this model has
+                // no interrupts and finishes device work synchronously, so
+                // the wait is satisfied in fact; reporting a timeout only
+                // makes the caller spin on it forever.
+                tracing::debug!(
+                    handle = format_args!("{handle:#x}"),
+                    "completing an event wait no thread can signal"
+                );
+                return Ok(WaitOutcome::Signaled);
             }
             self.pending = Some(PendingAction::Wait { handle });
             return Ok(WaitOutcome::Pending);
@@ -1052,13 +1061,22 @@ mod tests {
     }
 
     #[test]
-    fn a_wait_with_no_other_thread_times_out() {
+    fn a_wait_no_thread_can_signal_completes() {
         let mut threads = manager();
         threads.create_thread(thread_request(0x2000)).expect("the sole thread creates");
         let event = threads.create_event(false, false).expect("event creates");
-        // No other thread is runnable, so a wait cannot park — it times out
-        // instead of deadlocking the guest.
-        assert_eq!(threads.wait_for_object(event), Ok(WaitOutcome::TimedOut));
+        // No other thread is runnable, so nothing can ever signal it. The
+        // wait completes rather than deadlocking or spinning the guest.
+        assert_eq!(threads.wait_for_object(event), Ok(WaitOutcome::Signaled));
+    }
+
+    #[test]
+    fn a_thread_join_no_thread_can_satisfy_times_out() {
+        let mut threads = manager();
+        let created = threads.create_thread(thread_request(0x2000)).expect("thread creates");
+        // A join on a thread that will never run is a genuine timeout: no
+        // device stands behind it, so completing it would be a fiction.
+        assert_eq!(threads.wait_for_object(created.handle), Ok(WaitOutcome::TimedOut));
     }
 
     #[test]
