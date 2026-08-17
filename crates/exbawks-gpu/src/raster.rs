@@ -168,8 +168,11 @@ fn sample_filtered(texture: &dyn TextureSource, level: u32, u: f32, v: f32) -> u
     let [mode_u, mode_v] = texture.addressing();
     let (width, height) = (texture.width_in(level), texture.height_in(level));
 
-    let column = |offset: i64| address_texel(mode_u, left as i64 + offset, width);
-    let row = |offset: i64| address_texel(mode_v, top as i64 + offset, height);
+    // A guest hands over its texture coordinates as raw float bits, so the
+    // scaled value can saturate the cast; reaching for the neighbouring
+    // texel must not then overflow.
+    let column = |offset: i64| address_texel(mode_u, (left as i64).saturating_add(offset), width);
+    let row = |offset: i64| address_texel(mode_v, (top as i64).saturating_add(offset), height);
     let (x0, x1, y0, y1) = (column(0), column(1), row(0), row(1));
     let corners = [
         texture.texel_in(level, x0, y0),
@@ -928,6 +931,19 @@ mod tests {
         assert_eq!(texture.0.get(), 3, "the nearest sample reads its level");
         sample_filtered(&texture, 5, 0.5, 0.5);
         assert_eq!(texture.0.get(), 5, "and so does the filtered one");
+    }
+
+    #[test]
+    fn a_filtered_sample_survives_an_absurd_coordinate() {
+        // A guest supplies texture coordinates as raw float bits, so a
+        // vertex can carry one large enough that the floored, scaled value
+        // saturates the cast. Reaching for the neighbouring texel then
+        // overflows, which panics wherever overflow checks are on.
+        for coordinate in [1e20_f32, f32::INFINITY, -f32::INFINITY, f32::MAX, f32::NAN] {
+            let _ = sample_filtered(&Corners, 0, coordinate, 0.5);
+            let _ = sample_filtered(&Corners, 0, 0.5, coordinate);
+            let _ = sample_nearest(&Corners, 0, coordinate, coordinate);
+        }
     }
 
     #[test]

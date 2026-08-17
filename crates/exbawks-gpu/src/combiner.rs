@@ -146,13 +146,17 @@ fn scale_and_bias(outputs: u32, value: f32) -> f32 {
 /// Writes a result into the register a four-bit destination names.
 fn write_register(code: u32, value: [f32; 4], registers: &mut Registers, alpha_only: bool) {
     let target = match code & 0xF {
+        // The interpolated colours are writable: a stage that has consumed
+        // one commonly reuses its register as scratch.
+        4 => &mut registers.diffuse,
+        5 => &mut registers.specular,
         8 => &mut registers.textures[0],
         9 => &mut registers.textures[1],
         10 => &mut registers.textures[2],
         11 => &mut registers.textures[3],
         12 => &mut registers.spare0,
         13 => &mut registers.spare1,
-        // Zero and the read-only registers discard what a stage writes.
+        // Zero and the constants discard what a stage writes.
         _ => return,
     };
     if alpha_only {
@@ -195,15 +199,15 @@ fn run_portion(inputs: u32, outputs: u32, registers: &mut Registers, alpha_porti
     let scaled = |value: [f32; 4]| -> [f32; 4] {
         std::array::from_fn(|i| scale_and_bias(outputs, value[i]))
     };
-    // The second product's destination comes first in the word, and a
-    // dot product leaves no separate result to write.
-    if !cd_dot {
-        write_register(outputs, scaled(cd), registers, alpha_portion);
+    // The second product's destination comes first in the word. A dot
+    // product is not a reason to skip the write — the dot is precisely
+    // what its destination receives — but it consumes both inputs, so the
+    // stage has no sum left to produce.
+    write_register(outputs, scaled(cd), registers, alpha_portion);
+    write_register(outputs >> 4, scaled(ab), registers, alpha_portion);
+    if !ab_dot && !cd_dot {
+        write_register(outputs >> 8, scaled(sum), registers, alpha_portion);
     }
-    if !ab_dot {
-        write_register(outputs >> 4, scaled(ab), registers, alpha_portion);
-    }
-    write_register(outputs >> 8, scaled(sum), registers, alpha_portion);
 }
 
 /// Runs the final stage, producing the pixel.
@@ -242,7 +246,7 @@ fn run_final(state: &CombinerState, registers: &mut Registers) -> [f32; 4] {
     let d = inverted(d_field, variable(d_field));
 
     let g_field = (state.final_second >> 8) & 0xFF;
-    let g = variable(g_field);
+    let g = inverted(g_field, variable(g_field));
     let color: [f32; 4] =
         std::array::from_fn(|i| a[i].mul_add(b[i], (1.0 - a[i]).mul_add(c[i], d[i])));
     [color[0], color[1], color[2], g[3]]
@@ -396,15 +400,44 @@ mod tests {
 
     #[test]
     fn a_dot_product_broadcasts_across_the_channels() {
-        // texture0 . texture0 = 1, written to every color channel.
+        // texture0 . texture0 = 1, into the product's own destination. A
+        // dot consumes both inputs, so the hardware has no sum to give and
+        // a title programs the destination on the product itself.
         let mut state = CombinerState { active: 1, ..CombinerState::default() };
         state.stages[0] = Stage {
             color_inputs: inputs(input(8, false, 0), input(8, false, 0), 0, 0),
-            color_outputs: outputs(0, 0, 12) | (1 << 13),
+            color_outputs: outputs(12, 0, 0) | (1 << 13),
             ..Stage::default()
         };
         let color = evaluate(&state, &registers()).expect("runs");
         assert_eq!(color & 0x00FF_FFFF, 0x00FF_FFFF, "a unit dot product is white");
+    }
+
+    #[test]
+    fn a_dot_product_reaches_its_destination_and_suppresses_the_sum() {
+        // The dot is what the destination receives; a stage that computed
+        // one and then discarded it would leave the register untouched and
+        // shade from whatever was there before.
+        let mut state = CombinerState { active: 2, ..CombinerState::default() };
+        state.stages[0] = Stage {
+            color_inputs: inputs(input(8, false, 0), input(8, false, 0), 0, 0),
+            color_outputs: outputs(13, 0, 0) | (1 << 13),
+            ..Stage::default()
+        };
+        // The second stage moves that register to the pixel, so a missing
+        // write shows up as black rather than as white.
+        state.stages[1] = Stage {
+            color_inputs: inputs(
+                input(13, false, 0),
+                input(0, false, 1),
+                input(0, false, 0),
+                input(0, false, 0),
+            ),
+            color_outputs: outputs(12, 0, 0),
+            ..Stage::default()
+        };
+        let color = evaluate(&state, &registers()).expect("runs");
+        assert_eq!(color & 0x00FF_FFFF, 0x00FF_FFFF, "the dot reached spare one");
     }
 
     #[test]

@@ -1099,8 +1099,12 @@ const METHOD_SET_TEXTURE_OFFSET: u16 = 0x1B00;
 const METHOD_SET_TEXTURE_FORMAT: u16 = 0x1B04;
 /// Kelvin `SET_TEXTURE_FILTER`: how samples are blended.
 const METHOD_SET_TEXTURE_FILTER: u16 = 0x1B14;
-/// The magnification filter that blends neighbouring texels.
+/// The filter codes that blend neighbouring texels within one level.
+/// The two missing codes, 3 and 5, are mipmapped point sampling: they
+/// choose a level and then take a single texel from it.
 const TEXTURE_FILTER_LINEAR: u32 = 2;
+const TEXTURE_FILTER_LINEAR_MIPMAP_NEAREST: u32 = 4;
+const TEXTURE_FILTER_LINEAR_MIPMAP_LINEAR: u32 = 6;
 
 /// Kelvin `SET_TEXTURE_ADDRESS`: the wrap mode on each axis.
 const METHOD_SET_TEXTURE_ADDRESS: u16 = 0x1B08;
@@ -1949,9 +1953,18 @@ impl PushbufferEngine {
             });
         }
         if drawn > 0 {
-            let entry = self.combiner_census.entry((target.base, census_key)).or_insert((0, 0));
-            entry.0 += drawn;
-            entry.1 += 1;
+            // Both halves of the key are the guest's to choose, so the
+            // census is capped like the method one: a stream that varies
+            // its combiner program per draw would otherwise grow this
+            // until memory ran out.
+            let key = (target.base, census_key);
+            if self.combiner_census.len() < MAX_CENSUS_ENTRIES
+                || self.combiner_census.contains_key(&key)
+            {
+                let entry = self.combiner_census.entry(key).or_insert((0, 0));
+                entry.0 += drawn;
+                entry.1 += 1;
+            }
         }
     }
 
@@ -2008,16 +2021,27 @@ impl PushbufferEngine {
                 let possible = width.max(height).trailing_zeros() + 1;
                 claimed.min(possible)
             },
-            // Either filter asking to blend is enough: this engine does
-            // not select a mip level, so minification and magnification
-            // reach the same sampler.
-            filtered: (texture.filter >> 24) & 0xF >= TEXTURE_FILTER_LINEAR
-                || (texture.filter >> 16) & 0xFF >= TEXTURE_FILTER_LINEAR,
+            // Only the codes that blend WITHIN a level count. The
+            // mipmapped point-sampling codes (3 and 5) say how a level is
+            // chosen, not that its texels are blended, so treating any
+            // code above one as linear softens art a title asked to be
+            // sampled exactly.
+            filtered: matches!((texture.filter >> 24) & 0xF, TEXTURE_FILTER_LINEAR)
+                || matches!(
+                    (texture.filter >> 16) & 0xFF,
+                    TEXTURE_FILTER_LINEAR
+                        | TEXTURE_FILTER_LINEAR_MIPMAP_NEAREST
+                        | TEXTURE_FILTER_LINEAR_MIPMAP_LINEAR
+                ),
             has_alpha: !matches!(
                 texture.color_format(),
                 TEXTURE_FORMAT_LINEAR_X8R8G8B8 | TEXTURE_FORMAT_SWIZZLED_X8R8G8B8
             ),
-            end: base.saturating_add(object.limit).saturating_add(1),
+            // The window ends where the OBJECT ends, not that far past
+            // the texture's own offset inside it: a texture bound at a
+            // high offset would otherwise be allowed to read beyond the
+            // object it was bound to, and a mip chain walks forward.
+            end: object.base.saturating_add(object.limit).saturating_add(1),
         })
     }
 
@@ -2173,7 +2197,14 @@ impl PushbufferEngine {
                 let Some(object) = vertex_dma[context].or(vertex_dma[0]) else {
                     continue;
                 };
-                let start = object.base.wrapping_add(raw_offset & !VERTEX_ARRAY_CONTEXT_B);
+                let offset = raw_offset & !VERTEX_ARRAY_CONTEXT_B;
+                // The offset is the title's to choose, so an array can be
+                // pointed wholly outside the object it is bound to; that
+                // reads another object's memory as geometry.
+                if offset > object.limit {
+                    continue;
+                }
+                let start = object.base.wrapping_add(offset);
                 let base = start.wrapping_add(index.wrapping_mul(stride));
                 // An index the title never meant to send would otherwise
                 // read another object's memory as geometry.
@@ -2182,10 +2213,18 @@ impl PushbufferEngine {
                 }
                 let register = &mut attributes[attribute];
                 match format.kind {
-                    ATTRIBUTE_TYPE_D3DCOLOR | ATTRIBUTE_TYPE_UBYTE_RGBA => {
+                    ATTRIBUTE_TYPE_D3DCOLOR => {
                         let packed = memory.read_dword(base).unwrap_or(0);
                         let channel = |shift: u32| f32::from((packed >> shift) as u8) / 255.0;
                         *register = [channel(16), channel(8), channel(0), channel(24)];
+                    }
+                    // Four unsigned bytes in ascending order, which is a
+                    // different layout from the packed `D3DCOLOR` above:
+                    // reading one as the other swaps red and blue.
+                    ATTRIBUTE_TYPE_UBYTE_RGBA => {
+                        let packed = memory.read_dword(base).unwrap_or(0);
+                        let channel = |shift: u32| f32::from((packed >> shift) as u8) / 255.0;
+                        *register = [channel(0), channel(8), channel(16), channel(24)];
                     }
                     _ => {
                         *register = [0.0, 0.0, 0.0, 1.0];
@@ -3134,6 +3173,39 @@ mod tests {
             ..crate::CombinerRegisters::default()
         };
         assert_eq!(crate::evaluate_combiner(&combiner, &registers), Some(0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn a_vertex_array_pointed_outside_its_object_draws_nothing() {
+        // The array offset is the title's to choose, and an offset past
+        // the object's limit would otherwise read whatever memory sits
+        // there as geometry.
+        let handle = 0x1234_u32;
+        let hash = ramht_hash(handle, 9, 0) % 512;
+        let memory = FakeMemory::new(0x2_0000);
+        memory.write_words(0x8000 + hash * 8, &[handle, 0x100]);
+        // A DMA object covering only 0x100 bytes from 0xC000.
+        memory.write_words(0x8000 + 0x1000, &[0x0000_003D, 0xFF, 0xC000]);
+        let words = [
+            header(1, 0, METHOD_SET_CONTEXT_DMA_VERTEX_A),
+            handle,
+            header(1, 0, METHOD_SET_VERTEX_DATA_ARRAY_FORMAT),
+            0x32,
+            // An offset far past the object's own limit.
+            header(1, 0, METHOD_SET_VERTEX_DATA_ARRAY_OFFSET),
+            0x0001_0000,
+            header(1, 0, METHOD_SET_BEGIN_END),
+            PRIMITIVE_TRIANGLES,
+            header(1, 0, METHOD_ARRAY_ELEMENT32),
+            0,
+            header(1, 0, METHOD_SET_BEGIN_END),
+            0,
+        ];
+        memory.write_words(0x1000, &words);
+        let mut engine = PushbufferEngine::default();
+        engine.submit(&memory, 0, 0x8000, 0, 0x1000, 0x1000 + words.len() as u32 * 4);
+
+        assert_eq!(engine.stats().triangles, 0, "an array outside its object places nothing");
     }
 
     #[test]

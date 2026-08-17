@@ -269,6 +269,34 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+### Fixed
+
+- A guest texture coordinate large enough to saturate the cast made the
+  filtered sampler reach for a neighbouring texel at `i64::MAX`, panicking
+  wherever overflow checks are on and reading an unrelated texel where they
+  are not. Guest data must never panic the emulator, and the same input
+  must not give a different pixel per build profile.
+- A combiner stage's dot product was computed and then discarded instead of
+  written to its destination, so a title shading through one read whatever
+  the register held before. The sum is now suppressed instead, since a dot
+  consumes both inputs.
+- The combiner's primary and secondary colour registers are writable, and
+  the final stage's alpha input carries an invert bit like every other.
+- A texture's read window ran past its DMA object by the texture's own
+  offset inside it, so a texture bound at a high offset could sample beyond
+  the object it was bound to — which a mip chain, walking forward, reaches
+  sooner.
+- A vertex array's offset is checked against its object, so an array
+  pointed outside cannot read another object's memory as geometry.
+- The combiner census is capped like the method census; both halves of its
+  key are guest-chosen, so it could grow until memory ran out.
+- The mipmapped point-sampling filter codes are no longer treated as
+  linear: they choose a level, they do not blend within it.
+- `UBYTE_RGBA` vertex colours are four ascending bytes, not a packed
+  `D3DCOLOR`; reading one as the other swapped red and blue.
+
+### Added
+
 - The interpreter executes x87 (ADR 0018): the register stack with its top
   in the status word, loads and stores across every memory format including
   the 80-bit one, integer loads and stores, the arithmetic and comparison
