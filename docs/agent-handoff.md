@@ -421,12 +421,19 @@ Two active threads:
    `0x1E`). It also placed texgen at `0x03C0`, not the `0x0FD8` guessed
    from another layout.
 
+   **Fixed-function lighting is modelled**, and it was carrying the
+   screen's colour: the title lights its title screen with one infinite
+   light (`SET_LIGHTING_ENABLE` `0x0314`, `SET_LIGHT_ENABLE_MASK` `0x03BC`,
+   the light's own registers from `0x1000` at a `0x80` stride, only light
+   zero programmed), and drawing with an unlit white vertex colour is why
+   every frame before this came out grey. The teal appeared the moment the
+   light's diffuse term reached the vertex.
+
    Still approximate: `specular` reads black because no separate specular
-   attribute is interpolated, mip levels are ignored (the base level is
-   always sampled), and fixed-function **lighting** is not modelled at all
-   though the title programs it (`SET_LIGHT_*` from `0x1000`, ~240,000
-   submissions). Lighting is the largest unmodelled piece of the fixed
-   pipeline and the next thing to measure against the reference frame.
+   attribute is interpolated, local and spot lights are not computed (this
+   title uses neither), mip levels are ignored (the base level is always
+   sampled), and the material's ambient and diffuse tracking is taken from
+   the vertex colour rather than the material registers.
 
    Two techniques earned their keep and are worth reaching for again: the
    cancel pump's RIP sampling (`RUST_LOG=exbawks_core::emulator=trace`,

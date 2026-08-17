@@ -227,6 +227,18 @@ struct VertexState {
     /// Vertex indices received through `ARRAY_ELEMENT` for the current
     /// primitive, when the title draws from arrays in memory instead.
     elements: Vec<u32>,
+    /// Whether the fixed pipeline lights its vertices, and which lights
+    /// are on — two bits per light, of which only the first is modeled.
+    lighting_enable: bool,
+    light_enable_mask: u32,
+    /// The scene's ambient color and the material's own emission.
+    scene_ambient: [f32; 3],
+    material_emission: [f32; 3],
+    /// The first light's ambient and diffuse colors, and the direction it
+    /// shines from, already in eye space.
+    light_ambient: [f32; 3],
+    light_diffuse: [f32; 3],
+    light_direction: [f32; 3],
     /// The model-view matrix, which takes a vertex into eye space.
     model_view: [f32; 16],
     /// The inverse model-view matrix, which takes a normal there.
@@ -331,6 +343,32 @@ fn generated_texcoords(
         return Some([mapped[0] / mapped[3], mapped[1] / mapped[3]]);
     }
     Some([mapped[0], mapped[1]])
+}
+
+/// The color the fixed pipeline's lighting produces for one vertex.
+///
+/// Only the first light, in its infinite form, is computed: it is what
+/// this title turns on, and a scene lit by lights this engine does not
+/// model would otherwise be lit by nothing at all. The result modulates
+/// the vertex's own color, which is how the hardware tracks a material
+/// against a mesh that carries one.
+fn lit_color(state: &VertexState, normal: [f32; 4], material: [f32; 4]) -> [f32; 4] {
+    let mut color: [f32; 3] =
+        std::array::from_fn(|axis| state.material_emission[axis] + state.scene_ambient[axis]);
+    if state.light_enable_mask & 0x3 == LIGHT_INFINITE {
+        let transformed =
+            transform([normal[0], normal[1], normal[2], 0.0], &state.inverse_model_view);
+        let facing = normalize([transformed[0], transformed[1], transformed[2]]);
+        let towards = normalize(state.light_direction);
+        // A surface turned away from the light takes none of it.
+        let lambert = facing[0]
+            .mul_add(towards[0], facing[1].mul_add(towards[1], facing[2] * towards[2]))
+            .max(0.0);
+        for (axis, channel) in color.iter_mut().enumerate() {
+            *channel += state.light_ambient[axis] + state.light_diffuse[axis] * lambert;
+        }
+    }
+    [color[0] * material[0], color[1] * material[1], color[2] * material[2], material[3]]
 }
 
 /// A mesh need not carry every attribute, and the ones it leaves out are
@@ -881,6 +919,33 @@ const METHOD_SET_DEPTH_FUNC: u16 = 0x0354;
 const METHOD_SET_DEPTH_MASK: u16 = 0x035C;
 /// Kelvin `SET_SURFACE_ZETA_OFFSET`.
 const METHOD_SET_SURFACE_ZETA_OFFSET: u16 = 0x0214;
+/// Kelvin `SET_LIGHTING_ENABLE`.
+const METHOD_SET_LIGHTING_ENABLE: u16 = 0x0314;
+/// Kelvin `SET_MATERIAL_EMISSION`, three floats.
+const METHOD_SET_MATERIAL_EMISSION: u16 = 0x03A8;
+/// Kelvin `SET_LIGHT_ENABLE_MASK`: two bits per light, eight lights.
+const METHOD_SET_LIGHT_ENABLE_MASK: u16 = 0x03BC;
+/// Kelvin `SET_SCENE_AMBIENT_COLOR`, three floats.
+const METHOD_SET_SCENE_AMBIENT_COLOR: u16 = 0x0A10;
+/// Kelvin `SET_LIGHT_AMBIENT_COLOR` for the first light, three floats.
+const METHOD_SET_LIGHT_AMBIENT_COLOR: u16 = 0x1000;
+/// Kelvin `SET_LIGHT_DIFFUSE_COLOR` for the first light.
+const METHOD_SET_LIGHT_DIFFUSE_COLOR: u16 = 0x100C;
+/// Kelvin `SET_LIGHT_INFINITE_DIRECTION` for the first light.
+const METHOD_SET_LIGHT_INFINITE_DIRECTION: u16 = 0x1034;
+/// The last method of that three-float block.
+const METHOD_SET_MATERIAL_EMISSION_LAST: u16 = METHOD_SET_MATERIAL_EMISSION + 8;
+/// The last method of that three-float block.
+const METHOD_SET_SCENE_AMBIENT_COLOR_LAST: u16 = METHOD_SET_SCENE_AMBIENT_COLOR + 8;
+/// The last method of that three-float block.
+const METHOD_SET_LIGHT_AMBIENT_COLOR_LAST: u16 = METHOD_SET_LIGHT_AMBIENT_COLOR + 8;
+/// The last method of that three-float block.
+const METHOD_SET_LIGHT_DIFFUSE_COLOR_LAST: u16 = METHOD_SET_LIGHT_DIFFUSE_COLOR + 8;
+/// The last method of that three-float block.
+const METHOD_SET_LIGHT_INFINITE_DIRECTION_LAST: u16 = METHOD_SET_LIGHT_INFINITE_DIRECTION + 8;
+/// The enable-mask code for a light that shines from infinitely far away.
+const LIGHT_INFINITE: u32 = 1;
+
 /// Kelvin `SET_MODEL_VIEW_MATRIX`, which takes a vertex to eye space.
 const METHOD_SET_MODEL_VIEW_MATRIX: u16 = 0x0480;
 /// Its last method.
@@ -1391,6 +1456,32 @@ impl PushbufferEngine {
                 // shared, which this engine reads per stage regardless.
                 state.combiner.active = ((argument & 0xFF) as usize).min(crate::COMBINER_STAGES);
             }
+            METHOD_SET_LIGHTING_ENABLE => {
+                state.vertex.lighting_enable = argument != 0;
+            }
+            METHOD_SET_LIGHT_ENABLE_MASK => {
+                state.vertex.light_enable_mask = argument;
+            }
+            METHOD_SET_MATERIAL_EMISSION..=METHOD_SET_MATERIAL_EMISSION_LAST => {
+                let lane = usize::from((method - METHOD_SET_MATERIAL_EMISSION) / 4);
+                state.vertex.material_emission[lane] = f32::from_bits(argument);
+            }
+            METHOD_SET_SCENE_AMBIENT_COLOR..=METHOD_SET_SCENE_AMBIENT_COLOR_LAST => {
+                let lane = usize::from((method - METHOD_SET_SCENE_AMBIENT_COLOR) / 4);
+                state.vertex.scene_ambient[lane] = f32::from_bits(argument);
+            }
+            METHOD_SET_LIGHT_AMBIENT_COLOR..=METHOD_SET_LIGHT_AMBIENT_COLOR_LAST => {
+                let lane = usize::from((method - METHOD_SET_LIGHT_AMBIENT_COLOR) / 4);
+                state.vertex.light_ambient[lane] = f32::from_bits(argument);
+            }
+            METHOD_SET_LIGHT_DIFFUSE_COLOR..=METHOD_SET_LIGHT_DIFFUSE_COLOR_LAST => {
+                let lane = usize::from((method - METHOD_SET_LIGHT_DIFFUSE_COLOR) / 4);
+                state.vertex.light_diffuse[lane] = f32::from_bits(argument);
+            }
+            METHOD_SET_LIGHT_INFINITE_DIRECTION..=METHOD_SET_LIGHT_INFINITE_DIRECTION_LAST => {
+                let lane = usize::from((method - METHOD_SET_LIGHT_INFINITE_DIRECTION) / 4);
+                state.vertex.light_direction[lane] = f32::from_bits(argument);
+            }
             METHOD_SET_MODEL_VIEW_MATRIX..=MODEL_VIEW_MATRIX_LAST => {
                 let index = usize::from((method - METHOD_SET_MODEL_VIEW_MATRIX) / 4);
                 state.vertex.model_view[index] = f32::from_bits(argument);
@@ -1872,7 +1963,13 @@ impl PushbufferEngine {
                 let texcoord = attributes[ATTRIBUTE_TEXCOORD0 + unit];
                 [texcoord[0], texcoord[1]]
             });
-            (clip, attributes[ATTRIBUTE_DIFFUSE], texcoords)
+            let material = attributes[ATTRIBUTE_DIFFUSE];
+            let diffuse = if state.lighting_enable {
+                lit_color(state, attributes[ATTRIBUTE_NORMAL], material)
+            } else {
+                material
+            };
+            (clip, diffuse, texcoords)
         };
 
         let [x, y, z, w] = position;
@@ -2890,6 +2987,42 @@ mod tests {
             ..crate::CombinerRegisters::default()
         };
         assert_eq!(crate::evaluate_combiner(&combiner, &registers), Some(0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn an_infinite_light_shades_a_vertex_by_its_facing() {
+        let identity = {
+            let mut matrix = [0.0_f32; 16];
+            for lane in 0..4 {
+                matrix[lane * 4 + lane] = 1.0;
+            }
+            matrix
+        };
+        let state = VertexState {
+            inverse_model_view: identity,
+            lighting_enable: true,
+            light_enable_mask: LIGHT_INFINITE,
+            scene_ambient: [0.1, 0.1, 0.1],
+            light_diffuse: [0.0, 0.8, 0.8],
+            light_direction: [0.0, 0.0, 1.0],
+            ..VertexState::default()
+        };
+        let white = [1.0, 1.0, 1.0, 1.0];
+
+        // Facing the light takes all of it, and the light's own color is
+        // what puts the scene's tint on a white material.
+        let facing = lit_color(&state, [0.0, 0.0, 1.0, 0.0], white);
+        assert!((facing[1] - 0.9).abs() < 1e-5, "ambient plus full diffuse: {facing:?}");
+        assert!((facing[0] - 0.1).abs() < 1e-5, "the light has no red to give");
+
+        // Turned away, only the ambient term survives.
+        let away = lit_color(&state, [0.0, 0.0, -1.0, 0.0], white);
+        assert!((away[1] - 0.1).abs() < 1e-5, "a surface facing away is ambient only");
+
+        // The material still modulates the result, and carries the alpha.
+        let dark = lit_color(&state, [0.0, 0.0, 1.0, 0.0], [1.0, 0.5, 1.0, 0.25]);
+        assert!((dark[1] - 0.45).abs() < 1e-5, "half the material takes half the light");
+        assert_eq!(dark[3], 0.25, "alpha comes from the material");
     }
 
     #[test]

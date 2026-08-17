@@ -269,6 +269,13 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- Fixed-function vertex lighting: emission, scene ambient, and one
+  infinite light's ambient and diffuse terms, modulated by the vertex's
+  own color. Dino Crisis 3 lights its title screen with a single
+  directional light and had been drawing with an unlit white vertex color,
+  which is where the scene's colour was going missing — the light carries
+  the teal the screen is tinted with.
+
 - Reflection-map texture coordinate generation, with the per-unit texture
   matrix that maps it into the image. Dino Crisis 3's title screen reflects
   an environment map off its geometry: it programs `SET_TEXGEN` mode
