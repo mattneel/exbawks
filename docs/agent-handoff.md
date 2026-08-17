@@ -292,9 +292,11 @@ Two active threads:
    texture — the retail title's atlas comes out as its own title screen,
    logo and menu text intact, which is how the decode was proven.
 
-   A capture picks its frame by looking at the display-sized surfaces the
-   engine drew into and taking the one carrying picture; which buffer is on
-   screen otherwise depends on where the title sits in its rotation.
+   A capture picks its frame by looking rather than guessing: every frame
+   the title finishes is scored by how much it varies, and the best is kept.
+   A fade passes through flat black and flat white, so brightness is the
+   wrong measure and contrast is the right one — with it,
+   `exbawks run --screenshot` on the retail image produces the title logo.
 
    **What is left before a golden screenshot means anything:** the title
    still transforms most geometry with a vertex program this engine has no

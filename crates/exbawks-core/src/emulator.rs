@@ -244,6 +244,7 @@ impl EmulatorBuilder {
             devices: crate::mmio::DeviceSpace::default(),
             gpu_pusher: exbawks_gpu::PushbufferEngine::default(),
             gdt_fs_base: std::cell::Cell::new(u32::MAX),
+            brightest_frame: None,
             pending_persist_reservations: Vec::new(),
             last_relaunch_data: None,
         })
@@ -281,6 +282,12 @@ pub struct Emulator {
     /// The `fs` base the descriptor table currently carries, so the table
     /// is rewritten on a thread switch rather than on every exit.
     gdt_fs_base: std::cell::Cell<u32>,
+    /// The brightest finished frame the run has produced, and its score.
+    ///
+    /// A title fades its title screen in and out, so the frame that happens
+    /// to be current when a run stops is often nearly black; the brightest
+    /// one is the picture worth keeping.
+    brightest_frame: Option<(CapturedFrame, u64)>,
     /// Physical ranges (base, len) the next `load_xbe` must keep the
     /// allocator away from: soft-reboot persisted regions live at fixed
     /// window addresses, so their physical pages are reserved before the
@@ -1007,7 +1014,51 @@ impl Emulator {
     /// the SDTV modes use are decoded; anything else reports its format so
     /// the caller can say why no image came back.
     pub fn capture_frame(&self) -> Result<CapturedFrame, CaptureError> {
+        // The brightest finished frame beats whatever is current: a title
+        // fades, and the moment a run stops is rarely the moment worth
+        // keeping.
+        if let Some((frame, _)) = &self.brightest_frame {
+            return Ok(frame.clone());
+        }
         self.capture_surface(None)
+    }
+
+    /// Keeps a finished frame when it is brighter than the best so far.
+    fn record_completed_frame(&mut self) {
+        let Some((base, pitch, width, height)) = self.gpu_pusher.take_completed_frame() else {
+            return;
+        };
+        // Score by how much the frame varies, not by how bright it is: a
+        // fade passes through flat white and flat black, and neither is the
+        // picture. Contrast is what a frame with art in it has.
+        let mut samples = Vec::new();
+        for row in (0..height).step_by(8) {
+            for column in (0..width).step_by(8) {
+                let at = KERNEL_WINDOW_BASE | base.wrapping_add(row * pitch + column * 4);
+                if let Ok(value) = self.memory.read_u32(GuestVa(at)) {
+                    let red = i64::from((value >> 16) & 0xFF);
+                    let green = i64::from((value >> 8) & 0xFF);
+                    let blue = i64::from(value & 0xFF);
+                    samples.push(red + green + blue);
+                }
+            }
+        }
+        if samples.is_empty() {
+            return;
+        }
+        let mean = samples.iter().sum::<i64>() / samples.len() as i64;
+        let score = samples.iter().map(|value| (value - mean).unsigned_abs()).sum::<u64>();
+        if self.brightest_frame.as_ref().is_some_and(|(_, best)| *best >= score) {
+            return;
+        }
+        if let Ok(frame) = self.capture_surface(Some((base, pitch, width, height))) {
+            tracing::debug!(
+                frame = format_args!("{base:#010x}"),
+                score,
+                "keeping a brighter finished frame"
+            );
+            self.brightest_frame = Some((frame, score));
+        }
     }
 
     /// Chooses the display-sized surface that holds a finished frame.
@@ -1045,10 +1096,13 @@ impl Emulator {
     /// display geometry. A frame that lands somewhere unexpected is easier
     /// to find by looking than by reasoning about buffer rotation.
     pub fn capture_surface_at(&self, physical: u32) -> Result<CapturedFrame, CaptureError> {
-        self.capture_surface(Some(physical))
+        self.capture_surface(Some((physical, 2560, 640, 480)))
     }
 
-    fn capture_surface(&self, forced: Option<u32>) -> Result<CapturedFrame, CaptureError> {
+    fn capture_surface(
+        &self,
+        forced: Option<(u32, u32, u32, u32)>,
+    ) -> Result<CapturedFrame, CaptureError> {
         /// `D3DFMT_LIN_A8R8G8B8`, the format every SDTV mode scans out.
         const LINEAR_A8R8G8B8: u32 = 0x12;
         /// `D3DFMT_LIN_X8R8G8B8`: the same bytes with the alpha ignored.
@@ -1059,9 +1113,7 @@ impl Emulator {
         // The surface the graphics engine drew into last is the frame the
         // title just finished; its own buffer flip is not modeled, so the
         // encoder's programmed address can name an older buffer.
-        let drawn = forced
-            .map(|base| (base, 2560, 640, 480))
-            .or_else(|| self.presented_surface_by_content());
+        let drawn = forced.or_else(|| self.presented_surface_by_content());
         let (frame_buffer, pitch, width, height) = match drawn {
             Some((base, pitch, width, height)) if pitch % 4 == 0 && pitch != 0 => {
                 (base, pitch, width.min(pitch / 4), height)
@@ -1805,6 +1857,7 @@ impl Emulator {
         let view = WindowMemory(&memory);
         for (channel, get, put) in submissions {
             let end = self.gpu_pusher.submit(&view, channel, pramin, ramht_raw, get, put);
+            self.record_completed_frame();
             let stats = self.gpu_pusher.stats();
             tracing::debug!(
                 channel = format_args!("{channel:#010x}"),

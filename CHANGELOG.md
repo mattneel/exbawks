@@ -260,6 +260,12 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- A capture keeps the most legible frame a run produced rather than
+  whichever was current when it stopped. Each time the title finishes a
+  frame — it starts drawing into the other buffer — the frame is scored by
+  how much it varies, and the best is kept: a fade passes through flat black
+  and flat white, and neither is the picture.
+
 - GPU-M3: texture sampling and blending — **the retail title's screen now
   renders**. The engine follows the first texture unit's state (offset,
   format, pitch, image rectangle, and the context DMA its offset is

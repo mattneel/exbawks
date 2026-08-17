@@ -355,6 +355,9 @@ pub struct PushbufferEngine {
     /// buffering that is the finished frame: the title is busy drawing the
     /// next one over the buffer it just presented.
     previous_draw: Option<(u32, u32, u32, u32)>,
+    /// A frame finished since the last time a caller asked: the title
+    /// moved on to another surface, so this one is complete.
+    completed_frame: Option<(u32, u32, u32, u32)>,
     stats: PusherStats,
 }
 
@@ -889,7 +892,9 @@ impl PushbufferEngine {
             // the picture.
             let (pitch, width, height) = self.last_draw_geometry;
             if pitch != 0 && width >= PRESENTABLE_WIDTH {
-                self.previous_draw = Some((self.last_draw_target, pitch, width, height));
+                let finished = (self.last_draw_target, pitch, width, height);
+                self.previous_draw = Some(finished);
+                self.completed_frame = Some(finished);
             }
             self.last_draw_target = target.base;
             tracing::debug!(
@@ -1198,6 +1203,14 @@ impl PushbufferEngine {
     #[must_use]
     pub fn presented_target(&self) -> Option<(u32, u32, u32, u32)> {
         self.presentable_targets().into_iter().next()
+    }
+
+    /// Takes the frame finished since this was last called.
+    ///
+    /// A frame is finished when the title starts drawing into a different
+    /// display-sized surface: whatever it had been drawing is now whole.
+    pub fn take_completed_frame(&mut self) -> Option<(u32, u32, u32, u32)> {
+        self.completed_frame.take()
     }
 
     /// Every display-sized surface the engine has drawn into, the most
