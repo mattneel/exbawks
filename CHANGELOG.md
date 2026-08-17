@@ -269,6 +269,12 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- The texture addressing mode a title programs (`SET_TEXTURE_ADDRESS`) is
+  obeyed: wrap, mirror, or clamp per axis. Every sample had been clamped,
+  so a texture the title meant to tile held one edge texel across
+  everything past its first tile — which is what turned this title's
+  scene geometry into broad flat bands instead of detailed surfaces.
+
 - Geometry at or behind the eye is dropped instead of drawn. A vertex with
   a non-positive `w` divides through to the far side of the screen and
   drags a wedge of geometry across the frame; 24,942 triangles per run of

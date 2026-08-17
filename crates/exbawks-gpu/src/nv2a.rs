@@ -105,6 +105,8 @@ struct TextureState {
     rect: (u32, u32),
     /// Whether the unit is enabled by its control word.
     enabled: bool,
+    /// The addressing word: the wrap mode per axis, four bits each.
+    address: u32,
 }
 
 impl SurfaceState {
@@ -506,6 +508,9 @@ struct MemoryTexture<'a> {
     width: u32,
     height: u32,
     layout: TextureLayout,
+    /// How coordinates outside the texture are brought back inside, per
+    /// axis, as the title programmed them.
+    addressing: [u32; 2],
     /// Whether the format's alpha channel is meaningful.
     has_alpha: bool,
     /// One past the last byte the texture's own object covers. A sample
@@ -568,6 +573,10 @@ impl MemoryTexture<'_> {
 }
 
 impl crate::TextureSource for MemoryTexture<'_> {
+    fn addressing(&self) -> [u32; 2] {
+        self.addressing
+    }
+
     fn texel(&self, x: u32, y: u32) -> u32 {
         use crate::texture::{DXT_ALPHA_BLOCK_BYTES, DXT1_BLOCK_BYTES};
 
@@ -1001,6 +1010,9 @@ const METHOD_SET_TEXTURE_END: u16 = 0x1B00 + TEXTURE_UNIT_STRIDE * TEXTURE_UNITS
 const METHOD_SET_TEXTURE_OFFSET: u16 = 0x1B00;
 /// Kelvin `SET_TEXTURE_FORMAT` for unit zero.
 const METHOD_SET_TEXTURE_FORMAT: u16 = 0x1B04;
+/// Kelvin `SET_TEXTURE_ADDRESS`: the wrap mode on each axis.
+const METHOD_SET_TEXTURE_ADDRESS: u16 = 0x1B08;
+
 /// Kelvin `SET_TEXTURE_CONTROL0` for unit zero: the enable bit lives here.
 const METHOD_SET_TEXTURE_CONTROL0: u16 = 0x1B0C;
 /// Kelvin `SET_TEXTURE_CONTROL1` for unit zero: the row pitch, in the high
@@ -1547,6 +1559,7 @@ impl PushbufferEngine {
                 match METHOD_SET_TEXTURE_OFFSET + within {
                     METHOD_SET_TEXTURE_OFFSET => texture.offset = argument,
                     METHOD_SET_TEXTURE_FORMAT => texture.format = argument,
+                    METHOD_SET_TEXTURE_ADDRESS => texture.address = argument,
                     METHOD_SET_TEXTURE_CONTROL0 => {
                         texture.enabled = argument & TEXTURE_ENABLE != 0;
                     }
@@ -1888,6 +1901,7 @@ impl PushbufferEngine {
             width,
             height,
             layout,
+            addressing: [texture.address & 0xF, (texture.address >> 8) & 0xF],
             has_alpha: !matches!(
                 texture.color_format(),
                 TEXTURE_FORMAT_LINEAR_X8R8G8B8 | TEXTURE_FORMAT_SWIZZLED_X8R8G8B8

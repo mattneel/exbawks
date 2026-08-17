@@ -33,7 +33,7 @@ pub struct ScreenVertex {
 pub trait TextureSource {
     /// The texel at integer coordinates, as 8-bit ARGB.
     ///
-    /// Coordinates are already clamped to the texture's extent.
+    /// Coordinates are already brought inside the texture's extent.
     fn texel(&self, x: u32, y: u32) -> u32;
 
     /// The texture's width in texels.
@@ -41,6 +41,41 @@ pub trait TextureSource {
 
     /// The texture's height in texels.
     fn height(&self) -> u32;
+
+    /// How coordinates outside the texture are brought back inside, on
+    /// each axis. Clamping is the default because it is what a sampler
+    /// with nothing programmed does.
+    fn addressing(&self) -> [u32; 2] {
+        [ADDRESS_CLAMP_TO_EDGE; 2]
+    }
+}
+
+/// Repeat the texture, dropping the whole part of the coordinate.
+pub const ADDRESS_WRAP: u32 = 1;
+/// Repeat it, reversing direction on every other tile.
+pub const ADDRESS_MIRROR: u32 = 2;
+/// Hold the edge texel for anything outside.
+pub const ADDRESS_CLAMP_TO_EDGE: u32 = 3;
+
+/// Brings one texel coordinate inside `extent` by the programmed mode.
+///
+/// A title that asks to repeat a texture and gets clamping instead sees
+/// the edge texel smeared across everything past the first tile, which
+/// reads as a broad flat band rather than as a pattern.
+fn address_texel(mode: u32, texel: i64, extent: u32) -> u32 {
+    let span = i64::from(extent);
+    if span <= 0 {
+        return 0;
+    }
+    match mode {
+        ADDRESS_WRAP => texel.rem_euclid(span) as u32,
+        ADDRESS_MIRROR => {
+            let period = texel.rem_euclid(span * 2);
+            let mirrored = if period < span { period } else { span * 2 - 1 - period };
+            mirrored as u32
+        }
+        _ => texel.clamp(0, span - 1) as u32,
+    }
 }
 
 /// Splits an 8-bit ARGB color into the combiner's float channels.
@@ -403,11 +438,14 @@ pub fn fill_triangle(
                         + weights[2] * c.texcoords[unit][axis] * c.inverse_w)
                         * scale
                 };
-                let texel_x = (coordinate(0) * texture.width() as f32) as i64;
-                let texel_y = (coordinate(1) * texture.height() as f32) as i64;
+                // The floor, not a truncation: a negative coordinate must
+                // land in the tile below zero, not back in the first one.
+                let texel_x = (coordinate(0) * texture.width() as f32).floor() as i64;
+                let texel_y = (coordinate(1) * texture.height() as f32).floor() as i64;
+                let [mode_u, mode_v] = texture.addressing();
                 *sampled = Some(texture.texel(
-                    texel_x.clamp(0, i64::from(texture.width().saturating_sub(1))) as u32,
-                    texel_y.clamp(0, i64::from(texture.height().saturating_sub(1))) as u32,
+                    address_texel(mode_u, texel_x, texture.width()),
+                    address_texel(mode_v, texel_y, texture.height()),
                 ));
             }
             // Without a combiner program the first unit modulates the
@@ -670,6 +708,29 @@ mod tests {
             "the green corner stays green"
         );
         assert!(colors.iter().all(|color| color >> 24 == 0xFF), "alpha carries through");
+    }
+
+    #[test]
+    fn addressing_brings_a_coordinate_back_inside_the_texture() {
+        // Wrapping repeats, which is what a title asking to tile a texture
+        // expects; clamping it instead holds one edge texel across
+        // everything past the first tile.
+        assert_eq!(address_texel(ADDRESS_WRAP, 0, 4), 0);
+        assert_eq!(address_texel(ADDRESS_WRAP, 5, 4), 1, "past the end starts over");
+        assert_eq!(address_texel(ADDRESS_WRAP, -1, 4), 3, "and below zero comes from the end");
+
+        // Mirroring reverses on every other tile.
+        assert_eq!(address_texel(ADDRESS_MIRROR, 3, 4), 3);
+        assert_eq!(address_texel(ADDRESS_MIRROR, 4, 4), 3, "the next tile runs backwards");
+        assert_eq!(address_texel(ADDRESS_MIRROR, 7, 4), 0);
+        assert_eq!(address_texel(ADDRESS_MIRROR, 8, 4), 0, "and the one after that forwards");
+
+        // Clamping holds the edge, and is what an unprogrammed sampler does.
+        assert_eq!(address_texel(ADDRESS_CLAMP_TO_EDGE, 9, 4), 3);
+        assert_eq!(address_texel(ADDRESS_CLAMP_TO_EDGE, -9, 4), 0);
+
+        // A texture with no extent cannot be indexed at all.
+        assert_eq!(address_texel(ADDRESS_WRAP, 3, 0), 0);
     }
 
     #[test]
