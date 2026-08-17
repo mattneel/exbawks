@@ -260,6 +260,15 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- Golden frames: `exbawks run --frame-digest` prints a captured frame's
+  digest and `--expect-frame <digest>` fails the run when it differs, which
+  turns a screenshot into a regression test. The digest covers the frame's
+  shape as well as its pixels, and repeats exactly across runs of the same
+  image — a title's frame came back byte-identical on consecutive runs, so
+  the emulation is deterministic enough for the comparison to mean
+  something. A title cannot be committed, so its digest belongs beside the
+  private image in `fixtures/private/`, never in a test the repository runs.
+
 - Depth testing and perspective-correct texturing. Fragments compare against
   the depth surface by the title's chosen function and update it when its
   depth mask allows, and `CLEAR_SURFACE` clears depth as well as color —

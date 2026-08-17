@@ -119,6 +119,12 @@ enum Command {
         /// Prints the transform program's instruction words.
         #[arg(long)]
         gpu_program: bool,
+        /// Prints the captured frame's digest, for recording a golden.
+        #[arg(long)]
+        frame_digest: bool,
+        /// Fails the run when the captured frame's digest differs.
+        #[arg(long, value_name = "DIGEST")]
+        expect_frame: Option<String>,
     },
     /// Reports the implementation burndown across emulator surfaces.
     Coverage {
@@ -241,6 +247,8 @@ fn main() -> Result<()> {
             dump_texture,
             screenshot_address,
             gpu_program,
+            frame_digest,
+            expect_frame,
         } => {
             let tracing = TraceOptions {
                 path: trace.as_deref(),
@@ -260,6 +268,8 @@ fn main() -> Result<()> {
                     dump_texture: dump_texture.as_deref(),
                     screenshot_address,
                     gpu_program,
+                    frame_digest,
+                    expect_frame: expect_frame.as_deref(),
                     json: cli.json,
                 },
             )
@@ -573,6 +583,10 @@ struct RunOptions<'a> {
     screenshot_address: Option<u32>,
     /// Whether to print the transform program's instruction words.
     gpu_program: bool,
+    /// Whether to print the captured frame's digest.
+    frame_digest: bool,
+    /// The digest the captured frame must match, when one is expected.
+    expect_frame: Option<&'a str>,
     /// Whether the report prints as JSON.
     json: bool,
 }
@@ -588,6 +602,8 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
         dump_texture,
         screenshot_address,
         gpu_program,
+        frame_digest,
+        expect_frame,
         json,
     } = *options;
     let bytes = read_file(path)?;
@@ -761,6 +777,21 @@ Graphics methods (object, method, submissions):"
                 Ok(value) => println!("Peek [{}]: 0x{value:08X}", GuestVa(address)),
                 Err(_) => println!("Peek [{}]: <unmapped>", GuestVa(address)),
             }
+        }
+    }
+
+    if frame_digest || expect_frame.is_some() {
+        let frame = match screenshot_address {
+            Some(address) => emulator.capture_surface_at(address),
+            None => emulator.capture_frame(),
+        }
+        .map_err(|error| anyhow!("no frame to digest: {error}"))?;
+        let digest = exbawks_debug::frame_digest(frame.width, frame.height, &frame.pixels);
+        println!("Frame digest: {digest}");
+        if let Some(expected) = expect_frame
+            && expected != digest
+        {
+            bail!("the frame digest is {digest}, and {expected} was expected");
         }
     }
 

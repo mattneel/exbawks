@@ -338,6 +338,13 @@ Two active threads:
    but a twentieth are rejected. Texture coordinates interpolate in the
    plane of the triangle rather than across the screen.
 
+   **Goldens work.** `exbawks run --frame-digest` prints a captured frame's
+   digest and `--expect-frame <digest>` fails the run when it differs. The
+   retail title's frame digests identically on consecutive runs, so the
+   emulation is deterministic enough for the comparison to mean something.
+   A title cannot be committed, so its digest belongs beside the private
+   image under `fixtures/private/`, never in a test this repository runs.
+
    After that: the pixel combiner, which this engine still approximates as
    texture times vertex color.
 
