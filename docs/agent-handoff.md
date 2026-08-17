@@ -362,10 +362,34 @@ Two active threads:
    frame the run keeps is unchanged, so whatever fails happens after the
    part that renders.
 
-   After that: the pixel combiner, which this engine still approximates as
+   The blend factors, face culling, and alpha test a title programs are now
+   obeyed rather than assumed — worth knowing why that mattered: **half this
+   title's blended draws ask for a destination factor of `ONE`**, the
+   additive passes that add light, and rendering them as source-alpha
+   darkened exactly what should glow. Culling removed about a fifth of the
+   shading work. Neither changed the captured frame, because the frame the
+   capture keeps is 2D interface art drawn with a plain over-blend; both
+   change the scene, which sits under the title's own fade.
+
+   **`exbawks run --watch-write <address>`** reports every guest instruction
+   that writes an address, by mapping its page read-only and stepping the
+   writes. It named eighty-seven writers of a Direct3D device page in one
+   run. Its reach is bounded by what the interpreter can step, and that
+   bound is now the thing worth lifting: the write this was built to catch
+   is an `fstp`, and only the x87 control subset is modelled. Extending the
+   interpreter's x87 and SSE data instructions widens this tool, the MMIO
+   step path, and the oracle tier at once.
+
+   **The wall a long run hits:** Direct3D faults at `0x1CE0FC` reading
+   `[device+0x1A04]`, which is null — `cmp ebx,[edx+4]` with `edx` zero,
+   called from `0x1CB220`. Nothing in the D3D section writes that field with
+   an immediate displacement, so it is reached through a pointer; the
+   watchpoint is the right instrument once it can step x87.
+
+   Still ahead: the pixel combiner, which this engine approximates as
    texture times vertex color. The title programs all eight stages
    (`0x0260`/`0x0AC0` input words, `0x0A60` factors, `0x1E60` control,
-   ~192,000 updates each), so this is the last large piece of shading
+   ~192,000 updates each), so it is the last large piece of shading
    fidelity outstanding.
 
    Two techniques earned their keep and are worth reaching for again: the

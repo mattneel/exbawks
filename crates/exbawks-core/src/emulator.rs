@@ -251,6 +251,7 @@ impl EmulatorBuilder {
             devices: crate::mmio::DeviceSpace::default(),
             gpu_pusher: exbawks_gpu::PushbufferEngine::default(),
             gdt_fs_base: std::cell::Cell::new(u32::MAX),
+            watch_write: None,
             brightest_frame: None,
             pending_persist_reservations: Vec::new(),
             last_relaunch_data: None,
@@ -289,6 +290,12 @@ pub struct Emulator {
     /// The `fs` base the descriptor table currently carries, so the table
     /// is rewritten on a thread switch rather than on every exit.
     gdt_fs_base: std::cell::Cell<u32>,
+    /// A guest address whose writers should be reported.
+    ///
+    /// The page holding it is mapped read-only, so every write to it leaves
+    /// the processor and is stepped on the interpreter — which is what turns
+    /// "who sets this field?" from an afternoon of disassembly into a run.
+    watch_write: Option<u32>,
     /// The brightest finished frame the run has produced, and its score.
     ///
     /// A title fades its title screen in and out, so the frame that happens
@@ -1007,6 +1014,18 @@ impl Emulator {
         Some(CapturedFrame { width, height, pixels, frame_buffer: 0 })
     }
 
+    /// Reports every write to `address` at trace level, with the guest
+    /// instruction that made it.
+    pub fn watch_writes(&mut self, address: GuestVa) {
+        self.watch_write = Some(address.0);
+    }
+
+    /// Whether a guest physical address shares a page with the watchpoint.
+    fn watches(&self, physical: u32) -> bool {
+        self.watch_write
+            .is_some_and(|address| address / GUEST_PAGE_SIZE == physical / GUEST_PAGE_SIZE)
+    }
+
     /// The transform program a channel uploaded, from its start slot.
     #[must_use]
     pub fn gpu_transform_program(&self) -> Vec<[u32; 4]> {
@@ -1472,10 +1491,23 @@ impl Emulator {
                     // instruction on the interpreter over the device view,
                     // so the access's own semantics come from the oracle
                     // rather than a hand decoder (WHP-M2).
-                    if access.access_type != 2 && self.devices.routes(gpa) {
+                    if access.access_type != 2 && (self.devices.routes(gpa) || self.watches(gpa)) {
                         self.whp_read_cpu(&mut machine)?;
                         let memory = self.memory.clone();
                         let view = crate::mmio::MmioView::new(&memory, &self.devices);
+                        if let Some(address) = self.watch_write
+                            && self.watches(gpa)
+                        {
+                            // Reported before the step, so the writer is
+                            // named even when the interpreter cannot carry
+                            // its instruction out.
+                            tracing::info!(
+                                watched = format_args!("{address:#010x}"),
+                                touched = format_args!("{gpa:#010x}"),
+                                rip = format_args!("{:#010x}", self.cpu.eip),
+                                "guest writes a watched page"
+                            );
+                        }
                         match exbawks_cpu::step(&mut self.cpu, &view) {
                             Ok(()) => {
                                 // A device write may have just identified a
@@ -1757,21 +1789,37 @@ impl Emulator {
             let run_va = page as u64;
             let run_pa = u64::from(descriptor.physical_page().0);
             let permissions = descriptor.permissions();
+            let watched_page = self.watch_write.map(|address| u64::from(address / GUEST_PAGE_SIZE));
             let mut length = 1_u64;
             while page + (length as usize) < GUEST_PAGE_COUNT {
                 let next = table.get(GuestPage((run_va + length) as u32));
                 if next.kind() != PageKind::Ram
                     || u64::from(next.physical_page().0) != run_pa + length
                     || next.permissions() != permissions
+                    // A watched page is mapped by itself, with its own
+                    // permissions, so the run stops before it.
+                    || watched_page == Some(run_va + length)
                 {
                     break;
                 }
                 length += 1;
             }
+            if watched_page == Some(run_va) {
+                length = 1;
+            }
 
             let mut flags = 1_u32; // Mapped pages are always readable.
             if permissions.contains(MemoryPermissions::WRITE) {
                 flags |= 2;
+            }
+            // The watched page alone is mapped read-only, so writes to it
+            // exit and can be reported. Only that page: the run it sits in
+            // can be thousands of pages the guest writes legitimately.
+            if self
+                .watch_write
+                .is_some_and(|address| u64::from(address / GUEST_PAGE_SIZE) == run_va)
+            {
+                flags &= !2;
             }
             if permissions.contains(MemoryPermissions::EXECUTE) {
                 flags |= 4;

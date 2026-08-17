@@ -260,6 +260,13 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- `exbawks run --watch-write <address>` reports every guest instruction that
+  writes a chosen address. The page holding it is mapped read-only, so each
+  write leaves the processor and is stepped on the interpreter, which turns
+  "what sets this field?" from an afternoon of disassembly into a run. Its
+  reach is bounded by what the interpreter can step: a title's `fstp` to a
+  watched page ends the run, since only the x87 control subset is modelled.
+
 - The blend factors, face culling, and the alpha test a title programs are
   now obeyed rather than assumed. Half of this title's blended draws ask for
   a destination factor of `ONE` — the additive passes that add light — and

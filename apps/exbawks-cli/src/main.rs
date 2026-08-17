@@ -80,52 +80,7 @@ enum Command {
         check_registry: bool,
     },
     /// Loads and executes one XBE until a controlled stop reason.
-    Run {
-        /// The XBE file path.
-        path: PathBuf,
-        /// The emulated physical RAM size in MiB.
-        #[arg(long, default_value_t = 64)]
-        ram_mib: usize,
-        /// Writes JSON Lines trace events to this file.
-        #[arg(long)]
-        trace: Option<PathBuf>,
-        /// Includes the private XBE host path in trace records.
-        #[arg(long, requires = "trace")]
-        trace_host_paths: bool,
-        /// Restricts trace records to these event kinds.
-        #[arg(long, requires = "trace", value_enum, value_delimiter = ',')]
-        trace_filter: Vec<TraceFilterArg>,
-        /// The maximum executed block count.
-        #[arg(long, default_value_t = 1 << 20)]
-        max_blocks: usize,
-        /// The execution engine.
-        #[arg(long, value_enum, default_value_t = EngineArg::Interpreter)]
-        engine: EngineArg,
-        /// Prints these guest addresses' dword values after the stop.
-        #[arg(long, value_parser = parse_u32, value_delimiter = ',')]
-        peek: Vec<u32>,
-        /// Writes the scanned-out frame to this PNG file after the stop.
-        #[arg(long)]
-        screenshot: Option<PathBuf>,
-        /// Prints the most-submitted graphics methods after the stop.
-        #[arg(long)]
-        gpu_methods: Option<usize>,
-        /// Writes the most recently sampled texture to this PNG file.
-        #[arg(long)]
-        dump_texture: Option<PathBuf>,
-        /// Captures this color surface instead of the presented one.
-        #[arg(long, value_parser = parse_u32)]
-        screenshot_address: Option<u32>,
-        /// Prints the transform program's instruction words.
-        #[arg(long)]
-        gpu_program: bool,
-        /// Prints the captured frame's digest, for recording a golden.
-        #[arg(long)]
-        frame_digest: bool,
-        /// Fails the run when the captured frame's digest differs.
-        #[arg(long, value_name = "DIGEST")]
-        expect_frame: Option<String>,
-    },
+    Run(Box<RunArgs>),
     /// Reports the implementation burndown across emulator surfaces.
     Coverage {
         /// Restricts the report to one surface.
@@ -138,6 +93,61 @@ enum Command {
         #[arg(long)]
         missing: bool,
     },
+}
+
+/// The arguments `run` takes.
+///
+/// They live in their own struct because the command carries enough of
+/// them to dominate the size of every other variant.
+#[derive(Debug, clap::Args)]
+struct RunArgs {
+    /// The XBE file path.
+    path: PathBuf,
+    /// The emulated physical RAM size in MiB.
+    #[arg(long, default_value_t = 64)]
+    ram_mib: usize,
+    /// Writes JSON Lines trace events to this file.
+    #[arg(long)]
+    trace: Option<PathBuf>,
+    /// Includes the private XBE host path in trace records.
+    #[arg(long, requires = "trace")]
+    trace_host_paths: bool,
+    /// Restricts trace records to these event kinds.
+    #[arg(long, requires = "trace", value_enum, value_delimiter = ',')]
+    trace_filter: Vec<TraceFilterArg>,
+    /// The maximum executed block count.
+    #[arg(long, default_value_t = 1 << 20)]
+    max_blocks: usize,
+    /// The execution engine.
+    #[arg(long, value_enum, default_value_t = EngineArg::Interpreter)]
+    engine: EngineArg,
+    /// Prints these guest addresses' dword values after the stop.
+    #[arg(long, value_parser = parse_u32, value_delimiter = ',')]
+    peek: Vec<u32>,
+    /// Writes the scanned-out frame to this PNG file after the stop.
+    #[arg(long)]
+    screenshot: Option<PathBuf>,
+    /// Prints the most-submitted graphics methods after the stop.
+    #[arg(long)]
+    gpu_methods: Option<usize>,
+    /// Writes the most recently sampled texture to this PNG file.
+    #[arg(long)]
+    dump_texture: Option<PathBuf>,
+    /// Captures this color surface instead of the presented one.
+    #[arg(long, value_parser = parse_u32)]
+    screenshot_address: Option<u32>,
+    /// Prints the transform program's instruction words.
+    #[arg(long)]
+    gpu_program: bool,
+    /// Reports every guest write to this address, with its writer.
+    #[arg(long, value_parser = parse_u32)]
+    watch_write: Option<u32>,
+    /// Prints the captured frame's digest, for recording a golden.
+    #[arg(long)]
+    frame_digest: bool,
+    /// Fails the run when the captured frame's digest differs.
+    #[arg(long, value_name = "DIGEST")]
+    expect_frame: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -233,23 +243,26 @@ fn main() -> Result<()> {
         Command::Thunks { path, limit, check_registry } => {
             thunks(&path, limit, check_registry, cli.json)
         }
-        Command::Run {
-            path,
-            ram_mib,
-            trace,
-            trace_host_paths,
-            trace_filter,
-            max_blocks,
-            engine,
-            peek,
-            screenshot,
-            gpu_methods,
-            dump_texture,
-            screenshot_address,
-            gpu_program,
-            frame_digest,
-            expect_frame,
-        } => {
+        Command::Run(arguments) => {
+            let RunArgs {
+                path,
+                ram_mib,
+                trace,
+                trace_host_paths,
+                trace_filter,
+                max_blocks,
+                engine,
+                peek,
+                screenshot,
+                gpu_methods,
+                dump_texture,
+                screenshot_address,
+                gpu_program,
+                watch_write,
+                frame_digest,
+                expect_frame,
+            } = *arguments;
+
             let tracing = TraceOptions {
                 path: trace.as_deref(),
                 host_paths: trace_host_paths,
@@ -268,6 +281,7 @@ fn main() -> Result<()> {
                     dump_texture: dump_texture.as_deref(),
                     screenshot_address,
                     gpu_program,
+                    watch_write,
                     frame_digest,
                     expect_frame: expect_frame.as_deref(),
                     json: cli.json,
@@ -583,6 +597,8 @@ struct RunOptions<'a> {
     screenshot_address: Option<u32>,
     /// Whether to print the transform program's instruction words.
     gpu_program: bool,
+    /// A guest address whose writers should be reported.
+    watch_write: Option<u32>,
     /// Whether to print the captured frame's digest.
     frame_digest: bool,
     /// The digest the captured frame must match, when one is expected.
@@ -602,6 +618,7 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
         dump_texture,
         screenshot_address,
         gpu_program,
+        watch_write,
         frame_digest,
         expect_frame,
         json,
@@ -635,6 +652,9 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
     match hdd_root_for(&bytes) {
         Ok(hdd) => emulator.set_hdd_root(hdd),
         Err(error) => eprintln!("warning: no writable hard-disk mount: {error:#}"),
+    }
+    if let Some(address) = watch_write {
+        emulator.watch_writes(GuestVa(address));
     }
     emulator.load_xbe(bytes).with_context(|| format!("failed to load {}", path.display()))?;
     let stop = match engine {
