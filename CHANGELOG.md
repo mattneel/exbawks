@@ -269,6 +269,13 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- A mip level is selected per triangle from how many texels it covers per
+  pixel, instead of always reading the base level. The chain is walked as
+  the hardware lays it out: levels end to end, halving but never
+  vanishing, compressed levels padded out to whole four-by-four blocks so
+  the smallest still cost one. The level is chosen once per triangle,
+  which a steeply perspective one would want varying across it.
+
 - Texture samples are filtered when the title's `SET_TEXTURE_FILTER` asks
   for it, blending the four texels around the sample. Dino Crisis 3 asks
   for linear magnification and trilinear minification on every texture;

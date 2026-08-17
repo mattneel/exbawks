@@ -437,14 +437,15 @@ Two active threads:
    2D (`0x1E70` = 0), and enables separate specular (`0x03B8` = 1,
    `0x0294` = `0x00020001`).
 
-   Still approximate, in the order they are worth attacking: **mip levels
-   are not selected between** (minification reads the base level, which is
-   the largest remaining sampling error), **specular is never computed**
+   Still approximate, in the order they are worth attacking: **specular is
+   never computed**
    though the title enables it and uploads the light's specular colour and
-   half vector, local and spot lights are not computed (this title uses
-   neither), and material colours are taken from the vertex rather than
-   the material registers (harmless here — `SET_COLOR_MATERIAL` is 0 and
-   the vertex colour is white).
+   half vector, the mip level is chosen once per triangle rather than per
+   pixel (a steeply perspective triangle wants it varying across), local
+   and spot lights are not computed (this title uses neither), and
+   material colours are taken from the vertex rather than the material
+   registers (harmless here — `SET_COLOR_MATERIAL` is 0 and the vertex
+   colour is white).
 
    Two techniques earned their keep and are worth reaching for again: the
    cancel pump's RIP sampling (`RUST_LOG=exbawks_core::emulator=trace`,

@@ -519,6 +519,8 @@ struct MemoryTexture<'a> {
     addressing: [u32; 2],
     /// Whether samples blend between neighbouring texels.
     filtered: bool,
+    /// How many mip levels the title supplied, at least one.
+    levels: u32,
     /// Whether the format's alpha channel is meaningful.
     has_alpha: bool,
     /// One past the last byte the texture's own object covers. A sample
@@ -564,11 +566,52 @@ fn swizzle_index(x: u32, y: u32, width_bits: u32, height_bits: u32) -> u32 {
 
 impl MemoryTexture<'_> {
     /// Reads the block containing a texel, as two dwords at `offset`.
-    fn block(&self, x: u32, y: u32, block_bytes: u32, offset: u32) -> [u32; 2] {
-        let blocks_across = self.width.div_ceil(4);
+    fn block(
+        &self,
+        base: u32,
+        width: u32,
+        x: u32,
+        y: u32,
+        block_bytes: u32,
+        offset: u32,
+    ) -> [u32; 2] {
+        let blocks_across = width.div_ceil(4);
         let index = (y / 4) * blocks_across + (x / 4);
-        let address = self.base.wrapping_add(index * block_bytes).wrapping_add(offset);
+        let address = base.wrapping_add(index * block_bytes).wrapping_add(offset);
         [self.read(address), self.read(address.wrapping_add(4))]
+    }
+
+    /// One mip level's extent, which halves per level but never vanishes.
+    fn level_extent(&self, level: u32) -> (u32, u32) {
+        ((self.width >> level).max(1), (self.height >> level).max(1))
+    }
+
+    /// The bytes one mip level occupies.
+    ///
+    /// A compressed level is padded out to whole four-by-four blocks, so
+    /// the smallest levels of a chain each still cost one block.
+    fn level_bytes(&self, level: u32) -> u32 {
+        use crate::texture::{DXT_ALPHA_BLOCK_BYTES, DXT1_BLOCK_BYTES};
+
+        let (width, height) = self.level_extent(level);
+        match self.layout {
+            TextureLayout::Dxt1 => width.div_ceil(4) * height.div_ceil(4) * DXT1_BLOCK_BYTES,
+            TextureLayout::Dxt3 | TextureLayout::Dxt5 => {
+                width.div_ceil(4) * height.div_ceil(4) * DXT_ALPHA_BLOCK_BYTES
+            }
+            TextureLayout::Swizzled => width * height * 4,
+            // A linear texture addresses by pitch and carries no chain.
+            TextureLayout::Linear => 0,
+        }
+    }
+
+    /// Where one mip level begins: every earlier level, end to end.
+    fn level_base(&self, level: u32) -> u32 {
+        let mut base = self.base;
+        for earlier in 0..level {
+            base = base.wrapping_add(self.level_bytes(earlier));
+        }
+        base
     }
 
     /// Reads one dword of the texture, refusing to leave its object.
@@ -590,37 +633,61 @@ impl crate::TextureSource for MemoryTexture<'_> {
     }
 
     fn texel(&self, x: u32, y: u32) -> u32 {
+        self.texel_in(0, x, y)
+    }
+
+    fn texel_in(&self, level: u32, x: u32, y: u32) -> u32 {
         use crate::texture::{DXT_ALPHA_BLOCK_BYTES, DXT1_BLOCK_BYTES};
 
+        let level = level.min(self.levels.saturating_sub(1));
+        let (width, height) = self.level_extent(level);
+        let base = self.level_base(level);
         let address = match self.layout {
             TextureLayout::Swizzled => {
-                let index =
-                    swizzle_index(x, y, self.width.trailing_zeros(), self.height.trailing_zeros());
-                self.base.wrapping_add(index * 4)
+                let index = swizzle_index(x, y, width.trailing_zeros(), height.trailing_zeros());
+                base.wrapping_add(index * 4)
             }
             TextureLayout::Linear => {
-                self.base.wrapping_add(y.wrapping_mul(self.pitch)).wrapping_add(x * 4)
+                base.wrapping_add(y.wrapping_mul(self.pitch)).wrapping_add(x * 4)
             }
             TextureLayout::Dxt1 => {
-                let block = self.block(x, y, DXT1_BLOCK_BYTES, 0);
+                let block = self.block(base, width, x, y, DXT1_BLOCK_BYTES, 0);
                 return crate::dxt1_texel(block, x, y);
             }
             // The color half of an alpha-carrying block follows its alpha.
             TextureLayout::Dxt3 => {
-                let alpha = crate::dxt3_alpha(self.block(x, y, DXT_ALPHA_BLOCK_BYTES, 0), x, y);
-                let color =
-                    crate::dxt_opaque_texel(self.block(x, y, DXT_ALPHA_BLOCK_BYTES, 8), x, y);
+                let alpha = crate::dxt3_alpha(
+                    self.block(base, width, x, y, DXT_ALPHA_BLOCK_BYTES, 0),
+                    x,
+                    y,
+                );
+                let color = crate::dxt_opaque_texel(
+                    self.block(base, width, x, y, DXT_ALPHA_BLOCK_BYTES, 8),
+                    x,
+                    y,
+                );
                 return (color & 0x00FF_FFFF) | (alpha << 24);
             }
             TextureLayout::Dxt5 => {
-                let alpha = crate::dxt5_alpha(self.block(x, y, DXT_ALPHA_BLOCK_BYTES, 0), x, y);
-                let color =
-                    crate::dxt_opaque_texel(self.block(x, y, DXT_ALPHA_BLOCK_BYTES, 8), x, y);
+                let alpha = crate::dxt5_alpha(
+                    self.block(base, width, x, y, DXT_ALPHA_BLOCK_BYTES, 0),
+                    x,
+                    y,
+                );
+                let color = crate::dxt_opaque_texel(
+                    self.block(base, width, x, y, DXT_ALPHA_BLOCK_BYTES, 8),
+                    x,
+                    y,
+                );
                 return (color & 0x00FF_FFFF) | (alpha << 24);
             }
         };
         let texel = self.read(address);
         if self.has_alpha { texel } else { texel | 0xFF00_0000 }
+    }
+
+    fn levels(&self) -> u32 {
+        self.levels
     }
 
     fn width(&self) -> u32 {
@@ -629,6 +696,14 @@ impl crate::TextureSource for MemoryTexture<'_> {
 
     fn height(&self) -> u32 {
         self.height
+    }
+
+    fn width_in(&self, level: u32) -> u32 {
+        self.level_extent(level.min(self.levels.saturating_sub(1))).0
+    }
+
+    fn height_in(&self, level: u32) -> u32 {
+        self.level_extent(level.min(self.levels.saturating_sub(1))).1
     }
 }
 
@@ -1924,6 +1999,15 @@ impl PushbufferEngine {
             height,
             layout,
             addressing: [texture.address & 0xF, (texture.address >> 8) & 0xF],
+            // A chain cannot run past a one-by-one level however many the
+            // format word claims, and a linear texture has no chain.
+            levels: if matches!(layout, TextureLayout::Linear) {
+                1
+            } else {
+                let claimed = ((texture.format >> 16) & 0xF).max(1);
+                let possible = width.max(height).trailing_zeros() + 1;
+                claimed.min(possible)
+            },
             // Either filter asking to blend is enough: this engine does
             // not select a mip level, so minification and magnification
             // reach the same sampler.
@@ -3050,6 +3134,41 @@ mod tests {
             ..crate::CombinerRegisters::default()
         };
         assert_eq!(crate::evaluate_combiner(&combiner, &registers), Some(0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn a_mip_chain_lays_its_levels_end_to_end() {
+        // A 128-by-128 DXT1 texture: the base level is 32 by 32 blocks of
+        // eight bytes, and each level after it a quarter of the one
+        // before, down to a single block that cannot shrink further.
+        let memory = FakeMemory::new(0x2_0000);
+        let texture = MemoryTexture {
+            memory: &memory,
+            base: 0x1000,
+            pitch: 0,
+            width: 128,
+            height: 128,
+            layout: TextureLayout::Dxt1,
+            addressing: [1, 1],
+            filtered: false,
+            levels: 8,
+            has_alpha: true,
+            end: 0x1_0000,
+        };
+
+        assert_eq!(texture.level_extent(0), (128, 128));
+        assert_eq!(texture.level_extent(3), (16, 16));
+        assert_eq!(texture.level_extent(9), (1, 1), "a level never vanishes");
+
+        assert_eq!(texture.level_bytes(0), 32 * 32 * 8);
+        assert_eq!(texture.level_bytes(1), 16 * 16 * 8);
+        // The last levels are smaller than a block and still cost one.
+        assert_eq!(texture.level_bytes(6), 8);
+        assert_eq!(texture.level_bytes(7), 8);
+
+        assert_eq!(texture.level_base(0), 0x1000, "the base level starts at the base");
+        assert_eq!(texture.level_base(1), 0x1000 + 32 * 32 * 8);
+        assert_eq!(texture.level_base(2), 0x1000 + 32 * 32 * 8 + 16 * 16 * 8);
     }
 
     #[test]

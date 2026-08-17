@@ -53,6 +53,26 @@ pub trait TextureSource {
     fn filtered(&self) -> bool {
         false
     }
+
+    /// How many mip levels the texture carries.
+    fn levels(&self) -> u32 {
+        1
+    }
+
+    /// The texel at integer coordinates within one mip level.
+    fn texel_in(&self, _level: u32, x: u32, y: u32) -> u32 {
+        self.texel(x, y)
+    }
+
+    /// That level's width in texels.
+    fn width_in(&self, _level: u32) -> u32 {
+        self.width()
+    }
+
+    /// That level's height in texels.
+    fn height_in(&self, _level: u32) -> u32 {
+        self.height()
+    }
 }
 
 /// Repeat the texture, dropping the whole part of the coordinate.
@@ -83,14 +103,53 @@ fn address_texel(mode: u32, texel: i64, extent: u32) -> u32 {
     }
 }
 
+/// Which mip level a triangle should sample from one unit.
+///
+/// The level comes from how many texels the triangle covers per pixel: a
+/// surface squeezed into a quarter of its texture's area reads one level
+/// down. Taking it once per triangle rather than per pixel is an
+/// approximation — a steeply perspective triangle wants a level that
+/// varies across it — but it is the difference between reading a
+/// minified texture as noise and reading it as an image.
+fn mip_level(
+    texture: &dyn TextureSource,
+    vertices: [ScreenVertex; 3],
+    unit: usize,
+    area: f32,
+) -> u32 {
+    let levels = texture.levels();
+    if levels <= 1 || area <= 0.0 {
+        return 0;
+    }
+    let [a, b, c] = vertices;
+    let width = texture.width() as f32;
+    let height = texture.height() as f32;
+    let (first_u, first_v) = (a.texcoords[unit][0] * width, a.texcoords[unit][1] * height);
+    let edge_one =
+        [b.texcoords[unit][0] * width - first_u, b.texcoords[unit][1] * height - first_v];
+    let edge_two =
+        [c.texcoords[unit][0] * width - first_u, c.texcoords[unit][1] * height - first_v];
+    // Both areas are doubled, so the doubling cancels in the ratio.
+    let covered = edge_one[0].mul_add(edge_two[1], -(edge_two[0] * edge_one[1])).abs();
+    if covered <= 0.0 || !covered.is_finite() {
+        return 0;
+    }
+    let level = 0.5 * (covered / area).log2();
+    if !level.is_finite() || level <= 0.0 {
+        return 0;
+    }
+    (level.round() as u32).min(levels - 1)
+}
+
 /// The texel a coordinate lands on, with no blending.
-fn sample_nearest(texture: &dyn TextureSource, u: f32, v: f32) -> u32 {
+fn sample_nearest(texture: &dyn TextureSource, level: u32, u: f32, v: f32) -> u32 {
     // The floor, not a truncation: a negative coordinate must land in the
     // tile below zero, not back in the first one.
     let [mode_u, mode_v] = texture.addressing();
-    texture.texel(
-        address_texel(mode_u, u.floor() as i64, texture.width()),
-        address_texel(mode_v, v.floor() as i64, texture.height()),
+    texture.texel_in(
+        level,
+        address_texel(mode_u, u.floor() as i64, texture.width_in(level)),
+        address_texel(mode_v, v.floor() as i64, texture.height_in(level)),
     )
 }
 
@@ -100,23 +159,23 @@ fn sample_nearest(texture: &dyn TextureSource, u: f32, v: f32) -> u32 {
 /// its art in blocks, which is most of the difference between a rendered
 /// surface and a rendered mosaic. Minification still reads the base level:
 /// the mip chain a title supplies is not selected between.
-fn sample_filtered(texture: &dyn TextureSource, u: f32, v: f32) -> u32 {
+fn sample_filtered(texture: &dyn TextureSource, level: u32, u: f32, v: f32) -> u32 {
     // Texel centres sit at the half, so the blend is between the texels
     // either side of the sample rather than biased to one of them.
     let (u, v) = (u - 0.5, v - 0.5);
     let (left, top) = (u.floor(), v.floor());
     let (fraction_u, fraction_v) = (u - left, v - top);
     let [mode_u, mode_v] = texture.addressing();
-    let (width, height) = (texture.width(), texture.height());
+    let (width, height) = (texture.width_in(level), texture.height_in(level));
 
     let column = |offset: i64| address_texel(mode_u, left as i64 + offset, width);
     let row = |offset: i64| address_texel(mode_v, top as i64 + offset, height);
     let (x0, x1, y0, y1) = (column(0), column(1), row(0), row(1));
     let corners = [
-        texture.texel(x0, y0),
-        texture.texel(x1, y0),
-        texture.texel(x0, y1),
-        texture.texel(x1, y1),
+        texture.texel_in(level, x0, y0),
+        texture.texel_in(level, x1, y0),
+        texture.texel_in(level, x0, y1),
+        texture.texel_in(level, x1, y1),
     ];
     let weights = [
         (1.0 - fraction_u) * (1.0 - fraction_v),
@@ -436,6 +495,11 @@ pub fn fill_triangle(
         return 0;
     }
 
+    // One level per unit for the whole triangle, chosen before the loop.
+    let levels: [u32; 4] = std::array::from_fn(|unit| {
+        textures[unit].map_or(0, |texture| mip_level(texture, [a, b, c], unit, area))
+    });
+
     let mut written = 0;
     let mut y = top as u32;
     let last_y = bottom as u32;
@@ -494,12 +558,13 @@ pub fn fill_triangle(
                         + weights[2] * c.texcoords[unit][axis] * c.inverse_w)
                         * scale
                 };
-                let scaled_u = coordinate(0) * texture.width() as f32;
-                let scaled_v = coordinate(1) * texture.height() as f32;
+                let level = levels[unit];
+                let scaled_u = coordinate(0) * texture.width_in(level) as f32;
+                let scaled_v = coordinate(1) * texture.height_in(level) as f32;
                 *sampled = Some(if texture.filtered() {
-                    sample_filtered(texture, scaled_u, scaled_v)
+                    sample_filtered(texture, level, scaled_u, scaled_v)
                 } else {
-                    sample_nearest(texture, scaled_u, scaled_v)
+                    sample_nearest(texture, level, scaled_u, scaled_v)
                 });
             }
             // Without a combiner program the first unit modulates the
@@ -786,25 +851,104 @@ mod tests {
         }
     }
 
+    /// A texture that reports a chain and which level it was read at.
+    struct Chain(std::cell::Cell<u32>);
+
+    impl TextureSource for Chain {
+        fn texel(&self, x: u32, y: u32) -> u32 {
+            self.texel_in(0, x, y)
+        }
+
+        fn texel_in(&self, level: u32, _x: u32, _y: u32) -> u32 {
+            self.0.set(level);
+            0xFFFF_FFFF
+        }
+
+        fn width(&self) -> u32 {
+            64
+        }
+
+        fn height(&self) -> u32 {
+            64
+        }
+
+        fn levels(&self) -> u32 {
+            7
+        }
+
+        fn width_in(&self, level: u32) -> u32 {
+            (64 >> level).max(1)
+        }
+
+        fn height_in(&self, level: u32) -> u32 {
+            (64 >> level).max(1)
+        }
+    }
+
+    /// A triangle covering `pixels` on a side, mapped to `texels` of the
+    /// texture, as the level selector sees it.
+    fn spanning(pixels: f32, texels: f32) -> [ScreenVertex; 3] {
+        let corner = |x: f32, y: f32, u: f32, v: f32| ScreenVertex {
+            x,
+            y,
+            color: 0xFFFF_FFFF,
+            texcoords: [[u, v]; 4],
+            z: 0.0,
+            inverse_w: 1.0,
+        };
+        let fraction = texels / 64.0;
+        [
+            corner(0.0, 0.0, 0.0, 0.0),
+            corner(pixels, 0.0, fraction, 0.0),
+            corner(0.0, pixels, 0.0, fraction),
+        ]
+    }
+
+    #[test]
+    fn the_mip_level_follows_how_far_a_texture_is_squeezed() {
+        let texture = Chain(std::cell::Cell::new(0));
+        let area = |side: f32| side * side;
+
+        // One texel per pixel reads the level the title authored.
+        assert_eq!(mip_level(&texture, spanning(64.0, 64.0), 0, area(64.0)), 0);
+        // Four texels per pixel — half the size on each side — reads one
+        // level down, which is the level that already holds that average.
+        assert_eq!(mip_level(&texture, spanning(32.0, 64.0), 0, area(32.0)), 1);
+        assert_eq!(mip_level(&texture, spanning(16.0, 64.0), 0, area(16.0)), 2);
+        // A texture magnified rather than minified stays at the base.
+        assert_eq!(mip_level(&texture, spanning(128.0, 64.0), 0, area(128.0)), 0);
+        // And the chain bounds the choice however far it is squeezed.
+        assert_eq!(mip_level(&texture, spanning(0.25, 64.0), 0, area(0.25)), 6);
+    }
+
+    #[test]
+    fn a_sample_reads_the_level_it_was_given() {
+        let texture = Chain(std::cell::Cell::new(0));
+        sample_nearest(&texture, 3, 0.5, 0.5);
+        assert_eq!(texture.0.get(), 3, "the nearest sample reads its level");
+        sample_filtered(&texture, 5, 0.5, 0.5);
+        assert_eq!(texture.0.get(), 5, "and so does the filtered one");
+    }
+
     #[test]
     fn a_filtered_sample_blends_the_texels_around_it() {
         // Dead on a texel centre the blend returns that texel alone.
-        assert_eq!(sample_filtered(&Corners, 0.5, 0.5), 0xFF00_0000, "the first texel");
-        assert_eq!(sample_filtered(&Corners, 1.5, 0.5), 0xFFFF_FFFF, "and its neighbour");
+        assert_eq!(sample_filtered(&Corners, 0, 0.5, 0.5), 0xFF00_0000, "the first texel");
+        assert_eq!(sample_filtered(&Corners, 0, 1.5, 0.5), 0xFFFF_FFFF, "and its neighbour");
 
         // Halfway between them it is the average of the two, which is
         // what turns a mosaic back into a gradient.
-        let midpoint = sample_filtered(&Corners, 1.0, 0.5);
+        let midpoint = sample_filtered(&Corners, 0, 1.0, 0.5);
         let channel = midpoint & 0xFF;
         assert!((127..=128).contains(&channel), "halfway is halfway: {channel}");
 
         // The centre of the texture touches all four corners equally, and
         // two of them are white.
-        let centre = sample_filtered(&Corners, 1.0, 1.0) & 0xFF;
+        let centre = sample_filtered(&Corners, 0, 1.0, 1.0) & 0xFF;
         assert!((127..=128).contains(&centre), "the middle averages four: {centre}");
 
         // Alpha is blended like any other channel, not dropped.
-        assert_eq!(sample_filtered(&Corners, 0.5, 0.5) >> 24, 0xFF);
+        assert_eq!(sample_filtered(&Corners, 0, 0.5, 0.5) >> 24, 0xFF);
     }
 
     #[test]
