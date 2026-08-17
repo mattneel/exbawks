@@ -260,6 +260,17 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- GPU-M4: the vertex program. A title uploads 128-bit instructions and runs
+  them once per vertex, two operations at a time — a vector one and a scalar
+  one — over sixteen attribute registers, twelve temporaries, and a constant
+  bank. `exbawks-gpu::execute` decodes and runs them; the engine feeds each
+  vertex's attributes in, takes clip-space position, diffuse color, and the
+  first texture coordinate set out, and divides by `w`. A program applies
+  the viewport transform itself, from the scale and offset the title uploads
+  as constants, which is why its results are already in pixels.
+  `exbawks run --gpu-program` prints the instruction words, which is how the
+  encoding was read off the retail title's own shaders.
+
 - A capture keeps the most legible frame a run produced rather than
   whichever was current when it stopped. Each time the title finishes a
   frame — it starts drawing into the other buffer — the frame is scored by

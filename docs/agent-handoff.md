@@ -298,15 +298,25 @@ Two active threads:
    wrong measure and contrast is the right one — with it,
    `exbawks run --screenshot` on the retail image produces the title logo.
 
-   **What is left before a golden screenshot means anything:** the title
-   still transforms most geometry with a vertex program this engine has no
-   stage for (counted in `skipped_primitives`), so what renders is its
-   pre-transformed interface art over a black background. The frame is also
-   captured mid-fade — the title draws a near-opaque black quad over the
-   screen while fading in, and the same phase comes up every run because the
-   pacing is deterministic. Next, in order: a vertex-program interpreter,
-   the pixel combiner (this engine approximates it as texture times vertex
-   color), and picking the brightest completed frame for the capture.
+   **GPU-M4 runs the vertex program.** `exbawks-gpu::execute` decodes and
+   runs the 128-bit instructions a title uploads — a vector and a scalar
+   operation per instruction, over attribute, temporary, and constant banks
+   — and the engine feeds each vertex through it. Two facts the retail
+   stream settled, both easy to get backwards: the constant load index
+   addresses the hardware bank directly (no bias), and a program applies the
+   **viewport transform itself**, from the scale and offset it receives as
+   constants, so only the perspective divide is left to do. Getting either
+   wrong collapses every triangle to a point.
+   `exbawks run --gpu-program` prints the instruction words, and
+   `scratchpad/vpdis.py`-style disassembly off those words is how the field
+   layout was confirmed: identity swizzles read `0x1B`, and exactly one
+   instruction carries the final bit.
+
+   **What is left:** the title draws most of its 3D scene through vertex
+   *arrays* — `ARRAY_ELEMENT16` at `0x1800`, tens of millions of
+   submissions — and this engine only assembles `INLINE_ARRAY`, so those
+   primitives are counted in `skipped_primitives`. After that: the pixel
+   combiner (approximated as texture times vertex color) and depth testing.
 
    Two techniques earned their keep and are worth reaching for again: the
    cancel pump's RIP sampling (`RUST_LOG=exbawks_core::emulator=trace`,

@@ -155,6 +155,9 @@ pub enum CaptureError {
     },
 }
 
+/// The `NV_USER` channel Direct3D submits through.
+const NV_USER_CHANNEL: u32 = 0xFD80_0000;
+
 /// The console's time-stamp counter ticks per millisecond: a 733 MHz CPU
 /// clock, which is what a title's `rdtsc`-based pacing expects.
 const XBOX_TSC_PER_MILLISECOND: u64 = 733_333;
@@ -998,6 +1001,12 @@ impl Emulator {
         let view = WindowMemory(&memory);
         let (width, height, pixels) = self.gpu_pusher.dump_last_texture(&view)?;
         Some(CapturedFrame { width, height, pixels, frame_buffer: 0 })
+    }
+
+    /// The transform program a channel uploaded, from its start slot.
+    #[must_use]
+    pub fn gpu_transform_program(&self) -> Vec<[u32; 4]> {
+        self.gpu_pusher.transform_program(NV_USER_CHANNEL)
     }
 
     /// The color surfaces that received the most drawn pixels.

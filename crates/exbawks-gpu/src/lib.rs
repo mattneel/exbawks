@@ -7,6 +7,7 @@ mod error;
 mod frontend;
 mod nv2a;
 mod raster;
+mod shader;
 mod texture;
 
 pub use backend::{GraphicsBackend, NullGraphicsBackend, NullGraphicsStats};
@@ -15,4 +16,5 @@ pub use error::GraphicsError;
 pub use frontend::GraphicsFrontend;
 pub use nv2a::{DmaObject, Nv2aMemory, PushbufferEngine, PusherStats};
 pub use raster::{BlendMode, PixelSink, RenderTarget, ScreenVertex, TextureSource, fill_triangle};
+pub use shader::{INPUT_REGISTERS, ShaderResult, execute};
 pub use texture::{dxt1_texel, dxt3_alpha, dxt5_alpha};

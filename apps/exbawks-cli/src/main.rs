@@ -116,6 +116,9 @@ enum Command {
         /// Captures this color surface instead of the presented one.
         #[arg(long, value_parser = parse_u32)]
         screenshot_address: Option<u32>,
+        /// Prints the transform program's instruction words.
+        #[arg(long)]
+        gpu_program: bool,
     },
     /// Reports the implementation burndown across emulator surfaces.
     Coverage {
@@ -237,6 +240,7 @@ fn main() -> Result<()> {
             gpu_methods,
             dump_texture,
             screenshot_address,
+            gpu_program,
         } => {
             let tracing = TraceOptions {
                 path: trace.as_deref(),
@@ -255,6 +259,7 @@ fn main() -> Result<()> {
                     gpu_methods,
                     dump_texture: dump_texture.as_deref(),
                     screenshot_address,
+                    gpu_program,
                     json: cli.json,
                 },
             )
@@ -566,6 +571,8 @@ struct RunOptions<'a> {
     dump_texture: Option<&'a Path>,
     /// A specific color surface to capture instead of the presented one.
     screenshot_address: Option<u32>,
+    /// Whether to print the transform program's instruction words.
+    gpu_program: bool,
     /// Whether the report prints as JSON.
     json: bool,
 }
@@ -580,6 +587,7 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
         gpu_methods,
         dump_texture,
         screenshot_address,
+        gpu_program,
         json,
     } = *options;
     let bytes = read_file(path)?;
@@ -696,6 +704,18 @@ Graphics methods (object, method, submissions):"
             }
             let percent = (lit * 100).checked_div(sampled).unwrap_or(0);
             println!("  {}  {pixels}  {percent}%", GuestVa(base));
+        }
+        println!();
+    }
+
+    if gpu_program {
+        let program = emulator.gpu_transform_program();
+        println!("Transform program ({} slots):", program.len());
+        for (slot, words) in program.iter().enumerate().take(64) {
+            println!(
+                "  {slot:3}: {:08x} {:08x} {:08x} {:08x}",
+                words[0], words[1], words[2], words[3]
+            );
         }
         println!();
     }

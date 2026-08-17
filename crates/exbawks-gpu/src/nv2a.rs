@@ -133,6 +133,38 @@ struct AttributeFormat {
     size: u32,
 }
 
+/// The transform stage a title uploads: its program, its constants, and
+/// where execution starts.
+#[derive(Debug, Clone)]
+struct TransformState {
+    /// Instruction slots, four dwords each, as uploaded.
+    program: Vec<[u32; 4]>,
+    /// The slot the next program dword lands in, counted in dwords.
+    program_load: u32,
+    /// The slot execution begins at.
+    program_start: u32,
+    /// The constant bank, four floats each.
+    constants: Vec<[f32; 4]>,
+    /// The constant the next upload lands in, counted in dwords.
+    constant_load: u32,
+    /// Whether the transform stage runs a program rather than the fixed
+    /// pipeline.
+    programmed: bool,
+}
+
+impl Default for TransformState {
+    fn default() -> Self {
+        Self {
+            program: vec![[0; 4]; TRANSFORM_PROGRAM_SLOTS],
+            program_load: 0,
+            program_start: 0,
+            constants: vec![[0.0; 4]; TRANSFORM_CONSTANT_SLOTS],
+            constant_load: 0,
+            programmed: false,
+        }
+    }
+}
+
 /// The vertex pipeline's state between `SET_BEGIN_END` pairs.
 #[derive(Debug, Default, Clone)]
 struct VertexState {
@@ -142,7 +174,10 @@ struct VertexState {
     formats: [AttributeFormat; 16],
     /// Dwords received through `INLINE_ARRAY` for the current primitive.
     inline: Vec<u32>,
-    /// The viewport's scale, as programmed.
+    /// The viewport's scale, as programmed. A title reaches its geometry
+    /// through a transform program, which receives the same scale and
+    /// offset as constants and applies them itself; these are recorded for
+    /// the fixed pipeline, which no title on this path uses.
     viewport_scale: [f32; 4],
     /// The viewport's offset, as programmed.
     viewport_offset: [f32; 4],
@@ -175,6 +210,8 @@ struct ChannelState {
     surface: SurfaceState,
     /// The vertex pipeline state.
     vertex: VertexState,
+    /// The transform stage's program and constants.
+    transform: TransformState,
     /// Whether blending is enabled.
     blend: bool,
     /// The first texture unit's state.
@@ -450,6 +487,30 @@ const VIEWPORT_OFFSET_LAST: u16 = METHOD_SET_VIEWPORT_OFFSET + 12;
 const VIEWPORT_SCALE_LAST: u16 = METHOD_SET_VIEWPORT_SCALE + 12;
 /// The last of the sixteen vertex-attribute format methods.
 const VERTEX_FORMAT_LAST: u16 = METHOD_SET_VERTEX_DATA_ARRAY_FORMAT + 15 * 4;
+/// Instruction slots the transform program holds.
+const TRANSFORM_PROGRAM_SLOTS: usize = 136;
+/// Constant slots the transform stage holds.
+const TRANSFORM_CONSTANT_SLOTS: usize = 192;
+/// The first `SET_TRANSFORM_PROGRAM` method; thirty-two follow, each one
+/// dword of the program at the load pointer.
+const METHOD_SET_TRANSFORM_PROGRAM: u16 = 0x0B00;
+/// The last of them.
+const TRANSFORM_PROGRAM_LAST: u16 = 0x0B7C;
+/// The first `SET_TRANSFORM_CONSTANT` method; thirty-two follow.
+const METHOD_SET_TRANSFORM_CONSTANT: u16 = 0x0B80;
+/// The last of them.
+const TRANSFORM_CONSTANT_LAST: u16 = 0x0BFC;
+/// Kelvin `SET_TRANSFORM_EXECUTION_MODE`: fixed pipeline or program.
+const METHOD_SET_TRANSFORM_EXECUTION_MODE: u16 = 0x1E94;
+/// Kelvin `SET_TRANSFORM_PROGRAM_LOAD`: where uploaded instructions land.
+const METHOD_SET_TRANSFORM_PROGRAM_LOAD: u16 = 0x1E9C;
+/// Kelvin `SET_TRANSFORM_PROGRAM_START`: where execution begins.
+const METHOD_SET_TRANSFORM_PROGRAM_START: u16 = 0x1EA0;
+/// Kelvin `SET_TRANSFORM_CONSTANT_LOAD`: where uploaded constants land.
+const METHOD_SET_TRANSFORM_CONSTANT_LOAD: u16 = 0x1EA4;
+/// The execution-mode field selecting a program over the fixed pipeline.
+const TRANSFORM_MODE_PROGRAM: u32 = 2;
+
 /// Kelvin `SET_BLEND_ENABLE`.
 const METHOD_SET_BLEND_ENABLE: u16 = 0x0304;
 /// Kelvin `SET_TEXTURE_OFFSET` for unit zero; units are 64 bytes apart.
@@ -747,6 +808,36 @@ impl PushbufferEngine {
                 state.vertex.formats[index & 15] =
                     AttributeFormat { kind: argument & 0xF, size: (argument >> 4) & 0xF };
             }
+            METHOD_SET_TRANSFORM_PROGRAM..=TRANSFORM_PROGRAM_LAST => {
+                let slot = (state.transform.program_load / 4) as usize;
+                let component = (state.transform.program_load % 4) as usize;
+                if let Some(instruction) = state.transform.program.get_mut(slot) {
+                    instruction[component] = argument;
+                }
+                state.transform.program_load += 1;
+            }
+            METHOD_SET_TRANSFORM_CONSTANT..=TRANSFORM_CONSTANT_LAST => {
+                let slot = (state.transform.constant_load / 4) as usize;
+                let component = (state.transform.constant_load % 4) as usize;
+                if let Some(constant) = state.transform.constants.get_mut(slot) {
+                    constant[component] = f32::from_bits(argument);
+                }
+                state.transform.constant_load += 1;
+            }
+            METHOD_SET_TRANSFORM_EXECUTION_MODE => {
+                state.transform.programmed = argument & 0x3 == TRANSFORM_MODE_PROGRAM;
+            }
+            METHOD_SET_TRANSFORM_PROGRAM_LOAD => {
+                state.transform.program_load = argument * 4;
+            }
+            METHOD_SET_TRANSFORM_PROGRAM_START => {
+                state.transform.program_start = argument;
+            }
+            METHOD_SET_TRANSFORM_CONSTANT_LOAD => {
+                // The index addresses the hardware bank directly, and a
+                // program's constant field indexes the same bank.
+                state.transform.constant_load = argument.wrapping_mul(4);
+            }
             METHOD_SET_BLEND_ENABLE => {
                 state.blend = argument != 0;
             }
@@ -824,7 +915,7 @@ impl PushbufferEngine {
             let Some(primitive) = state.vertex.primitive.take() else {
                 return;
             };
-            let vertices = Self::assemble_inline(&state.vertex);
+            let vertices = Self::assemble_inline(&state.vertex, &state.transform);
             state.vertex.inline.clear();
             let dma = state.texture_dma[(state.texture.format & 3).saturating_sub(1) as usize & 1];
             (primitive, vertices, state.surface, state.texture, dma, state.blend)
@@ -992,13 +1083,50 @@ impl PushbufferEngine {
         }
     }
 
+    /// Unpacks one vertex's dwords into the attribute registers a program
+    /// reads.
+    fn load_attributes(state: &VertexState, chunk: &[u32], attributes: &mut [[f32; 4]]) {
+        let mut offset = 0_usize;
+        for (index, format) in state.formats.iter().enumerate() {
+            let dwords = Self::attribute_dwords(*format) as usize;
+            if dwords == 0 {
+                continue;
+            }
+            let Some(register) = attributes.get_mut(index) else {
+                offset += dwords;
+                continue;
+            };
+            match format.kind {
+                ATTRIBUTE_TYPE_D3DCOLOR | ATTRIBUTE_TYPE_UBYTE_RGBA => {
+                    let packed = chunk.get(offset).copied().unwrap_or(0);
+                    let channel = |shift: u32| f32::from((packed >> shift) as u8) / 255.0;
+                    // A packed color reads as red, green, blue, alpha.
+                    *register = [channel(16), channel(8), channel(0), channel(24)];
+                }
+                _ => {
+                    // Components the vertex does not carry read as the
+                    // hardware's defaults: zero, with a one in `w`.
+                    *register = [0.0, 0.0, 0.0, 1.0];
+                    for (component, lane) in register.iter_mut().enumerate().take(dwords.min(4)) {
+                        *lane =
+                            chunk.get(offset + component).map_or(0.0, |bits| f32::from_bits(*bits));
+                    }
+                }
+            }
+            offset += dwords;
+        }
+    }
+
     /// Builds screen-space vertices from the inline dword stream.
     ///
     /// The declared attribute layout gives each vertex its stride. Positions
     /// arrive in clip space, and the viewport scale and offset place them on
     /// the surface — the same transform the hardware applies after the
     /// vertex stage.
-    fn assemble_inline(state: &VertexState) -> Vec<crate::ScreenVertex> {
+    fn assemble_inline(
+        state: &VertexState,
+        transform: &TransformState,
+    ) -> Vec<crate::ScreenVertex> {
         let position = state.formats[ATTRIBUTE_POSITION];
         if position.kind != ATTRIBUTE_TYPE_FLOAT || position.size < 2 {
             return Vec::new();
@@ -1039,25 +1167,56 @@ impl PushbufferEngine {
                 "nv2a vertex layout"
             );
         }
-        // A vertex program owns the transform, and this engine has no
-        // vertex stage, so the only positions it can place truthfully are
-        // the ones already in pixels: pre-transformed geometry
-        // (`D3DFVF_XYZRHW`) arrives far outside any clip volume, which is
-        // exactly how it is recognized. Everything else is left undrawn —
-        // running it through the viewport transform alone would paint
-        // object-space coordinates over the frame, which is worse than a
-        // gap, because a gap is visible in `skipped_primitives`.
-        let pretransformed = state.inline.chunks_exact(stride as usize).take(3).any(|chunk| {
-            let x = f32::from_bits(chunk[0]).abs();
-            let y = f32::from_bits(chunk[1]).abs();
-            let w = if position.size >= 4 { f32::from_bits(chunk[3]).abs().max(1.0) } else { 1.0 };
-            x > w * 2.0 || y > w * 2.0
-        });
-        if !pretransformed {
-            return Vec::new();
+        // With a program uploaded, the transform stage places the geometry
+        // and the viewport maps its clip-space result onto the surface.
+        // Without one, only positions already in pixels can be placed
+        // truthfully: pre-transformed geometry arrives far outside any clip
+        // volume, which is how it is recognized, and anything else is left
+        // undrawn rather than painted at object-space coordinates.
+        let programmed = transform.programmed && !transform.program.is_empty();
+        if !programmed {
+            let pretransformed = state.inline.chunks_exact(stride as usize).take(3).any(|chunk| {
+                let x = f32::from_bits(chunk[0]).abs();
+                let y = f32::from_bits(chunk[1]).abs();
+                let w =
+                    if position.size >= 4 { f32::from_bits(chunk[3]).abs().max(1.0) } else { 1.0 };
+                x > w * 2.0 || y > w * 2.0
+            });
+            if !pretransformed {
+                return Vec::new();
+            }
         }
+        let program = &transform.program[transform.program_start as usize..];
         let mut vertices = Vec::with_capacity(state.inline.len() / stride as usize);
+        // Attribute values as the program reads them, rebuilt per vertex.
+        let mut attributes = vec![[0.0_f32; 4]; crate::INPUT_REGISTERS];
         for chunk in state.inline.chunks_exact(stride as usize) {
+            if programmed {
+                Self::load_attributes(state, chunk, &mut attributes);
+                let Some(result) = crate::execute(program, &transform.constants, &attributes)
+                else {
+                    continue;
+                };
+                let [x, y, _, w] = result.position;
+                if w == 0.0 || !w.is_finite() {
+                    continue;
+                }
+                let color = |value: f32| ((value.clamp(0.0, 1.0) * 255.0) as u32) & 0xFF;
+                // A program emits screen coordinates: the viewport scale
+                // and offset reach it as constants, and it applies them
+                // itself, so only the perspective divide remains.
+                vertices.push(crate::ScreenVertex {
+                    x: x / w,
+                    y: y / w,
+                    color: (color(result.diffuse[3]) << 24)
+                        | (color(result.diffuse[0]) << 16)
+                        | (color(result.diffuse[1]) << 8)
+                        | color(result.diffuse[2]),
+                    u: result.texcoord0[0],
+                    v: result.texcoord0[1],
+                });
+                continue;
+            }
             let color = match diffuse.kind {
                 ATTRIBUTE_TYPE_D3DCOLOR if diffuse.size != 0 => {
                     chunk.get(diffuse_offset).copied().unwrap_or(0xFFFF_FFFF)
@@ -1203,6 +1362,28 @@ impl PushbufferEngine {
     #[must_use]
     pub fn presented_target(&self) -> Option<(u32, u32, u32, u32)> {
         self.presentable_targets().into_iter().next()
+    }
+
+    /// The transform program as uploaded, from its start slot.
+    ///
+    /// Returns the instruction words so a caller can disassemble them; the
+    /// program is the only description of how a title places its geometry.
+    #[must_use]
+    pub fn transform_program(&self, channel: u32) -> Vec<[u32; 4]> {
+        let Some(state) = self.channels.get(&channel) else {
+            return Vec::new();
+        };
+        let start = state.transform.program_start as usize;
+        state.transform.program.get(start..).map(<[[u32; 4]]>::to_vec).unwrap_or_default()
+    }
+
+    /// The transform constants as uploaded.
+    #[must_use]
+    pub fn transform_constants(&self, channel: u32) -> Vec<[f32; 4]> {
+        self.channels
+            .get(&channel)
+            .map(|state| state.transform.constants.clone())
+            .unwrap_or_default()
     }
 
     /// Takes the frame finished since this was last called.
