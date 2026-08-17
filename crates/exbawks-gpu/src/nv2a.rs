@@ -463,6 +463,8 @@ pub struct PusherStats {
     pub skipped_primitives: u64,
     /// Primitives drawn with a texture bound.
     pub textured_primitives: u64,
+    /// Triangles dropped for reaching at or behind the eye.
+    pub triangles_behind_eye: u64,
     /// Primitives whose texture format this engine cannot sample.
     pub unsupported_textures: u64,
     /// Draws that bound each texture unit. A combiner stage reading a
@@ -1782,6 +1784,13 @@ impl PushbufferEngine {
         self.last_draw_geometry = (target.pitch, target.width, target.height);
         let mut drawn = 0_u64;
         for [a, b, c] in triangles {
+            // Proper clipping would split a straddling triangle against
+            // the near plane; this drops it, which is visible as a missing
+            // sliver rather than as a wedge across the whole frame.
+            if [a, b, c].iter().any(|index| vertices[*index].inverse_w <= 0.0) {
+                self.stats.triangles_behind_eye += 1;
+                continue;
+            }
             let written = crate::fill_triangle(
                 &sink,
                 &target,
@@ -1973,8 +1982,21 @@ impl PushbufferEngine {
         };
 
         let [x, y, z, w] = position;
-        if w == 0.0 || !w.is_finite() {
-            return None;
+        // A vertex at or behind the eye cannot be projected: `w` divides
+        // through, and a negative one mirrors the vertex to the far side
+        // of the screen, dragging a wedge of geometry across the frame.
+        // Such a vertex keeps its place in the list — an index-assembled
+        // primitive would otherwise pick up its neighbours — and is marked
+        // for the triangle stage by a reciprocal of zero.
+        if w <= 0.0 || !w.is_finite() {
+            return Some(crate::ScreenVertex {
+                x: 0.0,
+                y: 0.0,
+                color: 0,
+                texcoords: [[0.0, 0.0]; TEXTURE_UNITS],
+                z: 0.0,
+                inverse_w: 0.0,
+            });
         }
         let inverse_w = 1.0 / w;
         // Both paths reach the surface already scaled: a program applies
@@ -2987,6 +3009,32 @@ mod tests {
             ..crate::CombinerRegisters::default()
         };
         assert_eq!(crate::evaluate_combiner(&combiner, &registers), Some(0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn a_vertex_behind_the_eye_keeps_its_place_in_the_list() {
+        // Two triangles from an indexed list, the second of which reaches
+        // behind the eye. Dropping its vertex outright would renumber the
+        // first triangle's indices and draw something the title never
+        // asked for, so the vertex stays and is marked instead.
+        // An identity composite so the fixed pipeline passes the position
+        // through and `w` is the one the vertex carries.
+        let mut composite = [0.0_f32; 16];
+        for lane in 0..4 {
+            composite[lane * 4 + lane] = 1.0;
+        }
+        let state = VertexState { composite, ..VertexState::default() };
+        let transform_state = TransformState::default();
+        let mut attributes = default_attributes();
+        attributes[ATTRIBUTE_POSITION] = [0.0, 0.0, 1.0, -1.0];
+        let behind = PushbufferEngine::place_vertex(&state, &transform_state, &[], &attributes);
+        let placed = behind.expect("the vertex still occupies its index");
+        assert_eq!(placed.inverse_w, 0.0, "and is marked as unprojectable");
+
+        attributes[ATTRIBUTE_POSITION] = [0.0, 0.0, 1.0, 2.0];
+        let ahead = PushbufferEngine::place_vertex(&state, &transform_state, &[], &attributes)
+            .expect("a vertex in front projects");
+        assert!(ahead.inverse_w > 0.0, "and carries a real reciprocal");
     }
 
     #[test]

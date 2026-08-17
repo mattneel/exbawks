@@ -806,6 +806,7 @@ Graphics methods (object, method, submissions):"
             println!("  format {code:#04x}: {seen} draws, {refused} refused");
         }
         println!("  unsupported textures: {}", stats.unsupported_textures);
+        println!("  triangles behind the eye: {}", stats.triangles_behind_eye);
         for (attribute, (value, count)) in stats.constant_attributes.iter().enumerate() {
             if *count > 0 {
                 println!("  attribute {attribute:2}: constant {value:08x} set {count} times");

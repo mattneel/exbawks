@@ -269,6 +269,13 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- Geometry at or behind the eye is dropped instead of drawn. A vertex with
+  a non-positive `w` divides through to the far side of the screen and
+  drags a wedge of geometry across the frame; 24,942 triangles per run of
+  this title were being drawn that way. A vertex that cannot be projected
+  also keeps its place in the vertex list now — dropping it renumbered
+  every triangle an indexed primitive assembled after it.
+
 - Fixed-function vertex lighting: emission, scene ambient, and one
   infinite light's ambient and diffuse terms, modulated by the vertex's
   own color. Dino Crisis 3 lights its title screen with a single
