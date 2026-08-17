@@ -145,6 +145,9 @@ struct RunArgs {
     /// Prints the register-combiner program the last draw ran under.
     #[arg(long)]
     gpu_combiner: bool,
+    /// Prints the last value submitted for these graphics methods.
+    #[arg(long, value_parser = parse_u32, value_delimiter = ',')]
+    gpu_method_value: Vec<u32>,
     /// Reports every guest write to this address, with its writer.
     #[arg(long, value_parser = parse_u32)]
     watch_write: Option<u32>,
@@ -266,6 +269,7 @@ fn main() -> Result<()> {
                 screenshot_address,
                 gpu_program,
                 gpu_combiner,
+                gpu_method_value,
                 watch_write,
                 frame_digest,
                 expect_frame,
@@ -291,6 +295,7 @@ fn main() -> Result<()> {
                     screenshot_address,
                     gpu_program,
                     gpu_combiner,
+                    gpu_method_value: &gpu_method_value,
                     watch_write,
                     frame_digest,
                     expect_frame: expect_frame.as_deref(),
@@ -611,6 +616,8 @@ struct RunOptions<'a> {
     gpu_program: bool,
     /// Whether to print the register-combiner program.
     gpu_combiner: bool,
+    /// Graphics methods whose last submitted value should be printed.
+    gpu_method_value: &'a [u32],
     /// A guest address whose writers should be reported.
     watch_write: Option<u32>,
     /// Whether to print the captured frame's digest.
@@ -634,6 +641,7 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
         screenshot_address,
         gpu_program,
         gpu_combiner,
+        gpu_method_value,
         watch_write,
         frame_digest,
         expect_frame,
@@ -853,6 +861,19 @@ Graphics methods (object, method, submissions):"
                     programmed.alpha_inputs,
                     programmed.alpha_outputs
                 );
+            }
+        }
+        println!();
+    }
+
+    if !gpu_method_value.is_empty() {
+        let stats = emulator.gpu_stats();
+        println!("Method values:");
+        for method in gpu_method_value {
+            let key = u16::try_from(*method).unwrap_or(u16::MAX);
+            match stats.method_values.get(&key) {
+                Some(value) => println!("  {key:#06x}: {value:#010x}"),
+                None => println!("  {key:#06x}: never submitted"),
             }
         }
         println!();

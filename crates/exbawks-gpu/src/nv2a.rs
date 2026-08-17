@@ -107,6 +107,8 @@ struct TextureState {
     enabled: bool,
     /// The addressing word: the wrap mode per axis, four bits each.
     address: u32,
+    /// The filter word: minification in bits 16..24, magnification above.
+    filter: u32,
 }
 
 impl SurfaceState {
@@ -473,6 +475,10 @@ pub struct PusherStats {
     /// unit no draw binds sees white, which is how a modulate turns into
     /// a brightening — so the counts are worth having.
     pub bound_by_unit: [u64; TEXTURE_UNITS],
+    /// The last argument submitted for each method, whether or not this
+    /// engine acts on it. Reading a register a wrong-looking frame might
+    /// depend on beats adding a one-off counter for each guess.
+    pub method_values: std::collections::BTreeMap<u16, u32>,
     /// Draws per texture color format, and how many of those this engine
     /// could not sample. A format it does not decode costs the whole
     /// primitive, so the two counts together say what is missing.
@@ -511,6 +517,8 @@ struct MemoryTexture<'a> {
     /// How coordinates outside the texture are brought back inside, per
     /// axis, as the title programmed them.
     addressing: [u32; 2],
+    /// Whether samples blend between neighbouring texels.
+    filtered: bool,
     /// Whether the format's alpha channel is meaningful.
     has_alpha: bool,
     /// One past the last byte the texture's own object covers. A sample
@@ -575,6 +583,10 @@ impl MemoryTexture<'_> {
 impl crate::TextureSource for MemoryTexture<'_> {
     fn addressing(&self) -> [u32; 2] {
         self.addressing
+    }
+
+    fn filtered(&self) -> bool {
+        self.filtered
     }
 
     fn texel(&self, x: u32, y: u32) -> u32 {
@@ -1010,6 +1022,11 @@ const METHOD_SET_TEXTURE_END: u16 = 0x1B00 + TEXTURE_UNIT_STRIDE * TEXTURE_UNITS
 const METHOD_SET_TEXTURE_OFFSET: u16 = 0x1B00;
 /// Kelvin `SET_TEXTURE_FORMAT` for unit zero.
 const METHOD_SET_TEXTURE_FORMAT: u16 = 0x1B04;
+/// Kelvin `SET_TEXTURE_FILTER`: how samples are blended.
+const METHOD_SET_TEXTURE_FILTER: u16 = 0x1B14;
+/// The magnification filter that blends neighbouring texels.
+const TEXTURE_FILTER_LINEAR: u32 = 2;
+
 /// Kelvin `SET_TEXTURE_ADDRESS`: the wrap mode on each axis.
 const METHOD_SET_TEXTURE_ADDRESS: u16 = 0x1B08;
 
@@ -1218,6 +1235,10 @@ impl PushbufferEngine {
         argument: u32,
     ) {
         let channel = context.channel;
+        // The last value of every method, for reading a register back.
+        // The key is the method alone, so this is bounded by the method
+        // space rather than by anything the guest chooses.
+        self.stats.method_values.insert(method, argument);
         let state = self.channels.entry(channel).or_default();
         let bound = state.subchannel_handles[subchannel & 7];
         // The census is keyed partly by an object handle the guest picks,
@@ -1560,6 +1581,7 @@ impl PushbufferEngine {
                     METHOD_SET_TEXTURE_OFFSET => texture.offset = argument,
                     METHOD_SET_TEXTURE_FORMAT => texture.format = argument,
                     METHOD_SET_TEXTURE_ADDRESS => texture.address = argument,
+                    METHOD_SET_TEXTURE_FILTER => texture.filter = argument,
                     METHOD_SET_TEXTURE_CONTROL0 => {
                         texture.enabled = argument & TEXTURE_ENABLE != 0;
                     }
@@ -1902,6 +1924,11 @@ impl PushbufferEngine {
             height,
             layout,
             addressing: [texture.address & 0xF, (texture.address >> 8) & 0xF],
+            // Either filter asking to blend is enough: this engine does
+            // not select a mip level, so minification and magnification
+            // reach the same sampler.
+            filtered: (texture.filter >> 24) & 0xF >= TEXTURE_FILTER_LINEAR
+                || (texture.filter >> 16) & 0xFF >= TEXTURE_FILTER_LINEAR,
             has_alpha: !matches!(
                 texture.color_format(),
                 TEXTURE_FORMAT_LINEAR_X8R8G8B8 | TEXTURE_FORMAT_SWIZZLED_X8R8G8B8

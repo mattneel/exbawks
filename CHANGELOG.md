@@ -269,6 +269,13 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- Texture samples are filtered when the title's `SET_TEXTURE_FILTER` asks
+  for it, blending the four texels around the sample. Dino Crisis 3 asks
+  for linear magnification and trilinear minification on every texture;
+  taking the nearest texel instead rendered its art as a mosaic. Mip
+  levels are still not selected between — minification reads the base
+  level — so a heavily minified texture still aliases.
+
 - The texture addressing mode a title programs (`SET_TEXTURE_ADDRESS`) is
   obeyed: wrap, mirror, or clamp per axis. Every sample had been clamped,
   so a texture the title meant to tile held one edge texel across

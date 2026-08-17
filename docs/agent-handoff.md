@@ -429,11 +429,22 @@ Two active threads:
    every frame before this came out grey. The teal appeared the moment the
    light's diffuse term reached the vertex.
 
-   Still approximate: `specular` reads black because no separate specular
-   attribute is interpolated, local and spot lights are not computed (this
-   title uses neither), mip levels are ignored (the base level is always
-   sampled), and the material's ambient and diffuse tracking is taken from
-   the vertex colour rather than the material registers.
+   `exbawks run --gpu-method-value <methods>` reads back the last value
+   submitted for any graphics method, which is faster than adding a
+   counter per guess. It settled four questions at once: this title wraps
+   its textures on both axes (`0x1B08` = `0x00010101`), filters them
+   linearly (`0x1B14` = `0x02063F01`), runs every texture stage as plain
+   2D (`0x1E70` = 0), and enables separate specular (`0x03B8` = 1,
+   `0x0294` = `0x00020001`).
+
+   Still approximate, in the order they are worth attacking: **mip levels
+   are not selected between** (minification reads the base level, which is
+   the largest remaining sampling error), **specular is never computed**
+   though the title enables it and uploads the light's specular colour and
+   half vector, local and spot lights are not computed (this title uses
+   neither), and material colours are taken from the vertex rather than
+   the material registers (harmless here — `SET_COLOR_MATERIAL` is 0 and
+   the vertex colour is white).
 
    Two techniques earned their keep and are worth reaching for again: the
    cancel pump's RIP sampling (`RUST_LOG=exbawks_core::emulator=trace`,

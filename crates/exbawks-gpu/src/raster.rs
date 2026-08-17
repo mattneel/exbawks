@@ -48,6 +48,11 @@ pub trait TextureSource {
     fn addressing(&self) -> [u32; 2] {
         [ADDRESS_CLAMP_TO_EDGE; 2]
     }
+
+    /// Whether samples are blended between neighbouring texels.
+    fn filtered(&self) -> bool {
+        false
+    }
 }
 
 /// Repeat the texture, dropping the whole part of the coordinate.
@@ -76,6 +81,57 @@ fn address_texel(mode: u32, texel: i64, extent: u32) -> u32 {
         }
         _ => texel.clamp(0, span - 1) as u32,
     }
+}
+
+/// The texel a coordinate lands on, with no blending.
+fn sample_nearest(texture: &dyn TextureSource, u: f32, v: f32) -> u32 {
+    // The floor, not a truncation: a negative coordinate must land in the
+    // tile below zero, not back in the first one.
+    let [mode_u, mode_v] = texture.addressing();
+    texture.texel(
+        address_texel(mode_u, u.floor() as i64, texture.width()),
+        address_texel(mode_v, v.floor() as i64, texture.height()),
+    )
+}
+
+/// The four texels around a coordinate, blended by how near it is to each.
+///
+/// A title that asks for a filtered sample and gets the nearest texel sees
+/// its art in blocks, which is most of the difference between a rendered
+/// surface and a rendered mosaic. Minification still reads the base level:
+/// the mip chain a title supplies is not selected between.
+fn sample_filtered(texture: &dyn TextureSource, u: f32, v: f32) -> u32 {
+    // Texel centres sit at the half, so the blend is between the texels
+    // either side of the sample rather than biased to one of them.
+    let (u, v) = (u - 0.5, v - 0.5);
+    let (left, top) = (u.floor(), v.floor());
+    let (fraction_u, fraction_v) = (u - left, v - top);
+    let [mode_u, mode_v] = texture.addressing();
+    let (width, height) = (texture.width(), texture.height());
+
+    let column = |offset: i64| address_texel(mode_u, left as i64 + offset, width);
+    let row = |offset: i64| address_texel(mode_v, top as i64 + offset, height);
+    let (x0, x1, y0, y1) = (column(0), column(1), row(0), row(1));
+    let corners = [
+        texture.texel(x0, y0),
+        texture.texel(x1, y0),
+        texture.texel(x0, y1),
+        texture.texel(x1, y1),
+    ];
+    let weights = [
+        (1.0 - fraction_u) * (1.0 - fraction_v),
+        fraction_u * (1.0 - fraction_v),
+        (1.0 - fraction_u) * fraction_v,
+        fraction_u * fraction_v,
+    ];
+
+    let mut blended = 0_u32;
+    for shift in [0, 8, 16, 24] {
+        let channel: f32 =
+            (0..4).map(|corner| ((corners[corner] >> shift) & 0xFF) as f32 * weights[corner]).sum();
+        blended |= ((channel + 0.5).clamp(0.0, 255.0) as u32) << shift;
+    }
+    blended
 }
 
 /// Splits an 8-bit ARGB color into the combiner's float channels.
@@ -438,15 +494,13 @@ pub fn fill_triangle(
                         + weights[2] * c.texcoords[unit][axis] * c.inverse_w)
                         * scale
                 };
-                // The floor, not a truncation: a negative coordinate must
-                // land in the tile below zero, not back in the first one.
-                let texel_x = (coordinate(0) * texture.width() as f32).floor() as i64;
-                let texel_y = (coordinate(1) * texture.height() as f32).floor() as i64;
-                let [mode_u, mode_v] = texture.addressing();
-                *sampled = Some(texture.texel(
-                    address_texel(mode_u, texel_x, texture.width()),
-                    address_texel(mode_v, texel_y, texture.height()),
-                ));
+                let scaled_u = coordinate(0) * texture.width() as f32;
+                let scaled_v = coordinate(1) * texture.height() as f32;
+                *sampled = Some(if texture.filtered() {
+                    sample_filtered(texture, scaled_u, scaled_v)
+                } else {
+                    sample_nearest(texture, scaled_u, scaled_v)
+                });
             }
             // Without a combiner program the first unit modulates the
             // vertex color, which is what an unprogrammed stage does.
@@ -708,6 +762,49 @@ mod tests {
             "the green corner stays green"
         );
         assert!(colors.iter().all(|color| color >> 24 == 0xFF), "alpha carries through");
+    }
+
+    /// A two-by-two texture: black, white on the top row; white, black
+    /// on the bottom.
+    struct Corners;
+
+    impl TextureSource for Corners {
+        fn texel(&self, x: u32, y: u32) -> u32 {
+            if (x + y).is_multiple_of(2) { 0xFF00_0000 } else { 0xFFFF_FFFF }
+        }
+
+        fn width(&self) -> u32 {
+            2
+        }
+
+        fn height(&self) -> u32 {
+            2
+        }
+
+        fn filtered(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_filtered_sample_blends_the_texels_around_it() {
+        // Dead on a texel centre the blend returns that texel alone.
+        assert_eq!(sample_filtered(&Corners, 0.5, 0.5), 0xFF00_0000, "the first texel");
+        assert_eq!(sample_filtered(&Corners, 1.5, 0.5), 0xFFFF_FFFF, "and its neighbour");
+
+        // Halfway between them it is the average of the two, which is
+        // what turns a mosaic back into a gradient.
+        let midpoint = sample_filtered(&Corners, 1.0, 0.5);
+        let channel = midpoint & 0xFF;
+        assert!((127..=128).contains(&channel), "halfway is halfway: {channel}");
+
+        // The centre of the texture touches all four corners equally, and
+        // two of them are white.
+        let centre = sample_filtered(&Corners, 1.0, 1.0) & 0xFF;
+        assert!((127..=128).contains(&centre), "the middle averages four: {centre}");
+
+        // Alpha is blended like any other channel, not dropped.
+        assert_eq!(sample_filtered(&Corners, 0.5, 0.5) >> 24, 0xFF);
     }
 
     #[test]
