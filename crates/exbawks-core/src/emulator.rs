@@ -158,6 +158,10 @@ pub enum CaptureError {
 /// The `NV_USER` channel Direct3D submits through.
 const NV_USER_CHANNEL: u32 = 0xFD80_0000;
 
+/// The largest frame a capture will build: a guest can program a surface
+/// far larger than any display, and a capture must not follow it.
+const MAX_CAPTURE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// The console's time-stamp counter ticks per millisecond: a 733 MHz CPU
 /// clock, which is what a title's `rdtsc`-based pacing expects.
 const XBOX_TSC_PER_MILLISECOND: u64 = 733_333;
@@ -1143,7 +1147,13 @@ impl Emulator {
             }
         };
         let base = KERNEL_WINDOW_BASE | frame_buffer;
-        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        // The geometry comes from guest registers, so the reservation is
+        // computed wide and refused when it is not a plausible frame.
+        let bytes = u64::from(width) * u64::from(height) * 4;
+        if bytes > MAX_CAPTURE_BYTES {
+            return Err(CaptureError::UnsupportedPitch { pitch });
+        }
+        let mut pixels = Vec::with_capacity(usize::try_from(bytes).unwrap_or(0));
         let mut scanline = vec![0_u8; pitch as usize];
         for row in 0..height {
             let at = GuestVa(base.wrapping_add(row * pitch));

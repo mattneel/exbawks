@@ -107,6 +107,27 @@ struct TextureState {
     enabled: bool,
 }
 
+impl SurfaceState {
+    /// The rectangle a clear covers: the clear rectangle intersected with
+    /// the surface clip, and with what the hardware can address at `pitch`.
+    fn clear_bounds(&self, pitch: u32) -> Option<(u32, u32, u32, u32)> {
+        if pitch == 0 {
+            return None;
+        }
+        let addressable = (pitch / 4).min(MAX_SURFACE_DIMENSION);
+        let left = self.clear_x.0.max(self.clip_x);
+        let right =
+            self.clear_x.1.min(self.clip_x.saturating_add(self.clip_width)).min(addressable);
+        let top = self.clear_y.0.max(self.clip_y);
+        let bottom = self
+            .clear_y
+            .1
+            .min(self.clip_y.saturating_add(self.clip_height))
+            .min(MAX_SURFACE_DIMENSION);
+        (left < right && top < bottom).then_some((left, right, top, bottom))
+    }
+}
+
 impl TextureState {
     /// The color format code the hardware samples with.
     fn color_format(self) -> u32 {
@@ -121,12 +142,25 @@ impl TextureState {
     /// rectangle instead — which stays behind in the register when the next
     /// texture is a compressed one, so reading it first mis-sizes the image.
     fn extent(self) -> (u32, u32) {
+        // A linear format cannot express its size as logarithms and carries
+        // an explicit rectangle; every other format's logarithms are
+        // authoritative, including the one-by-one case where both read
+        // zero and the rectangle left behind by an earlier texture would
+        // otherwise be believed.
+        if self.is_linear() {
+            return self.rect;
+        }
         let width_log2 = (self.format >> 20) & 0xF;
         let height_log2 = (self.format >> 24) & 0xF;
-        if width_log2 != 0 || height_log2 != 0 {
-            return (1 << width_log2, 1 << height_log2);
-        }
-        self.rect
+        (1 << width_log2, 1 << height_log2)
+    }
+
+    /// Whether the format stores its texels row by row at a pitch.
+    fn is_linear(self) -> bool {
+        matches!(
+            self.color_format(),
+            TEXTURE_FORMAT_LINEAR_A8R8G8B8 | TEXTURE_FORMAT_LINEAR_X8R8G8B8
+        )
     }
 }
 
@@ -156,6 +190,14 @@ struct TransformState {
     /// Whether the transform stage runs a program rather than the fixed
     /// pipeline.
     programmed: bool,
+}
+
+impl TransformState {
+    /// The program from its start slot, empty when the start is past its
+    /// end — a guest may set any start it likes.
+    fn program_from_start(&self) -> &[[u32; 4]] {
+        self.program.get(self.program_start as usize..).unwrap_or(&[])
+    }
 }
 
 impl Default for TransformState {
@@ -305,6 +347,10 @@ struct MemoryTexture<'a> {
     layout: TextureLayout,
     /// Whether the format's alpha channel is meaningful.
     has_alpha: bool,
+    /// One past the last byte the texture's own object covers. A sample
+    /// beyond it reads as transparent rather than as another object's
+    /// memory.
+    end: u32,
 }
 
 /// How a bound texture's texels are arranged in memory.
@@ -348,10 +394,15 @@ impl MemoryTexture<'_> {
         let blocks_across = self.width.div_ceil(4);
         let index = (y / 4) * blocks_across + (x / 4);
         let address = self.base.wrapping_add(index * block_bytes).wrapping_add(offset);
-        [
-            self.memory.read_dword(address).unwrap_or(0),
-            self.memory.read_dword(address.wrapping_add(4)).unwrap_or(0),
-        ]
+        [self.read(address), self.read(address.wrapping_add(4))]
+    }
+
+    /// Reads one dword of the texture, refusing to leave its object.
+    fn read(&self, address: u32) -> u32 {
+        if address < self.base || address >= self.end {
+            return 0;
+        }
+        self.memory.read_dword(address).unwrap_or(0)
     }
 }
 
@@ -375,16 +426,18 @@ impl crate::TextureSource for MemoryTexture<'_> {
             // The color half of an alpha-carrying block follows its alpha.
             TextureLayout::Dxt3 => {
                 let alpha = crate::dxt3_alpha(self.block(x, y, DXT_ALPHA_BLOCK_BYTES, 0), x, y);
-                let color = crate::dxt1_texel(self.block(x, y, DXT_ALPHA_BLOCK_BYTES, 8), x, y);
+                let color =
+                    crate::dxt_opaque_texel(self.block(x, y, DXT_ALPHA_BLOCK_BYTES, 8), x, y);
                 return (color & 0x00FF_FFFF) | (alpha << 24);
             }
             TextureLayout::Dxt5 => {
                 let alpha = crate::dxt5_alpha(self.block(x, y, DXT_ALPHA_BLOCK_BYTES, 0), x, y);
-                let color = crate::dxt1_texel(self.block(x, y, DXT_ALPHA_BLOCK_BYTES, 8), x, y);
+                let color =
+                    crate::dxt_opaque_texel(self.block(x, y, DXT_ALPHA_BLOCK_BYTES, 8), x, y);
                 return (color & 0x00FF_FFFF) | (alpha << 24);
             }
         };
-        let texel = self.memory.read_dword(address).unwrap_or(0);
+        let texel = self.read(address);
         if self.has_alpha { texel } else { texel | 0xFF00_0000 }
     }
 
@@ -454,6 +507,16 @@ fn ramht_hash(handle: u32, index_bits: u32, channel: u32) -> u32 {
     }
     hash ^ ((channel & 0xF) << (index_bits - 4))
 }
+
+/// The most distinct methods the census records before it stops growing.
+const MAX_CENSUS_ENTRIES: usize = 4096;
+
+/// The largest texture edge the hardware addresses; a format word can ask
+/// for more, and a sampler built from one would walk gigabytes.
+const MAX_TEXTURE_DIMENSION: u32 = 4096;
+
+/// The largest surface edge a title can draw into, for the same reason.
+const MAX_SURFACE_DIMENSION: u32 = 4096;
 
 /// The narrowest surface a capture treats as a displayable frame.
 const PRESENTABLE_WIDTH: u32 = 512;
@@ -757,6 +820,10 @@ impl PushbufferEngine {
             let subchannel = ((word >> 13) & 0x7) as usize;
             let mut method = (word & 0x1FFC) as u16;
 
+            // Every argument dword costs budget, not just the header:
+            // one header can carry two thousand of them, and a circular
+            // pushbuffer of them would otherwise run for hours.
+            budget = budget.saturating_sub(count);
             for _ in 0..count {
                 let Some(argument) = memory.read_dword(cursor) else {
                     self.stats.aborted += 1;
@@ -785,7 +852,14 @@ impl PushbufferEngine {
         let channel = context.channel;
         let state = self.channels.entry(channel).or_default();
         let bound = state.subchannel_handles[subchannel & 7];
-        *self.method_counts.entry((bound, method)).or_insert(0) += 1;
+        // The census is keyed partly by an object handle the guest picks,
+        // so it is capped: a stream that binds a fresh handle per method
+        // would otherwise grow it until memory ran out.
+        if self.method_counts.len() < MAX_CENSUS_ENTRIES
+            || self.method_counts.contains_key(&(bound, method))
+        {
+            *self.method_counts.entry((bound, method)).or_insert(0) += 1;
+        }
         tracing::trace!(
             channel,
             subchannel,
@@ -941,7 +1015,7 @@ impl PushbufferEngine {
                 if let Some(instruction) = state.transform.program.get_mut(slot) {
                     instruction[component] = argument;
                 }
-                state.transform.program_load += 1;
+                state.transform.program_load = state.transform.program_load.wrapping_add(1);
             }
             METHOD_SET_TRANSFORM_CONSTANT..=TRANSFORM_CONSTANT_LAST => {
                 let slot = (state.transform.constant_load / 4) as usize;
@@ -949,16 +1023,18 @@ impl PushbufferEngine {
                 if let Some(constant) = state.transform.constants.get_mut(slot) {
                     constant[component] = f32::from_bits(argument);
                 }
-                state.transform.constant_load += 1;
+                state.transform.constant_load = state.transform.constant_load.wrapping_add(1);
             }
             METHOD_SET_TRANSFORM_EXECUTION_MODE => {
                 state.transform.programmed = argument & 0x3 == TRANSFORM_MODE_PROGRAM;
             }
             METHOD_SET_TRANSFORM_PROGRAM_LOAD => {
-                state.transform.program_load = argument * 4;
+                state.transform.program_load = argument.wrapping_mul(4);
             }
             METHOD_SET_TRANSFORM_PROGRAM_START => {
-                state.transform.program_start = argument;
+                // A start beyond the program runs nothing, which is what the
+                // slice below needs; it must never index past the end.
+                state.transform.program_start = argument.min(TRANSFORM_PROGRAM_SLOTS as u32);
             }
             METHOD_SET_TRANSFORM_CONSTANT_LOAD => {
                 // The index addresses the hardware bank directly, and a
@@ -1187,14 +1263,22 @@ impl PushbufferEngine {
         if layout == TextureLayout::Linear && texture.pitch == 0 {
             return None;
         }
+        // A texture may not be larger than the hardware can address, and
+        // its samples may not leave the object it was bound to.
+        if width > MAX_TEXTURE_DIMENSION || height > MAX_TEXTURE_DIMENSION {
+            return None;
+        }
+        let object = dma?;
+        let base = object.base.wrapping_add(texture.offset);
         Some(MemoryTexture {
             memory,
-            base: dma.map_or(0, |object| object.base).wrapping_add(texture.offset),
+            base,
             pitch: texture.pitch,
             width,
             height,
             layout,
             has_alpha: texture.color_format() != TEXTURE_FORMAT_LINEAR_X8R8G8B8,
+            end: base.saturating_add(object.limit).saturating_add(1),
         })
     }
 
@@ -1204,13 +1288,23 @@ impl PushbufferEngine {
         if surface.color_pitch == 0 || surface.clip_width == 0 || surface.clip_height == 0 {
             return None;
         }
+        // The clip is two 16-bit guest fields: on its own it permits a
+        // 65535-by-65535 fill, which is weeks of work for one primitive.
+        // A surface is no larger than the hardware draws into, and no
+        // larger than the object holding it.
+        let rows = color.limit / surface.color_pitch.max(1);
+        let width = surface.clip_width.min(MAX_SURFACE_DIMENSION).min(surface.color_pitch / 4);
+        let height = surface.clip_height.min(MAX_SURFACE_DIMENSION).min(rows.max(1));
+        if width == 0 || height == 0 {
+            return None;
+        }
         Some(crate::RenderTarget {
             base: color.base.wrapping_add(surface.color_offset),
             pitch: surface.color_pitch,
             clip_x: surface.clip_x,
             clip_y: surface.clip_y,
-            width: surface.clip_width,
-            height: surface.clip_height,
+            width,
+            height,
             // The depth surface shares the color surface's context object.
             zeta: (surface.zeta_pitch != 0 && surface.zeta_offset != 0)
                 .then(|| color.base.wrapping_add(surface.zeta_offset)),
@@ -1301,7 +1395,7 @@ impl PushbufferEngine {
         transform: &TransformState,
         vertex_dma: &[Option<DmaObject>; 2],
     ) -> Vec<crate::ScreenVertex> {
-        let program = &transform.program[transform.program_start as usize..];
+        let program = transform.program_from_start();
         let mut attributes = default_attributes();
         let mut vertices = Vec::with_capacity(state.elements.len());
         for index in &state.elements {
@@ -1315,10 +1409,13 @@ impl PushbufferEngine {
                 let Some(object) = vertex_dma[context].or(vertex_dma[0]) else {
                     continue;
                 };
-                let base = object
-                    .base
-                    .wrapping_add(raw_offset & !VERTEX_ARRAY_CONTEXT_B)
-                    .wrapping_add(index.wrapping_mul(stride));
+                let start = object.base.wrapping_add(raw_offset & !VERTEX_ARRAY_CONTEXT_B);
+                let base = start.wrapping_add(index.wrapping_mul(stride));
+                // An index the title never meant to send would otherwise
+                // read another object's memory as geometry.
+                if base < start || base.saturating_sub(start) > object.limit {
+                    continue;
+                }
                 let register = &mut attributes[attribute];
                 match format.kind {
                     ATTRIBUTE_TYPE_D3DCOLOR | ATTRIBUTE_TYPE_UBYTE_RGBA => {
@@ -1448,7 +1545,7 @@ impl PushbufferEngine {
                 return Vec::new();
             }
         }
-        let program = &transform.program[transform.program_start as usize..];
+        let program = transform.program_from_start();
         let mut vertices = Vec::with_capacity(state.inline.len() / stride as usize);
         // Attribute values as the program reads them, rebuilt per vertex.
         let mut attributes = default_attributes();
@@ -1512,17 +1609,18 @@ impl PushbufferEngine {
         if surface.zeta_pitch == 0 || surface.zeta_offset == 0 {
             return;
         }
-        let left = surface.clear_x.0.max(surface.clip_x);
-        let right = surface.clear_x.1.min(surface.clip_x.saturating_add(surface.clip_width));
-        let top = surface.clear_y.0.max(surface.clip_y);
-        let bottom = surface.clear_y.1.min(surface.clip_y.saturating_add(surface.clip_height));
-        if left >= right || top >= bottom {
+        let Some((left, right, top, bottom)) = surface.clear_bounds(surface.zeta_pitch) else {
             return;
-        }
+        };
         let base = color.base.wrapping_add(surface.zeta_offset);
         for row in top..bottom {
             let scanline = base.wrapping_add(row.wrapping_mul(surface.zeta_pitch));
             let start = scanline.wrapping_add(left * 4);
+            // The depth surface shares the colour object, so it shares its
+            // limit: a clear may not run past the end of it.
+            if start.wrapping_sub(color.base) > color.limit {
+                break;
+            }
             memory.fill_dwords(start, surface.clear_zstencil, right - left);
         }
     }
@@ -1540,13 +1638,9 @@ impl PushbufferEngine {
         if surface.color_pitch == 0 {
             return;
         }
-        let left = surface.clear_x.0.max(surface.clip_x);
-        let right = surface.clear_x.1.min(surface.clip_x.saturating_add(surface.clip_width));
-        let top = surface.clear_y.0.max(surface.clip_y);
-        let bottom = surface.clear_y.1.min(surface.clip_y.saturating_add(surface.clip_height));
-        if left >= right || top >= bottom {
+        let Some((left, right, top, bottom)) = surface.clear_bounds(surface.color_pitch) else {
             return;
-        }
+        };
 
         tracing::debug!(
             left,
@@ -1590,7 +1684,8 @@ impl PushbufferEngine {
         let (state, dma) = self.last_texture?;
         let texture = Self::bind_texture(memory, &state, dma)?;
         let (width, height) = (texture.width(), texture.height());
-        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        let bytes = u64::from(width) * u64::from(height) * 4;
+        let mut pixels = Vec::with_capacity(usize::try_from(bytes).unwrap_or(0));
         for y in 0..height {
             for x in 0..width {
                 let texel = texture.texel(x, y);
@@ -2009,6 +2104,171 @@ mod tests {
         assert_eq!(engine.stats().skipped_primitives, 1, "the gap is counted, not hidden");
     }
 
+    /// Runs one pushbuffer of words against a fresh engine, returning it.
+    ///
+    /// Every test below submits guest data no title would send. None may
+    /// panic, hang, or read outside the objects the stream names.
+    fn submit_words(words: &[u32]) -> (PushbufferEngine, FakeMemory) {
+        let memory = FakeMemory::new(0x2_0000);
+        memory.write_words(0x1000, words);
+        let mut engine = PushbufferEngine::default();
+        engine.submit(&memory, 0, 0x8000, 0, 0x1000, 0x1000 + words.len() as u32 * 4);
+        (engine, memory)
+    }
+
+    #[test]
+    fn a_transform_start_past_the_program_draws_nothing() {
+        let (engine, _) = submit_words(&[
+            header(1, 0, METHOD_SET_TRANSFORM_EXECUTION_MODE),
+            TRANSFORM_MODE_PROGRAM,
+            header(1, 0, METHOD_SET_TRANSFORM_PROGRAM_START),
+            0xFFFF_FFFF,
+            header(1, 0, METHOD_SET_VERTEX_DATA_ARRAY_FORMAT),
+            0x32,
+            header(1, 0, METHOD_SET_BEGIN_END),
+            PRIMITIVE_TRIANGLES,
+            header(1, 0, METHOD_ARRAY_ELEMENT32),
+            0,
+            header(1, 0, METHOD_SET_BEGIN_END),
+            0,
+        ]);
+        assert_eq!(engine.stats().triangles, 0, "an empty program places no geometry");
+    }
+
+    #[test]
+    fn a_transform_load_pointer_at_the_top_of_the_range_does_not_overflow() {
+        let (engine, _) = submit_words(&[
+            header(1, 0, METHOD_SET_TRANSFORM_PROGRAM_LOAD),
+            0x4000_0000,
+            header(1, 0, METHOD_SET_TRANSFORM_PROGRAM),
+            0xDEAD_BEEF,
+            header(1, 0, METHOD_SET_TRANSFORM_CONSTANT_LOAD),
+            0x3FFF_FFFF,
+            header(4, 0, METHOD_SET_TRANSFORM_CONSTANT),
+            0,
+            0,
+            0,
+            0,
+        ]);
+        // Reaching here at all is the assertion: these words used to panic
+        // on the multiply and on the increment past the end of the range.
+        assert_eq!(engine.stats().aborted, 0);
+    }
+
+    #[test]
+    fn a_vast_surface_clip_does_not_fill_forever() {
+        let handle = 0x1234_u32;
+        let hash = ramht_hash(handle, 9, 0) % 512;
+        let memory = FakeMemory::new(0x2_0000);
+        memory.write_words(0x8000 + hash * 8, &[handle, 0x100]);
+        memory.write_words(0x8000 + 0x1000, &[0x0000_003D, 0xFFFF, 0xC000]);
+        let words = [
+            header(1, 0, METHOD_SET_CONTEXT_DMA_COLOR),
+            handle,
+            // Sixty-five thousand pixels on a side, as the two 16-bit
+            // halves of the clip permit.
+            header(1, 0, METHOD_SET_SURFACE_CLIP_HORIZONTAL),
+            0xFFFF_0000,
+            header(1, 0, METHOD_SET_SURFACE_CLIP_VERTICAL),
+            0xFFFF_0000,
+            header(1, 0, METHOD_SET_SURFACE_PITCH),
+            32,
+            header(1, 0, METHOD_SET_CLEAR_RECT_HORIZONTAL),
+            0xFFFF_0000,
+            header(1, 0, METHOD_SET_CLEAR_RECT_VERTICAL),
+            0xFFFF_0000,
+            header(1, 0, METHOD_SET_COLOR_CLEAR_VALUE),
+            0xFFFF_FFFF,
+            header(1, 0, METHOD_CLEAR_SURFACE),
+            CLEAR_COLOR_MASK,
+        ];
+        memory.write_words(0x1000, &words);
+        let mut engine = PushbufferEngine::default();
+        let start = std::time::Instant::now();
+
+        engine.submit(&memory, 0, 0x8000, 0, 0x1000, 0x1000 + words.len() as u32 * 4);
+
+        assert!(
+            start.elapsed().as_secs() < 5,
+            "the clear is bounded by the surface, not the field"
+        );
+        assert!(
+            engine.stats().cleared_pixels < 1 << 26,
+            "cleared {} pixels",
+            engine.stats().cleared_pixels
+        );
+    }
+
+    #[test]
+    fn a_circular_pushbuffer_of_long_runs_exhausts_its_budget() {
+        let memory = FakeMemory::new(0x2_0000);
+        // A two-thousand-count method header, its arguments, then a jump
+        // back to the header: the pusher must charge every dword it reads.
+        let mut words = vec![(2047 << 18) | u32::from(0x0100_u16)];
+        words.extend(std::iter::repeat_n(0, 2047));
+        words.push(0x2000_0000 | 0x1000);
+        memory.write_words(0x1000, &words);
+        let mut engine = PushbufferEngine::default();
+        let start = std::time::Instant::now();
+
+        engine.submit(&memory, 0, 0x8000, 0, 0x1000, 0x1000 + words.len() as u32 * 4);
+
+        assert!(start.elapsed().as_secs() < 10, "the budget bounds the walk");
+        assert!(
+            engine.stats().method_dwords <= u64::from(MAX_DWORDS_PER_SUBMIT),
+            "consumed {} dwords",
+            engine.stats().method_dwords
+        );
+    }
+
+    #[test]
+    fn a_texture_larger_than_the_hardware_is_refused() {
+        let handle = 0x1234_u32;
+        let hash = ramht_hash(handle, 9, 0) % 512;
+        let memory = FakeMemory::new(0x2_0000);
+        memory.write_words(0x8000 + hash * 8, &[handle, 0x100]);
+        memory.write_words(0x8000 + 0x1000, &[0x0000_003D, 0xFFFF, 0xC000]);
+        let words = [
+            header(1, 0, METHOD_SET_CONTEXT_DMA_A),
+            handle,
+            header(1, 0, METHOD_SET_TEXTURE_OFFSET),
+            0,
+            // Thirty-two thousand texels on a side.
+            header(1, 0, METHOD_SET_TEXTURE_FORMAT),
+            0xFF00_1201,
+            header(1, 0, METHOD_SET_TEXTURE_CONTROL1),
+            4 << 16,
+            header(1, 0, METHOD_SET_TEXTURE_CONTROL0),
+            TEXTURE_ENABLE,
+        ];
+        memory.write_words(0x1000, &words);
+        let mut engine = PushbufferEngine::default();
+        engine.submit(&memory, 0, 0x8000, 0, 0x1000, 0x1000 + words.len() as u32 * 4);
+
+        assert!(
+            engine.dump_last_texture(&memory).is_none(),
+            "no sampler for an impossible texture"
+        );
+    }
+
+    #[test]
+    fn the_method_census_stops_growing() {
+        // A fresh object handle before every method would otherwise key a
+        // new census entry each time until memory ran out.
+        let mut words = Vec::new();
+        for handle in 0..(MAX_CENSUS_ENTRIES as u32 + 64) {
+            words.push(header(1, 0, METHOD_SET_OBJECT));
+            words.push(handle + 1);
+            words.push(header(1, 0, 0x0100));
+            words.push(0);
+        }
+        let (engine, _) = submit_words(&words);
+        assert!(
+            engine.top_methods(usize::MAX).len() <= MAX_CENSUS_ENTRIES,
+            "the census is capped at {MAX_CENSUS_ENTRIES}"
+        );
+    }
+
     #[test]
     fn call_and_return_round_trip() {
         let memory = FakeMemory::new(0x1_0000);
@@ -2034,98 +2294,5 @@ mod tests {
 
         assert_eq!(end, 0x1000, "the abandonment point is the bad word");
         assert_eq!(engine.stats().aborted, 1);
-    }
-
-    /// TEMPORARY probe: the reviewer's exact trigger.
-    #[test]
-    fn probe_reviewer_trigger() {
-        let memory = FakeMemory::new(0x2_0000);
-        let pramin = 0x8000_u32;
-        let handle = 0x1234_u32;
-        let hash = ramht_hash(handle, 9, 0) % 512;
-        memory.write_words(pramin + hash * 8, &[handle, 0x100]);
-        // class 0x3D, limit 0xFF (256 bytes), frame/base 0x2000.
-        memory.write_words(pramin + 0x1000, &[0x0000_003D, 0xFF, 0x2000]);
-
-        let words = vec![
-            header(1, 0, METHOD_SET_CONTEXT_DMA_COLOR),
-            handle,
-            header(1, 0, METHOD_SET_SURFACE_CLIP_HORIZONTAL),
-            10 << 16,
-            header(1, 0, METHOD_SET_SURFACE_CLIP_VERTICAL),
-            10 << 16,
-            header(1, 0, METHOD_SET_SURFACE_PITCH),
-            (40 << 16) | 40,
-            header(1, 0, METHOD_SET_SURFACE_ZETA_OFFSET),
-            0x4000,
-            header(1, 0, METHOD_SET_CLEAR_RECT_HORIZONTAL),
-            10 << 16,
-            header(1, 0, METHOD_SET_CLEAR_RECT_VERTICAL),
-            10 << 16,
-            header(1, 0, METHOD_SET_ZSTENCIL_CLEAR_VALUE),
-            0xDEAD_BEEF,
-            header(1, 0, METHOD_SET_COLOR_CLEAR_VALUE),
-            0xCAFE_BABE,
-            header(1, 0, METHOD_CLEAR_SURFACE),
-            0xF3,
-        ];
-        let len = words.len() as u32 * 4;
-        memory.write_words(0x1000, &words);
-        let mut engine = PushbufferEngine::default();
-
-        engine.submit(&memory, 0, pramin, 0, 0x1000, 0x1000 + len);
-
-        println!("zeta 0x6000        = {:#010x}", memory.read_word(0x6000));
-        println!("zeta 0x6000+9*40   = {:#010x}", memory.read_word(0x6000 + 9 * 40));
-        for row in 0..10 {
-            println!(
-                "color row {row}: {:#010x} at {:#06x}",
-                memory.read_word(0x2000 + row * 40),
-                0x2000 + row * 40
-            );
-        }
-        println!("cleared_pixels = {}", engine.stats().cleared_pixels);
-    }
-
-    /// TEMPORARY probe: the colour path aimed outside the object too.
-    #[test]
-    fn probe_color_offset_escapes_the_limit() {
-        let memory = FakeMemory::new(0x2_0000);
-        let pramin = 0x8000_u32;
-        let handle = 0x1234_u32;
-        let hash = ramht_hash(handle, 9, 0) % 512;
-        memory.write_words(pramin + hash * 8, &[handle, 0x100]);
-        memory.write_words(pramin + 0x1000, &[0x0000_003D, 0xFF, 0x2000]);
-
-        let words = vec![
-            header(1, 0, METHOD_SET_CONTEXT_DMA_COLOR),
-            handle,
-            header(1, 0, METHOD_SET_SURFACE_CLIP_HORIZONTAL),
-            10 << 16,
-            header(1, 0, METHOD_SET_SURFACE_CLIP_VERTICAL),
-            10 << 16,
-            header(1, 0, METHOD_SET_SURFACE_PITCH),
-            (40 << 16) | 40,
-            header(1, 0, METHOD_SET_SURFACE_COLOR_OFFSET),
-            0x4000,
-            header(1, 0, METHOD_SET_CLEAR_RECT_HORIZONTAL),
-            10 << 16,
-            header(1, 0, METHOD_SET_CLEAR_RECT_VERTICAL),
-            10 << 16,
-            header(1, 0, METHOD_SET_COLOR_CLEAR_VALUE),
-            0xCAFE_BABE,
-            header(1, 0, METHOD_CLEAR_SURFACE),
-            0xF0,
-        ];
-        let len = words.len() as u32 * 4;
-        memory.write_words(0x1000, &words);
-        let mut engine = PushbufferEngine::default();
-
-        engine.submit(&memory, 0, pramin, 0, 0x1000, 0x1000 + len);
-
-        println!("color at 0x6000       = {:#010x}", memory.read_word(0x6000));
-        println!("color at 0x6000+6*40  = {:#010x}", memory.read_word(0x6000 + 6 * 40));
-        println!("color at 0x6000+7*40  = {:#010x}", memory.read_word(0x6000 + 7 * 40));
-        println!("cleared_pixels = {}", engine.stats().cleared_pixels);
     }
 }

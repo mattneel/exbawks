@@ -260,6 +260,26 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+### Fixed (graphics, from an adversarial review)
+
+- Malformed pushbuffer data can no longer panic or hang the engine. A
+  transform program start past the program's end now runs nothing instead of
+  slicing out of range; the program and constant load pointers wrap instead
+  of overflowing; a surface clip, whose two halves permit sixty-five thousand
+  pixels a side, is bounded by what the hardware draws into and by the object
+  holding it; the per-submission budget charges every dword the pusher reads
+  rather than only headers, so a circular pushbuffer of long runs stops; the
+  method census stops growing when a stream binds a fresh object handle per
+  method; and the frame and texture captures refuse a size no display has.
+- Texture samples and vertex-array fetches stay inside the object they were
+  bound to, and a depth clear honours its object's limit the way the colour
+  clear already did.
+- `DXT3` and `DXT5` colour halves decode with four colours. They carry alpha
+  separately, so reading them by `DXT1`'s rule turned a quarter of the texels
+  of any block whose endpoints ascend into transparent black.
+- A compressed or swizzled texture one texel on a side is sized by its format
+  word rather than by the rectangle an earlier linear texture left behind.
+
 - A private compatibility harness (`QA-002`): manifests under a directory
   named by `EXBAWKS_PRIVATE_FIXTURES` say which local image to run and which
   frame digest it should render, and `just goldens` runs them. The suite is

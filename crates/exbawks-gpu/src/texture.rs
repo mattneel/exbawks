@@ -44,10 +44,26 @@ fn mix(first: u32, second: u32, numerator: u32, denominator: u32) -> u32 {
 pub fn dxt1_texel(block: [u32; 2], x: u32, y: u32) -> u32 {
     let first = (block[0] & 0xFFFF) as u16;
     let second = ((block[0] >> 16) & 0xFFFF) as u16;
-    let color0 = expand_565(first);
-    let color1 = expand_565(second);
+    color_texel(block, x, y, first > second)
+}
+
+/// Decodes one texel of a color block that always carries four colors.
+///
+/// `DXT3` and `DXT5` keep alpha in their own half of the block, so their
+/// color halves never spend a slot on transparency the way a `DXT1` block
+/// can — reading them by `DXT1`'s rule turns a quarter of the texels of any
+/// block whose endpoints happen to ascend into transparent black.
+#[must_use]
+pub fn dxt_opaque_texel(block: [u32; 2], x: u32, y: u32) -> u32 {
+    color_texel(block, x, y, true)
+}
+
+/// Decodes one texel of a color block under the chosen interpretation.
+fn color_texel(block: [u32; 2], x: u32, y: u32, four_colors: bool) -> u32 {
+    let color0 = expand_565((block[0] & 0xFFFF) as u16);
+    let color1 = expand_565(((block[0] >> 16) & 0xFFFF) as u16);
     let index = (block[1] >> ((y & 3) * 8 + (x & 3) * 2)) & 0x3;
-    if first > second {
+    if four_colors {
         match index {
             0 => color0,
             1 => color1,
@@ -124,6 +140,16 @@ mod tests {
         let texel = dxt1_texel(block, 0, 0);
         let red = (texel >> 16) & 0xFF;
         assert!((0xA6..=0xAE).contains(&red), "two thirds white: {red:#x}");
+    }
+
+    #[test]
+    fn an_alpha_carrying_block_keeps_four_colors() {
+        // Ascending endpoints would select the three-color mode in DXT1;
+        // a DXT3 or DXT5 color half must not read the fourth slot as clear.
+        let block = [0xFFFF_0000, 0xFFFF_FFFF];
+        assert_eq!(dxt1_texel(block, 0, 0), 0, "DXT1 spends the slot on transparency");
+        assert_ne!(dxt_opaque_texel(block, 0, 0), 0, "an alpha-carrying block does not");
+        assert_eq!(dxt_opaque_texel(block, 0, 0) >> 24, 0xFF, "and stays opaque");
     }
 
     #[test]

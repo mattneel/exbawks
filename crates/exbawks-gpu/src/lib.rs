@@ -19,4 +19,4 @@ pub use raster::{
     BlendMode, DepthState, PixelSink, RenderTarget, ScreenVertex, TextureSource, fill_triangle,
 };
 pub use shader::{INPUT_REGISTERS, ShaderResult, execute};
-pub use texture::{dxt1_texel, dxt3_alpha, dxt5_alpha};
+pub use texture::{dxt_opaque_texel, dxt1_texel, dxt3_alpha, dxt5_alpha};
