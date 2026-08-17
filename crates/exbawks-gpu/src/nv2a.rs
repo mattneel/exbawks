@@ -66,6 +66,10 @@ struct SurfaceState {
     color_dma: Option<DmaObject>,
     /// The color surface's byte offset inside that object.
     color_offset: u32,
+    /// The depth surface's byte offset inside the same object.
+    zeta_offset: u32,
+    /// The distance between depth scanlines in bytes.
+    zeta_pitch: u32,
     /// The distance between color scanlines in bytes.
     color_pitch: u32,
     /// The surface clip's left edge and width in pixels.
@@ -76,6 +80,8 @@ struct SurfaceState {
     clip_height: u32,
     /// The ARGB value a color clear writes.
     clear_color: u32,
+    /// The packed depth and stencil value a depth clear writes.
+    clear_zstencil: u32,
     /// The clear rectangle's horizontal bounds (left, right).
     clear_x: (u32, u32),
     /// The clear rectangle's vertical bounds (top, bottom).
@@ -236,6 +242,12 @@ struct ChannelState {
     transform: TransformState,
     /// Whether blending is enabled.
     blend: bool,
+    /// Whether a fragment is compared against the depth surface.
+    depth_test: bool,
+    /// Whether a passing fragment updates the depth surface.
+    depth_write: bool,
+    /// The depth comparison the title selected.
+    depth_function: u32,
     /// The first texture unit's state.
     texture: TextureState,
     /// The context-DMA objects textures address through (`A` and `B`).
@@ -474,8 +486,12 @@ const METHOD_SET_SURFACE_CLIP_VERTICAL: u16 = 0x0204;
 const METHOD_SET_SURFACE_PITCH: u16 = 0x020C;
 /// Kelvin `SET_SURFACE_COLOR_OFFSET`.
 const METHOD_SET_SURFACE_COLOR_OFFSET: u16 = 0x0210;
+/// Kelvin `SET_ZSTENCIL_CLEAR_VALUE`.
+const METHOD_SET_ZSTENCIL_CLEAR_VALUE: u16 = 0x1D8C;
 /// Kelvin `SET_COLOR_CLEAR_VALUE`.
 const METHOD_SET_COLOR_CLEAR_VALUE: u16 = 0x1D90;
+/// The `CLEAR_SURFACE` bits selecting depth and stencil.
+const CLEAR_DEPTH_MASK: u32 = 0x03;
 /// Kelvin `CLEAR_SURFACE`: the buffers a clear touches.
 const METHOD_CLEAR_SURFACE: u16 = 0x1D94;
 /// Kelvin `SET_CLEAR_RECT_HORIZONTAL`: left and right edges.
@@ -560,6 +576,14 @@ const TRANSFORM_MODE_PROGRAM: u32 = 2;
 
 /// Kelvin `SET_BLEND_ENABLE`.
 const METHOD_SET_BLEND_ENABLE: u16 = 0x0304;
+/// Kelvin `SET_DEPTH_TEST_ENABLE`.
+const METHOD_SET_DEPTH_TEST_ENABLE: u16 = 0x030C;
+/// Kelvin `SET_DEPTH_FUNC`.
+const METHOD_SET_DEPTH_FUNC: u16 = 0x0354;
+/// Kelvin `SET_DEPTH_MASK`: whether depth writes reach the surface.
+const METHOD_SET_DEPTH_MASK: u16 = 0x035C;
+/// Kelvin `SET_SURFACE_ZETA_OFFSET`.
+const METHOD_SET_SURFACE_ZETA_OFFSET: u16 = 0x0214;
 /// Kelvin `SET_TEXTURE_OFFSET` for unit zero; units are 64 bytes apart.
 const METHOD_SET_TEXTURE_OFFSET: u16 = 0x1B00;
 /// Kelvin `SET_TEXTURE_FORMAT` for unit zero.
@@ -823,12 +847,28 @@ impl PushbufferEngine {
             }
             METHOD_SET_SURFACE_PITCH => {
                 state.surface.color_pitch = argument & 0xFFFF;
+                state.surface.zeta_pitch = argument >> 16;
+            }
+            METHOD_SET_SURFACE_ZETA_OFFSET => {
+                state.surface.zeta_offset = argument;
+            }
+            METHOD_SET_DEPTH_TEST_ENABLE => {
+                state.depth_test = argument != 0;
+            }
+            METHOD_SET_DEPTH_MASK => {
+                state.depth_write = argument != 0;
+            }
+            METHOD_SET_DEPTH_FUNC => {
+                state.depth_function = argument;
             }
             METHOD_SET_SURFACE_COLOR_OFFSET => {
                 state.surface.color_offset = argument;
             }
             METHOD_SET_COLOR_CLEAR_VALUE => {
                 state.surface.clear_color = argument;
+            }
+            METHOD_SET_ZSTENCIL_CLEAR_VALUE => {
+                state.surface.clear_zstencil = argument;
             }
             METHOD_SET_CLEAR_RECT_HORIZONTAL => {
                 state.surface.clear_x = (argument & 0xFFFF, argument >> 16);
@@ -837,9 +877,15 @@ impl PushbufferEngine {
                 state.surface.clear_y = (argument & 0xFFFF, argument >> 16);
             }
             METHOD_CLEAR_SURFACE => {
+                let surface = self.channels.entry(channel).or_default().surface;
                 if argument & CLEAR_COLOR_MASK != 0 {
-                    let surface = self.channels.entry(channel).or_default().surface;
                     self.clear_color_surface(memory, &surface);
+                }
+                if argument & CLEAR_DEPTH_MASK != 0 {
+                    // A depth clear is the same rectangle fill against the
+                    // depth surface; without it every fragment would be
+                    // compared against whatever the memory last held.
+                    Self::clear_zeta_surface(memory, &surface);
                 }
             }
             METHOD_SET_VIEWPORT_OFFSET..=VIEWPORT_OFFSET_LAST => {
@@ -992,7 +1038,7 @@ impl PushbufferEngine {
     /// anything else is counted and skipped, so what is missing stays
     /// visible in the statistics rather than quietly drawing nothing.
     fn end_primitive(&mut self, memory: &dyn Nv2aMemory, channel: u32) {
-        let (primitive, vertices, surface, texture, texture_dma, blend) = {
+        let (primitive, vertices, surface, texture, texture_dma, blend, depth) = {
             let state = self.channels.entry(channel).or_default();
             let Some(primitive) = state.vertex.primitive.take() else {
                 return;
@@ -1005,7 +1051,14 @@ impl PushbufferEngine {
             state.vertex.inline.clear();
             state.vertex.elements.clear();
             let dma = state.texture_dma[(state.texture.format & 3).saturating_sub(1) as usize & 1];
-            (primitive, vertices, state.surface, state.texture, dma, state.blend)
+            let depth = crate::DepthState {
+                test: state.depth_test,
+                write: state.depth_write,
+                // The hardware's comparisons are numbered from a base of
+                // `never`; a title programs them as `0x200 + comparison`.
+                function: state.depth_function & 0x7,
+            };
+            (primitive, vertices, state.surface, state.texture, dma, state.blend, depth)
         };
         let Some(target) = Self::render_target(&surface).filter(|_| !vertices.is_empty()) else {
             self.stats.skipped_primitives += 1;
@@ -1091,6 +1144,7 @@ impl PushbufferEngine {
                 [vertices[a], vertices[b], vertices[c]],
                 sampler,
                 mode,
+                depth,
             );
             self.stats.triangles += 1;
             self.stats.shaded_pixels += written;
@@ -1157,6 +1211,10 @@ impl PushbufferEngine {
             clip_y: surface.clip_y,
             width: surface.clip_width,
             height: surface.clip_height,
+            // The depth surface shares the color surface's context object.
+            zeta: (surface.zeta_pitch != 0 && surface.zeta_offset != 0)
+                .then(|| color.base.wrapping_add(surface.zeta_offset)),
+            zeta_pitch: surface.zeta_pitch,
         })
     }
 
@@ -1202,10 +1260,11 @@ impl PushbufferEngine {
             (clip, attributes[ATTRIBUTE_DIFFUSE], [texcoord[0], texcoord[1]])
         };
 
-        let [x, y, _, w] = position;
+        let [x, y, z, w] = position;
         if w == 0.0 || !w.is_finite() {
             return None;
         }
+        let inverse_w = 1.0 / w;
         // Both paths reach the surface already scaled: a program applies
         // the viewport from constants, and the fixed pipeline has it folded
         // into the matrix, leaving only the register's sub-pixel offset.
@@ -1224,6 +1283,10 @@ impl PushbufferEngine {
                 | color(diffuse[2]),
             u: texcoord[0],
             v: texcoord[1],
+            // Depth reaches the surface already divided, as the transform
+            // that produced it folded in the depth scale.
+            z: z * inverse_w,
+            inverse_w,
         })
     }
 
@@ -1432,9 +1495,36 @@ impl PushbufferEngine {
                 color,
                 u,
                 v,
+                // Pre-transformed geometry arrives with its depth already
+                // in surface units and no perspective left to correct.
+                z: chunk.get(2).map_or(0.0, |bits| f32::from_bits(*bits)),
+                inverse_w: 1.0,
             });
         }
         vertices
+    }
+
+    /// Fills the clear rectangle of the depth surface with its clear value.
+    fn clear_zeta_surface(memory: &dyn Nv2aMemory, surface: &SurfaceState) {
+        let Some(color) = surface.color_dma else {
+            return;
+        };
+        if surface.zeta_pitch == 0 || surface.zeta_offset == 0 {
+            return;
+        }
+        let left = surface.clear_x.0.max(surface.clip_x);
+        let right = surface.clear_x.1.min(surface.clip_x.saturating_add(surface.clip_width));
+        let top = surface.clear_y.0.max(surface.clip_y);
+        let bottom = surface.clear_y.1.min(surface.clip_y.saturating_add(surface.clip_height));
+        if left >= right || top >= bottom {
+            return;
+        }
+        let base = color.base.wrapping_add(surface.zeta_offset);
+        for row in top..bottom {
+            let scanline = base.wrapping_add(row.wrapping_mul(surface.zeta_pitch));
+            let start = scanline.wrapping_add(left * 4);
+            memory.fill_dwords(start, surface.clear_zstencil, right - left);
+        }
     }
 
     /// Fills the clear rectangle of the color surface with its clear value.

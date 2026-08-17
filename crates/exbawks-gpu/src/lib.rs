@@ -15,6 +15,8 @@ pub use command::{ClearMask, GraphicsCommand, PrimitiveType, ResourceHandle};
 pub use error::GraphicsError;
 pub use frontend::GraphicsFrontend;
 pub use nv2a::{DmaObject, Nv2aMemory, PushbufferEngine, PusherStats};
-pub use raster::{BlendMode, PixelSink, RenderTarget, ScreenVertex, TextureSource, fill_triangle};
+pub use raster::{
+    BlendMode, DepthState, PixelSink, RenderTarget, ScreenVertex, TextureSource, fill_triangle,
+};
 pub use shader::{INPUT_REGISTERS, ShaderResult, execute};
 pub use texture::{dxt1_texel, dxt3_alpha, dxt5_alpha};

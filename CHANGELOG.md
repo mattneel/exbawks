@@ -260,6 +260,14 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- Depth testing and perspective-correct texturing. Fragments compare against
+  the depth surface by the title's chosen function and update it when its
+  depth mask allows, and `CLEAR_SURFACE` clears depth as well as color —
+  without that clear every fragment is compared against whatever the memory
+  last held, which rejected all but a twentieth of them. Texture coordinates
+  now interpolate in the plane of the triangle rather than across the
+  screen, so a textured surface seen at an angle no longer skews.
+
 - Vertex arrays: a title that draws from arrays it uploaded once — indices
   through `ARRAY_ELEMENT16` and `ARRAY_ELEMENT32`, attributes at their own
   offsets and strides in a vertex context DMA — now assembles the same way

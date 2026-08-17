@@ -22,6 +22,11 @@ pub struct ScreenVertex {
     pub u: f32,
     /// The vertical texture coordinate, in units of the texture height.
     pub v: f32,
+    /// The depth, in the units the depth surface stores.
+    pub z: f32,
+    /// The reciprocal of the clip-space `w`, for perspective-correct
+    /// interpolation. One for geometry that arrives already projected.
+    pub inverse_w: f32,
 }
 
 /// A bound texture the rasterizer can sample.
@@ -63,6 +68,18 @@ pub struct RenderTarget {
     pub width: u32,
     /// The drawable rectangle's height in pixels.
     pub height: u32,
+    /// The depth surface's base physical address, when one is bound.
+    pub zeta: Option<u32>,
+    /// The distance between depth scanlines in bytes.
+    pub zeta_pitch: u32,
+}
+
+impl RenderTarget {
+    /// The physical address of one depth value, when a surface is bound.
+    fn depth_address(&self, x: u32, y: u32) -> Option<u32> {
+        let base = self.zeta?;
+        base.checked_add(y.checked_mul(self.zeta_pitch)?)?.checked_add(x.checked_mul(4)?)
+    }
 }
 
 impl RenderTarget {
@@ -86,6 +103,34 @@ pub trait PixelSink {
 
     /// Reads the pixel already at a physical address, for blending.
     fn read_pixel(&self, physical: u32) -> u32;
+}
+
+/// How a fragment's depth is compared against the surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DepthState {
+    /// Whether a fragment must pass the comparison to be drawn.
+    pub test: bool,
+    /// Whether a passing fragment updates the depth surface.
+    pub write: bool,
+    /// The comparison, in the hardware's numbering: never, less, equal,
+    /// less-or-equal, greater, not-equal, greater-or-equal, always.
+    pub function: u32,
+}
+
+impl DepthState {
+    /// Whether a fragment at `value` passes against `stored`.
+    fn passes(self, value: u32, stored: u32) -> bool {
+        match self.function & 0x7 {
+            0 => false,
+            1 => value < stored,
+            2 => value == stored,
+            3 => value <= stored,
+            4 => value > stored,
+            5 => value != stored,
+            6 => value >= stored,
+            _ => true,
+        }
+    }
 }
 
 /// How a drawn pixel combines with what is already on the surface.
@@ -150,6 +195,7 @@ pub fn fill_triangle(
     vertices: [ScreenVertex; 3],
     texture: Option<&dyn TextureSource>,
     blend: BlendMode,
+    depth: DepthState,
 ) -> u64 {
     let [a, b, c] = vertices;
     let area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
@@ -188,10 +234,42 @@ pub fn fill_triangle(
                 continue;
             };
             let weights = [weight_a / area, weight_b / area, weight_c / area];
+
+            // Depth is already divided by `w`, so it interpolates linearly
+            // in screen space, as the hardware's does.
+            let mut depth_address = None;
+            if depth.test || depth.write {
+                let value = weights[0] * a.z + weights[1] * b.z + weights[2] * c.z;
+                let value = value.clamp(0.0, f32::from(u16::MAX) * 256.0) as u32;
+                if let Some(address) = target.depth_address(x, y) {
+                    // A `Z24S8` surface keeps its stencil in the low byte.
+                    let stored = sink.read_pixel(address) >> 8;
+                    if depth.test && !depth.passes(value, stored) {
+                        continue;
+                    }
+                    if depth.write {
+                        depth_address = Some((address, value));
+                    }
+                }
+            }
+
             let mut color = interpolate_color([a.color, b.color, c.color], weights);
             if let Some(texture) = texture {
-                let u = weights[0] * a.u + weights[1] * b.u + weights[2] * c.u;
-                let v = weights[0] * a.v + weights[1] * b.v + weights[2] * c.v;
+                // Texture coordinates interpolate in the plane of the
+                // triangle, not the screen: weight each by the vertex's
+                // reciprocal `w` and divide by the interpolated reciprocal,
+                // or a textured surface seen at an angle skews.
+                let inverse_w =
+                    weights[0] * a.inverse_w + weights[1] * b.inverse_w + weights[2] * c.inverse_w;
+                let scale = if inverse_w == 0.0 { 1.0 } else { 1.0 / inverse_w };
+                let u = (weights[0] * a.u * a.inverse_w
+                    + weights[1] * b.u * b.inverse_w
+                    + weights[2] * c.u * c.inverse_w)
+                    * scale;
+                let v = (weights[0] * a.v * a.inverse_w
+                    + weights[1] * b.v * b.inverse_w
+                    + weights[2] * c.v * c.inverse_w)
+                    * scale;
                 let texel_x = (u * texture.width() as f32) as i64;
                 let texel_y = (v * texture.height() as f32) as i64;
                 let texel = texture.texel(
@@ -213,6 +291,10 @@ pub fn fill_triangle(
                 }
             }
             sink.write_pixel(address, color);
+            if let Some((address, value)) = depth_address {
+                let stencil = sink.read_pixel(address) & 0xFF;
+                sink.write_pixel(address, (value << 8) | stencil);
+            }
             written += 1;
         }
         y += 1;
@@ -246,11 +328,20 @@ mod tests {
     }
 
     fn target() -> RenderTarget {
-        RenderTarget { base: 0x1000, pitch: 40, clip_x: 0, clip_y: 0, width: 10, height: 10 }
+        RenderTarget {
+            base: 0x1000,
+            pitch: 40,
+            clip_x: 0,
+            clip_y: 0,
+            width: 10,
+            height: 10,
+            zeta: None,
+            zeta_pitch: 0,
+        }
     }
 
     fn vertex(x: f32, y: f32, color: u32) -> ScreenVertex {
-        ScreenVertex { x, y, color, u: 0.0, v: 0.0 }
+        ScreenVertex { x, y, color, u: 0.0, v: 0.0, z: 0.0, inverse_w: 1.0 }
     }
 
     /// A two-by-two texture whose texels are their own coordinates.
@@ -289,6 +380,7 @@ mod tests {
             ],
             None,
             BlendMode::Replace,
+            DepthState::default(),
         );
         // Half of a hundred pixels, within the diagonal's rounding.
         assert!((45..=60).contains(&written), "covered {written} pixels");
@@ -307,6 +399,7 @@ mod tests {
             ],
             None,
             BlendMode::Replace,
+            DepthState::default(),
         );
         let counter = fill_triangle(
             &canvas,
@@ -318,6 +411,7 @@ mod tests {
             ],
             None,
             BlendMode::Replace,
+            DepthState::default(),
         );
         assert_eq!(clockwise, counter, "both windings fill the same pixels");
     }
@@ -335,6 +429,7 @@ mod tests {
             ],
             None,
             BlendMode::Replace,
+            DepthState::default(),
         );
         let written = canvas.0.lock().expect("lock");
         let (first_address, first_color) = written[0];
@@ -357,6 +452,7 @@ mod tests {
             ],
             None,
             BlendMode::Replace,
+            DepthState::default(),
         );
         assert_eq!(written, 0);
         assert!(canvas.0.lock().expect("lock").is_empty());
@@ -375,6 +471,7 @@ mod tests {
             ],
             None,
             BlendMode::Replace,
+            DepthState::default(),
         );
         assert_eq!(written, 0, "a zero-area triangle covers nothing");
     }
@@ -392,6 +489,7 @@ mod tests {
             ],
             None,
             BlendMode::Replace,
+            DepthState::default(),
         );
         let written = canvas.0.lock().expect("lock");
         let colors: Vec<u32> = written.iter().map(|(_, color)| *color).collect();
@@ -419,8 +517,14 @@ mod tests {
         ];
         vertices[1].u = 1.0;
         vertices[2].v = 1.0;
-        let written =
-            fill_triangle(&canvas, &target(), vertices, Some(&Checker), BlendMode::Replace);
+        let written = fill_triangle(
+            &canvas,
+            &target(),
+            vertices,
+            Some(&Checker),
+            BlendMode::Replace,
+            DepthState::default(),
+        );
 
         assert!(written > 0);
         let pixels = canvas.0.lock().expect("lock");
@@ -435,11 +539,18 @@ mod tests {
         let canvas = Canvas::default();
         // Half-intensity vertex color over the first texel (pure red).
         let vertices = [
-            ScreenVertex { x: 0.0, y: 0.0, color: 0xFF80_8080, u: 0.0, v: 0.0 },
-            ScreenVertex { x: 4.0, y: 0.0, color: 0xFF80_8080, u: 0.0, v: 0.0 },
-            ScreenVertex { x: 0.0, y: 4.0, color: 0xFF80_8080, u: 0.0, v: 0.0 },
+            vertex(0.0, 0.0, 0xFF80_8080),
+            vertex(4.0, 0.0, 0xFF80_8080),
+            vertex(0.0, 4.0, 0xFF80_8080),
         ];
-        fill_triangle(&canvas, &target(), vertices, Some(&Checker), BlendMode::Replace);
+        fill_triangle(
+            &canvas,
+            &target(),
+            vertices,
+            Some(&Checker),
+            BlendMode::Replace,
+            DepthState::default(),
+        );
 
         let pixels = canvas.0.lock().expect("lock");
         let (_, color) = pixels[0];
@@ -453,11 +564,18 @@ mod tests {
     fn transparent_pixels_leave_the_surface_alone() {
         let canvas = Canvas::default();
         let vertices = [
-            ScreenVertex { x: 0.0, y: 0.0, color: 0x0000_0000, u: 0.0, v: 0.0 },
-            ScreenVertex { x: 8.0, y: 0.0, color: 0x0000_0000, u: 0.0, v: 0.0 },
-            ScreenVertex { x: 0.0, y: 8.0, color: 0x0000_0000, u: 0.0, v: 0.0 },
+            vertex(0.0, 0.0, 0x0000_0000),
+            vertex(8.0, 0.0, 0x0000_0000),
+            vertex(0.0, 8.0, 0x0000_0000),
         ];
-        let written = fill_triangle(&canvas, &target(), vertices, None, BlendMode::SourceAlpha);
+        let written = fill_triangle(
+            &canvas,
+            &target(),
+            vertices,
+            None,
+            BlendMode::SourceAlpha,
+            DepthState::default(),
+        );
 
         assert_eq!(written, 0, "nothing is drawn through zero alpha");
         assert!(canvas.0.lock().expect("lock").is_empty());
@@ -469,11 +587,18 @@ mod tests {
         // Paint the surface white, then draw half-transparent black over it.
         canvas.write_pixel(0x1000, 0xFFFF_FFFF);
         let vertices = [
-            ScreenVertex { x: 0.0, y: 0.0, color: 0x8000_0000, u: 0.0, v: 0.0 },
-            ScreenVertex { x: 4.0, y: 0.0, color: 0x8000_0000, u: 0.0, v: 0.0 },
-            ScreenVertex { x: 0.0, y: 4.0, color: 0x8000_0000, u: 0.0, v: 0.0 },
+            vertex(0.0, 0.0, 0x8000_0000),
+            vertex(4.0, 0.0, 0x8000_0000),
+            vertex(0.0, 4.0, 0x8000_0000),
         ];
-        fill_triangle(&canvas, &target(), vertices, None, BlendMode::SourceAlpha);
+        fill_triangle(
+            &canvas,
+            &target(),
+            vertices,
+            None,
+            BlendMode::SourceAlpha,
+            DepthState::default(),
+        );
 
         let pixels = canvas.0.lock().expect("lock");
         let (_, color) = *pixels
@@ -486,10 +611,115 @@ mod tests {
     }
 
     #[test]
+    fn a_fragment_behind_the_surface_is_rejected() {
+        let canvas = Canvas::default();
+        let target = RenderTarget {
+            base: 0x1000,
+            pitch: 40,
+            clip_x: 0,
+            clip_y: 0,
+            width: 10,
+            height: 10,
+            zeta: Some(0x8000),
+            zeta_pitch: 40,
+        };
+        // The surface already holds a nearer depth than the fragment's.
+        canvas.write_pixel(0x8000, 100 << 8);
+        let mut vertices = [
+            vertex(0.0, 0.0, 0xFFFFFFFF),
+            vertex(4.0, 0.0, 0xFFFFFFFF),
+            vertex(0.0, 4.0, 0xFFFFFFFF),
+        ];
+        for vertex in &mut vertices {
+            vertex.z = 500.0;
+        }
+        let depth = DepthState { test: true, write: true, function: 3 };
+        fill_triangle(&canvas, &target, vertices, None, BlendMode::Replace, depth);
+
+        let pixels = canvas.0.lock().expect("lock");
+        assert!(
+            !pixels.iter().skip(1).any(|(address, _)| *address == 0x1000),
+            "the first pixel is behind what is already there"
+        );
+    }
+
+    #[test]
+    fn a_nearer_fragment_draws_and_updates_the_depth() {
+        let canvas = Canvas::default();
+        let target = RenderTarget {
+            base: 0x1000,
+            pitch: 40,
+            clip_x: 0,
+            clip_y: 0,
+            width: 10,
+            height: 10,
+            zeta: Some(0x8000),
+            zeta_pitch: 40,
+        };
+        canvas.write_pixel(0x8000, 500 << 8);
+        let mut vertices = [
+            vertex(0.0, 0.0, 0xFFFFFFFF),
+            vertex(4.0, 0.0, 0xFFFFFFFF),
+            vertex(0.0, 4.0, 0xFFFFFFFF),
+        ];
+        for vertex in &mut vertices {
+            vertex.z = 100.0;
+        }
+        let depth = DepthState { test: true, write: true, function: 3 };
+        let written = fill_triangle(&canvas, &target, vertices, None, BlendMode::Replace, depth);
+
+        assert!(written > 0, "a nearer fragment draws");
+        let pixels = canvas.0.lock().expect("lock");
+        let depth_write = pixels.iter().rev().find(|(address, _)| *address == 0x8000);
+        assert_eq!(depth_write.expect("the depth surface was updated").1 >> 8, 100);
+    }
+
+    #[test]
+    fn texture_coordinates_interpolate_in_the_triangle_plane() {
+        let canvas = Canvas::default();
+        // A triangle whose far vertex has a tenth of the near one's
+        // reciprocal w: halfway across in screen space is nearer the near
+        // vertex in texture space.
+        let mut vertices = [
+            vertex(0.0, 0.0, 0xFFFFFFFF),
+            vertex(9.0, 0.0, 0xFFFFFFFF),
+            vertex(0.0, 9.0, 0xFFFFFFFF),
+        ];
+        vertices[1].u = 1.0;
+        vertices[1].inverse_w = 0.1;
+        fill_triangle(
+            &canvas,
+            &target(),
+            vertices,
+            Some(&Checker),
+            BlendMode::Replace,
+            DepthState::default(),
+        );
+
+        let pixels = canvas.0.lock().expect("lock");
+        // With a perspective divide the midpoint still samples the first
+        // texel; interpolating in screen space would have reached the
+        // second by now.
+        let midpoint = pixels
+            .iter()
+            .find(|(address, _)| *address == 0x1000 + 4 * 4)
+            .expect("the midpoint was drawn");
+        assert_eq!(midpoint.1, 0xFFFF_0000, "still the near vertex's texel");
+    }
+
+    #[test]
     fn a_clip_offset_moves_the_drawable_area() {
         let canvas = Canvas::default();
-        let target =
-            RenderTarget { base: 0x1000, pitch: 40, clip_x: 5, clip_y: 5, width: 5, height: 5 };
+        let target = RenderTarget {
+            base: 0x1000,
+            pitch: 40,
+            clip_x: 5,
+            clip_y: 5,
+            width: 5,
+            height: 5,
+            zeta: None,
+            zeta_pitch: 0,
+        };
         let written = fill_triangle(
             &canvas,
             &target,
@@ -500,6 +730,7 @@ mod tests {
             ],
             None,
             BlendMode::Replace,
+            DepthState::default(),
         );
         // Only the part of the triangle inside the clip is drawn, and the
         // clip's own corner is outside the triangle's half-space.

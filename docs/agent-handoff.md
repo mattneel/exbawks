@@ -331,8 +331,15 @@ Two active threads:
    that carries no diffuse attribute is **white**, not transparent black,
    and alpha-zero pixels were being skipped by the blend.
 
-   After that: the pixel combiner (approximated as texture times vertex
-   color) and depth testing.
+   Depth testing works against the title's own depth surface, by the
+   function and write mask it programs — and `CLEAR_SURFACE` clears depth as
+   well as color, which matters more than it sounds: without that clear
+   every fragment compares against whatever the memory last held, and all
+   but a twentieth are rejected. Texture coordinates interpolate in the
+   plane of the triangle rather than across the screen.
+
+   After that: the pixel combiner, which this engine still approximates as
+   texture times vertex color.
 
    Two techniques earned their keep and are worth reaching for again: the
    cancel pump's RIP sampling (`RUST_LOG=exbawks_core::emulator=trace`,
