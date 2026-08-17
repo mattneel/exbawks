@@ -263,10 +263,17 @@ The project follows Keep a Changelog structure before its first release.
 - Vertex arrays: a title that draws from arrays it uploaded once — indices
   through `ARRAY_ELEMENT16` and `ARRAY_ELEMENT32`, attributes at their own
   offsets and strides in a vertex context DMA — now assembles the same way
-  inline data does. The composite matrix the fixed pipeline transforms by is
-  tracked, but not yet trusted: multiplying by it in either convention
-  collapses the retail title's geometry to a point or throws it off the
-  surface, so those primitives are counted rather than drawn wrong.
+  inline data does.
+- The fixed pipeline transforms by the composite matrix, which a title
+  builds with the viewport already folded in: its third row carries the
+  depth scale, the viewport register is left holding a sub-pixel offset, and
+  each clip component is one matrix row dotted with the position. Two
+  measurements settled it — the convention that puts most of the retail
+  title's vertices on screen (64%, centred), and the reason none of them
+  shaded a pixel afterwards: a mesh that carries no color attribute is
+  white, not transparent black, and the alpha-zero pixels were all being
+  skipped. Scene geometry now shades 1.3 billion pixels a run rather than
+  none.
 
 - GPU-M4: the vertex program. A title uploads 128-bit instructions and runs
   them once per vertex, two operations at a time — a vector one and a scalar

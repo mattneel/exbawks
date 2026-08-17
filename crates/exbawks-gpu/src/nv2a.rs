@@ -207,6 +207,18 @@ struct SurfaceHistory {
     blended: u64,
 }
 
+/// The attribute registers a vertex starts from.
+///
+/// A mesh need not carry every attribute, and the ones it leaves out are
+/// not zero: a vertex with no color of its own is white, which is what
+/// makes its texture show through unchanged.
+fn default_attributes() -> Vec<[f32; 4]> {
+    let mut attributes = vec![[0.0, 0.0, 0.0, 1.0]; crate::INPUT_REGISTERS];
+    attributes[ATTRIBUTE_DIFFUSE] = [1.0; 4];
+    attributes[ATTRIBUTE_SPECULAR] = [1.0; 4];
+    attributes
+}
+
 /// The engine's per-channel decode state.
 #[derive(Debug, Default)]
 struct ChannelState {
@@ -508,6 +520,8 @@ const MAX_ELEMENTS: usize = 1 << 18;
 const ATTRIBUTE_POSITION: usize = 0;
 /// The vertex attribute carrying the diffuse color.
 const ATTRIBUTE_DIFFUSE: usize = 3;
+/// The vertex attribute carrying the specular color.
+const ATTRIBUTE_SPECULAR: usize = 4;
 /// The attribute component type for a packed `D3DCOLOR` dword (ARGB).
 const ATTRIBUTE_TYPE_D3DCOLOR: u32 = 0;
 /// The attribute component type for 32-bit floats.
@@ -983,16 +997,6 @@ impl PushbufferEngine {
             let Some(primitive) = state.vertex.primitive.take() else {
                 return;
             };
-            if std::env::var("EXBAWKS_GPU_ELEM").is_ok() && !state.vertex.elements.is_empty() {
-                tracing::info!(
-                    elements = state.vertex.elements.len(),
-                    programmed = state.transform.programmed,
-                    dma_a = format_args!("{:?}", state.vertex_dma[0].map(|o| o.base)),
-                    stride0 = state.vertex.array_strides[0],
-                    offset0 = format_args!("{:#010x}", state.vertex.array_offsets[0]),
-                    "nv2a array draw"
-                );
-            }
             let vertices = if state.vertex.elements.is_empty() {
                 Self::assemble_inline(&state.vertex, &state.transform)
             } else {
@@ -1173,29 +1177,44 @@ impl PushbufferEngine {
     /// pipeline transforms by the composite matrix and the viewport scale
     /// and offset map the result onto the surface.
     fn place_vertex(
+        state: &VertexState,
         transform: &TransformState,
         program: &[[u32; 4]],
         attributes: &[[f32; 4]],
     ) -> Option<crate::ScreenVertex> {
         let color = |value: f32| ((value.clamp(0.0, 1.0) * 255.0) as u32) & 0xFF;
-        // Only a program's result can be placed truthfully. The fixed
-        // pipeline's composite matrix is tracked but not yet trusted:
-        // multiplying by it in either convention collapses the title's
-        // geometry to a point or throws it off the surface, so those
-        // primitives are counted rather than drawn wrong.
-        if !transform.programmed || program.is_empty() {
-            return None;
-        }
-        let result = crate::execute(program, &transform.constants, attributes)?;
-        let (position, diffuse, texcoord) = (result.position, result.diffuse, result.texcoord0);
+        let (position, diffuse, texcoord) = if transform.programmed && !program.is_empty() {
+            let result = crate::execute(program, &transform.constants, attributes)?;
+            (result.position, result.diffuse, result.texcoord0)
+        } else {
+            // The fixed pipeline transforms by the composite matrix, which
+            // a title builds with the viewport already folded in: its third
+            // row carries the depth scale, and the viewport register is
+            // left holding a sub-pixel offset. Each clip component is that
+            // row dotted with the position.
+            let source = attributes[ATTRIBUTE_POSITION];
+            let matrix = &state.composite;
+            let mut clip = [0.0_f32; 4];
+            for (row, lane) in clip.iter_mut().enumerate() {
+                *lane = (0..4).map(|column| source[column] * matrix[row * 4 + column]).sum();
+            }
+            let texcoord = attributes[ATTRIBUTE_TEXCOORD0];
+            (clip, attributes[ATTRIBUTE_DIFFUSE], [texcoord[0], texcoord[1]])
+        };
 
         let [x, y, _, w] = position;
         if w == 0.0 || !w.is_finite() {
             return None;
         }
-        // A program applies the viewport itself, from constants the title
-        // uploads, so only the perspective divide remains.
-        let (x, y) = (x / w, y / w);
+        // Both paths reach the surface already scaled: a program applies
+        // the viewport from constants, and the fixed pipeline has it folded
+        // into the matrix, leaving only the register's sub-pixel offset.
+        let (x, y) = if transform.programmed && !program.is_empty() {
+            (x / w, y / w)
+        } else {
+            let [offset_x, offset_y, ..] = state.viewport_offset;
+            (x / w + offset_x, y / w + offset_y)
+        };
         Some(crate::ScreenVertex {
             x,
             y,
@@ -1220,7 +1239,7 @@ impl PushbufferEngine {
         vertex_dma: &[Option<DmaObject>; 2],
     ) -> Vec<crate::ScreenVertex> {
         let program = &transform.program[transform.program_start as usize..];
-        let mut attributes = vec![[0.0_f32; 4]; crate::INPUT_REGISTERS];
+        let mut attributes = default_attributes();
         let mut vertices = Vec::with_capacity(state.elements.len());
         for index in &state.elements {
             for (attribute, format) in state.formats.iter().enumerate() {
@@ -1256,7 +1275,7 @@ impl PushbufferEngine {
                     }
                 }
             }
-            if let Some(vertex) = Self::place_vertex(transform, program, &attributes) {
+            if let Some(vertex) = Self::place_vertex(state, transform, program, &attributes) {
                 vertices.push(vertex);
             }
         }
@@ -1369,11 +1388,11 @@ impl PushbufferEngine {
         let program = &transform.program[transform.program_start as usize..];
         let mut vertices = Vec::with_capacity(state.inline.len() / stride as usize);
         // Attribute values as the program reads them, rebuilt per vertex.
-        let mut attributes = vec![[0.0_f32; 4]; crate::INPUT_REGISTERS];
+        let mut attributes = default_attributes();
         for chunk in state.inline.chunks_exact(stride as usize) {
             if programmed {
                 Self::load_attributes(state, chunk, &mut attributes);
-                if let Some(vertex) = Self::place_vertex(transform, program, &attributes) {
+                if let Some(vertex) = Self::place_vertex(state, transform, program, &attributes) {
                     vertices.push(vertex);
                 }
                 continue;

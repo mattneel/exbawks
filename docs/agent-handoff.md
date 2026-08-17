@@ -314,17 +314,22 @@ Two active threads:
 
    Vertex arrays assemble too: indices through `ARRAY_ELEMENT16`/`32`,
    attributes fetched at their own offsets and strides from a vertex context
-   DMA. **But the title draws its scene through the fixed pipeline**
-   (`SET_TRANSFORM_EXECUTION_MODE` reads `4`, not `6`), and the composite
-   matrix at `0x0680` does not place that geometry: multiplied one way every
-   vertex lands within a pixel of the screen centre (`w` comes out near
-   50,000), and transposed they land far off the surface. The matrix is
-   tracked and the primitives are counted rather than drawn wrong, so the
-   next person picks up a measurement, not a mess. Worth checking first:
-   whether the matrix needs its own load pointer (like the program and
-   constants do), whether `0x0680` is the composite or another of the four
-   matrices in that block, and what the fixed pipeline does with `w` before
-   the viewport.
+   DMA. **The title draws its scene through the fixed pipeline**
+   (`SET_TRANSFORM_EXECUTION_MODE` reads `4`, not `6`), transformed by the
+   composite matrix at `0x0680`: each clip component is one matrix *row*
+   dotted with the position, and the viewport is already folded in — the
+   matrix's third row carries the depth scale (about 2^24) and the viewport
+   register is left holding a sub-pixel offset, so nothing but the
+   perspective divide and that offset follows.
+
+   Two measurements settled it, and both are worth repeating when a
+   transform looks wrong. First, transform a few million vertices under each
+   candidate convention and ask which puts most of them on screen: the right
+   one gave 64% with medians near the screen centre, the others clustered
+   every vertex at the origin. Second, when geometry lands on screen and
+   still shades nothing, suspect the color rather than the position — a mesh
+   that carries no diffuse attribute is **white**, not transparent black,
+   and alpha-zero pixels were being skipped by the blend.
 
    After that: the pixel combiner (approximated as texture times vertex
    color) and depth testing.
