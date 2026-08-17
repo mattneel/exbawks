@@ -269,6 +269,17 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- All four texture units are sampled, each with its own coordinate set,
+  rather than only the first. This title's dominant draw — 44,757 of them
+  on the captured surface alone — binds two units and multiplies one by the
+  other, so a single unit could not reproduce what it puts on screen.
+
+- The constant vertex attributes a title sets by method (`SET_VERTEX_DATA2F`,
+  `SET_VERTEX_DATA4F`, `SET_VERTEX_DATA4UB`) are honoured. Dino Crisis 3
+  sets its diffuse, specular, and second coordinate set that way for
+  hundreds of thousands of primitives; every one of them previously read
+  the hardware default instead.
+
 - `exbawks run --gpu-combiner` prints the decoded combiner program of the
   last draw. It is what confirmed the method numbering against the retail
   stream: the title's own words decode to one stage passing the diffuse into

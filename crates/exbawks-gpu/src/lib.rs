@@ -19,7 +19,7 @@ pub use combiner::{
 pub use command::{ClearMask, GraphicsCommand, PrimitiveType, ResourceHandle};
 pub use error::GraphicsError;
 pub use frontend::GraphicsFrontend;
-pub use nv2a::{DmaObject, Nv2aMemory, PushbufferEngine, PusherStats};
+pub use nv2a::{BoundTexture, DmaObject, Nv2aMemory, PushbufferEngine, PusherStats};
 pub use raster::{
     AlphaTest, BlendState, CullState, DepthState, PipelineState, PixelSink, RenderTarget,
     ScreenVertex, TextureSource, fill_triangle,

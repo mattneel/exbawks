@@ -1038,6 +1038,40 @@ impl Emulator {
         self.gpu_pusher.last_combiner()
     }
 
+    /// The first few vertices of the draw that shaded the most pixels.
+    #[must_use]
+    pub fn gpu_busiest_vertices(&self) -> &[exbawks_gpu::ScreenVertex] {
+        self.gpu_pusher.busiest_vertices()
+    }
+
+    /// The color surface a capture would read, when one is known.
+    #[must_use]
+    pub fn presented_surface(&self) -> Option<u32> {
+        self.presented_surface_by_content().map(|(base, ..)| base)
+    }
+
+    /// The texture units the busiest draw had bound.
+    #[must_use]
+    pub fn gpu_busiest_textures(&self) -> [Option<exbawks_gpu::BoundTexture>; 4] {
+        self.gpu_pusher.busiest_textures()
+    }
+
+    /// The pushbuffer engine's aggregate statistics.
+    #[must_use]
+    pub fn gpu_stats(&self) -> &exbawks_gpu::PusherStats {
+        self.gpu_pusher.stats()
+    }
+
+    /// The combiner programs that shaded the most pixels.
+    #[must_use]
+    pub fn gpu_busiest_combiners(
+        &self,
+        target: Option<u32>,
+        limit: usize,
+    ) -> Vec<(exbawks_gpu::CombinerState, u64, u64)> {
+        self.gpu_pusher.busiest_combiners(target, limit)
+    }
+
     /// The color surfaces that received the most drawn pixels.
     #[must_use]
     pub fn gpu_busiest_targets(&self, limit: usize) -> Vec<(u32, u64)> {

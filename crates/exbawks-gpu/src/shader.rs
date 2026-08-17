@@ -46,7 +46,7 @@ pub struct ShaderResult {
     /// The diffuse color, each channel in `0.0..=1.0`.
     pub diffuse: [f32; 4],
     /// The first texture coordinate set.
-    pub texcoord0: [f32; 2],
+    pub texcoords: [[f32; 2]; 4],
 }
 
 /// Reads a field of `count` bits at `start` from one instruction word.
@@ -244,7 +244,10 @@ pub fn execute(
     executed.then(|| ShaderResult {
         position: outputs[OUTPUT_POSITION],
         diffuse: outputs[OUTPUT_DIFFUSE],
-        texcoord0: [outputs[OUTPUT_TEXCOORD0][0], outputs[OUTPUT_TEXCOORD0][1]],
+        texcoords: std::array::from_fn(|unit| {
+            let output = outputs[OUTPUT_TEXCOORD0 + unit];
+            [output[0], output[1]]
+        }),
     })
 }
 
@@ -431,7 +434,7 @@ mod tests {
         }
         .encode()];
         let result = execute(&program, &[[0.0; 4]; 4], &inputs()).expect("runs");
-        assert_eq!(result.texcoord0, [0.25, 0.75]);
+        assert_eq!(result.texcoords[0], [0.25, 0.75]);
     }
 
     #[test]

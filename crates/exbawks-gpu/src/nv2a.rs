@@ -225,6 +225,16 @@ struct VertexState {
     /// Vertex indices received through `ARRAY_ELEMENT` for the current
     /// primitive, when the title draws from arrays in memory instead.
     elements: Vec<u32>,
+    /// The value each attribute takes when no array supplies it.
+    ///
+    /// A title sets these by method and leaves them standing across draws:
+    /// this one sets its diffuse and specular colors that way for hundreds
+    /// of thousands of primitives, and reading white instead washes every
+    /// one of them out.
+    constants: [[f32; 4]; 16],
+    /// Whether a constant has been set for each attribute, so an unset one
+    /// keeps the hardware's own default rather than black.
+    constant_set: [bool; 16],
     /// Each attribute's byte offset inside the vertex context DMA.
     array_offsets: [u32; 16],
     /// Each attribute's stride in bytes, from its format word.
@@ -267,6 +277,20 @@ fn default_attributes() -> Vec<[f32; 4]> {
     attributes
 }
 
+impl VertexState {
+    /// What each attribute holds before a vertex supplies one: the value
+    /// the title last set by method, or the hardware's default.
+    fn attribute_defaults(&self) -> Vec<[f32; 4]> {
+        let mut attributes = default_attributes();
+        for (index, register) in attributes.iter_mut().enumerate() {
+            if self.constant_set.get(index).copied().unwrap_or(false) {
+                *register = self.constants[index];
+            }
+        }
+        attributes
+    }
+}
+
 /// The engine's per-channel decode state.
 #[derive(Debug, Default)]
 struct ChannelState {
@@ -304,8 +328,10 @@ struct ChannelState {
     alpha_reference: u32,
     /// The register combiners a fragment's color is computed by.
     combiner: crate::CombinerState,
-    /// The first texture unit's state.
-    texture: TextureState,
+    /// The four texture units' state. A title's dominant draw here binds
+    /// two of them and multiplies one by the other, so a single unit is
+    /// not enough to reproduce what it puts on screen.
+    textures: [TextureState; TEXTURE_UNITS],
     /// The context-DMA objects textures address through (`A` and `B`).
     texture_dma: [Option<DmaObject>; 2],
     /// The context-DMA objects vertex arrays address through (`A` and `B`).
@@ -335,6 +361,17 @@ pub struct PusherStats {
     pub textured_primitives: u64,
     /// Primitives whose texture format this engine cannot sample.
     pub unsupported_textures: u64,
+    /// Draws that bound each texture unit. A combiner stage reading a
+    /// unit no draw binds sees white, which is how a modulate turns into
+    /// a brightening — so the counts are worth having.
+    pub bound_by_unit: [u64; TEXTURE_UNITS],
+    /// The last constant written to each vertex attribute by method, and
+    /// how many times each was written.
+    pub constant_attributes: [(u32, u64); 16],
+    /// Draws that bound a unit whose whole coordinate set was zero. Such
+    /// a draw samples one texel across the primitive, which shades flat
+    /// where the title meant detail.
+    pub degenerate_texcoords: [u64; TEXTURE_UNITS],
     /// Submissions abandoned mid-walk (bad word or unreadable memory).
     pub aborted: u64,
 }
@@ -484,6 +521,19 @@ pub struct PushbufferEngine {
     /// Dumping it answers whether a black frame is bad addressing or a
     /// texture that is genuinely empty.
     last_texture: Option<(TextureState, Option<DmaObject>)>,
+    /// Pixels and draws charged to each distinct combiner program, keyed
+    /// by its control words. Which program shades the most of the screen
+    /// is the question a wrong-looking frame asks first.
+    combiner_census: HashMap<(u32, [u32; 35]), (u64, u64)>,
+    /// The first few vertices of the draw that shaded the most pixels,
+    /// with that count. A coordinate set that is degenerate here samples
+    /// one texel for the whole primitive, which looks like flat shading —
+    /// and the busiest draw is the one worth looking at, since the last
+    /// one a title makes is usually a full-screen fade.
+    busiest_vertices: (u64, Vec<crate::ScreenVertex>),
+    /// The texture units that draw had bound, as `(format, rect, pitch)`
+    /// per unit, with `None` for a unit it left disabled.
+    busiest_textures: [Option<BoundTexture>; TEXTURE_UNITS],
     /// The combiner configuration the last draw ran under. Printing it is
     /// how a decode of the title's own program gets checked against what
     /// the color on screen looks like.
@@ -659,6 +709,43 @@ const TRANSFORM_MODE_PROGRAM: u32 = 2;
 const METHOD_SET_BLEND_ENABLE: u16 = 0x0304;
 /// Kelvin `SET_ALPHA_TEST_ENABLE`.
 const METHOD_SET_ALPHA_TEST_ENABLE: u16 = 0x0300;
+/// The control words that identify one combiner program.
+///
+/// The per-stage constant colors are left out deliberately: a title varies
+/// them per draw, and keying on them would scatter one program across
+/// thousands of census entries.
+fn combiner_key(combiner: &crate::CombinerState) -> [u32; 35] {
+    let mut key = [0_u32; 35];
+    for (index, stage) in combiner.stages.iter().enumerate() {
+        key[index * 4] = stage.color_inputs;
+        key[index * 4 + 1] = stage.color_outputs;
+        key[index * 4 + 2] = stage.alpha_inputs;
+        key[index * 4 + 3] = stage.alpha_outputs;
+    }
+    key[32] = combiner.control;
+    key[33] = combiner.final_first;
+    key[34] = combiner.final_second;
+    key
+}
+
+/// Rebuilds a combiner program from its census key.
+fn combiner_from_key(key: &[u32; 35]) -> crate::CombinerState {
+    let mut combiner = crate::CombinerState {
+        control: key[32],
+        final_first: key[33],
+        final_second: key[34],
+        ..crate::CombinerState::default()
+    };
+    combiner.active = ((key[32] & 0xFF) as usize).min(crate::COMBINER_STAGES);
+    for (index, stage) in combiner.stages.iter_mut().enumerate() {
+        stage.color_inputs = key[index * 4];
+        stage.color_outputs = key[index * 4 + 1];
+        stage.alpha_inputs = key[index * 4 + 2];
+        stage.alpha_outputs = key[index * 4 + 3];
+    }
+    combiner
+}
+
 /// Splits a packed ARGB constant into the combiner's float channels.
 fn unpack_color(color: u32) -> [f32; 4] {
     [
@@ -718,6 +805,30 @@ const METHOD_SET_DEPTH_FUNC: u16 = 0x0354;
 const METHOD_SET_DEPTH_MASK: u16 = 0x035C;
 /// Kelvin `SET_SURFACE_ZETA_OFFSET`.
 const METHOD_SET_SURFACE_ZETA_OFFSET: u16 = 0x0214;
+/// Kelvin `SET_VERTEX_DATA2F_M`: two floats per attribute.
+const METHOD_SET_VERTEX_DATA2F: u16 = 0x1880;
+/// One past its last method.
+const METHOD_SET_VERTEX_DATA2F_END: u16 = METHOD_SET_VERTEX_DATA2F + 16 * 8;
+/// Kelvin `SET_VERTEX_DATA4UB`: four bytes per attribute, one dword each.
+const METHOD_SET_VERTEX_DATA4UB: u16 = 0x1940;
+/// One past its last method.
+const METHOD_SET_VERTEX_DATA4UB_END: u16 = METHOD_SET_VERTEX_DATA4UB + 16 * 4;
+/// Kelvin `SET_VERTEX_DATA4F_M`: four floats per attribute.
+const METHOD_SET_VERTEX_DATA4F: u16 = 0x1A00;
+/// One past its last method.
+const METHOD_SET_VERTEX_DATA4F_END: u16 = METHOD_SET_VERTEX_DATA4F + 16 * 16;
+
+/// What one bound texture unit reports for diagnostics: its format word,
+/// its explicit rectangle, its pitch, and the texel at its origin.
+pub type BoundTexture = (u32, (u32, u32), u32, u32);
+
+/// Texture units the hardware provides.
+const TEXTURE_UNITS: usize = 4;
+/// The distance between one unit's method block and the next.
+const TEXTURE_UNIT_STRIDE: u16 = 0x40;
+/// One past the last texture method, across all four units.
+const METHOD_SET_TEXTURE_END: u16 = 0x1B00 + TEXTURE_UNIT_STRIDE * TEXTURE_UNITS as u16;
+
 /// Kelvin `SET_TEXTURE_OFFSET` for unit zero; units are 64 bytes apart.
 const METHOD_SET_TEXTURE_OFFSET: u16 = 0x1B00;
 /// Kelvin `SET_TEXTURE_FORMAT` for unit zero.
@@ -1173,23 +1284,54 @@ impl PushbufferEngine {
                 // shared, which this engine reads per stage regardless.
                 state.combiner.active = ((argument & 0xFF) as usize).min(crate::COMBINER_STAGES);
             }
+            METHOD_SET_VERTEX_DATA2F..METHOD_SET_VERTEX_DATA2F_END => {
+                let within = method - METHOD_SET_VERTEX_DATA2F;
+                let attribute = usize::from(within / 8);
+                let lane = usize::from(within % 8) / 4;
+                // A two-float attribute reads zero in `z` and one in `w`.
+                if !state.vertex.constant_set[attribute] {
+                    state.vertex.constants[attribute] = [0.0, 0.0, 0.0, 1.0];
+                    state.vertex.constant_set[attribute] = true;
+                }
+                state.vertex.constants[attribute][lane] = f32::from_bits(argument);
+            }
+            METHOD_SET_VERTEX_DATA4F..METHOD_SET_VERTEX_DATA4F_END => {
+                let within = method - METHOD_SET_VERTEX_DATA4F;
+                let attribute = usize::from(within / 16);
+                let lane = usize::from(within % 16) / 4;
+                state.vertex.constant_set[attribute] = true;
+                state.vertex.constants[attribute][lane] = f32::from_bits(argument);
+            }
+            METHOD_SET_VERTEX_DATA4UB..METHOD_SET_VERTEX_DATA4UB_END => {
+                let attribute = usize::from((method - METHOD_SET_VERTEX_DATA4UB) / 4);
+                // Four unsigned bytes in ascending order, not the packed
+                // `D3DCOLOR` order a vertex array uses.
+                let channel = |shift: u32| f32::from((argument >> shift) as u8) / 255.0;
+                state.vertex.constants[attribute] =
+                    [channel(0), channel(8), channel(16), channel(24)];
+                state.vertex.constant_set[attribute] = true;
+                let record = &mut self.stats.constant_attributes[attribute];
+                *record = (argument, record.1 + 1);
+            }
             METHOD_SET_BLEND_ENABLE => {
                 state.blend = argument != 0;
             }
-            METHOD_SET_TEXTURE_OFFSET => {
-                state.texture.offset = argument;
-            }
-            METHOD_SET_TEXTURE_FORMAT => {
-                state.texture.format = argument;
-            }
-            METHOD_SET_TEXTURE_CONTROL0 => {
-                state.texture.enabled = argument & TEXTURE_ENABLE != 0;
-            }
-            METHOD_SET_TEXTURE_CONTROL1 => {
-                state.texture.pitch = argument >> 16;
-            }
-            METHOD_SET_TEXTURE_IMAGE_RECT => {
-                state.texture.rect = (argument >> 16, argument & 0xFFFF);
+            METHOD_SET_TEXTURE_OFFSET..METHOD_SET_TEXTURE_END => {
+                let unit = usize::from((method - METHOD_SET_TEXTURE_OFFSET) / TEXTURE_UNIT_STRIDE);
+                let within = (method - METHOD_SET_TEXTURE_OFFSET) % TEXTURE_UNIT_STRIDE;
+                let texture = &mut state.textures[unit];
+                match METHOD_SET_TEXTURE_OFFSET + within {
+                    METHOD_SET_TEXTURE_OFFSET => texture.offset = argument,
+                    METHOD_SET_TEXTURE_FORMAT => texture.format = argument,
+                    METHOD_SET_TEXTURE_CONTROL0 => {
+                        texture.enabled = argument & TEXTURE_ENABLE != 0;
+                    }
+                    METHOD_SET_TEXTURE_CONTROL1 => texture.pitch = argument >> 16,
+                    METHOD_SET_TEXTURE_IMAGE_RECT => {
+                        texture.rect = (argument >> 16, argument & 0xFFFF);
+                    }
+                    _ => {}
+                }
             }
             METHOD_SET_CONTEXT_DMA_A | METHOD_SET_CONTEXT_DMA_B => {
                 let resolved = Self::resolve_dma_object(
@@ -1246,7 +1388,7 @@ impl PushbufferEngine {
     /// anything else is counted and skipped, so what is missing stays
     /// visible in the statistics rather than quietly drawing nothing.
     fn end_primitive(&mut self, memory: &dyn Nv2aMemory, channel: u32) {
-        let (primitive, vertices, surface, texture, texture_dma, pipeline, combiner) = {
+        let (primitive, vertices, surface, textures, texture_dma, pipeline, combiner) = {
             let state = self.channels.entry(channel).or_default();
             let Some(primitive) = state.vertex.primitive.take() else {
                 return;
@@ -1258,7 +1400,12 @@ impl PushbufferEngine {
             };
             state.vertex.inline.clear();
             state.vertex.elements.clear();
-            let dma = state.texture_dma[(state.texture.format & 3).saturating_sub(1) as usize & 1];
+            // Each unit's format word names the context DMA it reads
+            // through, `A` or `B`.
+            let dma: [Option<DmaObject>; TEXTURE_UNITS] = std::array::from_fn(|unit| {
+                let selector = (state.textures[unit].format & 3).saturating_sub(1) as usize & 1;
+                state.texture_dma[selector]
+            });
             let pipeline = crate::PipelineState {
                 blend: crate::BlendState {
                     enabled: state.blend,
@@ -1283,9 +1430,10 @@ impl PushbufferEngine {
                     reference: state.alpha_reference & 0xFF,
                 },
             };
-            (primitive, vertices, state.surface, state.texture, dma, pipeline, state.combiner)
+            (primitive, vertices, state.surface, state.textures, dma, pipeline, state.combiner)
         };
         self.last_combiner = combiner;
+        let census_key = combiner_key(&combiner);
         let Some(target) = Self::render_target(&surface).filter(|_| !vertices.is_empty()) else {
             self.stats.skipped_primitives += 1;
             return;
@@ -1303,26 +1451,44 @@ impl PushbufferEngine {
         }
         let sink = Sink(memory);
 
-        // The bound texture, when this engine can address and read it.
-        let bound = texture.enabled.then(|| Self::bind_texture(memory, &texture, texture_dma));
-        match bound {
-            Some(Some(_)) => {
-                self.stats.textured_primitives += 1;
-                self.last_texture = Some((texture, texture_dma));
+        // Each enabled unit, when this engine can address and read it.
+        let mut bound: [Option<MemoryTexture<'_>>; TEXTURE_UNITS] = [const { None }; TEXTURE_UNITS];
+        for unit in 0..TEXTURE_UNITS {
+            let texture = textures[unit];
+            if !texture.enabled {
+                continue;
             }
-            Some(None) => {
-                // The primitive is textured with a format this engine
-                // cannot decode. Drawing it flat would paint its vertex
-                // color over the frame — and over the render targets a
-                // title composites from — so it is left undrawn and
-                // counted instead.
-                self.stats.unsupported_textures += 1;
-                return;
+            match Self::bind_texture(memory, &texture, texture_dma[unit]) {
+                Some(sampler) => {
+                    self.stats.bound_by_unit[unit] += 1;
+                    if unit == 0 {
+                        self.stats.textured_primitives += 1;
+                        self.last_texture = Some((texture, texture_dma[unit]));
+                    }
+                    bound[unit] = Some(sampler);
+                }
+                None => {
+                    // The primitive is textured with a format this engine
+                    // cannot decode. Drawing it flat would paint its vertex
+                    // color over the frame — and over the render targets a
+                    // title composites from — so it is left undrawn and
+                    // counted instead.
+                    self.stats.unsupported_textures += 1;
+                    return;
+                }
             }
-            None => {}
         }
-        let bound = bound.flatten();
-        let sampler = bound.as_ref().map(|texture| texture as &dyn crate::TextureSource);
+        for (unit, sampler) in bound.iter().enumerate() {
+            if sampler.is_some()
+                && vertices.iter().all(|vertex| vertex.texcoords[unit] == [0.0, 0.0])
+            {
+                self.stats.degenerate_texcoords[unit] += 1;
+            }
+        }
+        let samplers: [Option<&dyn crate::TextureSource>; TEXTURE_UNITS] =
+            std::array::from_fn(|unit| {
+                bound[unit].as_ref().map(|texture| texture as &dyn crate::TextureSource)
+            });
 
         // Primitive assembly follows the hardware's numbering; triangles,
         // strips, fans, and quads are what a title draws with.
@@ -1362,17 +1528,19 @@ impl PushbufferEngine {
             );
         }
         self.last_draw_geometry = (target.pitch, target.width, target.height);
+        let mut drawn = 0_u64;
         for [a, b, c] in triangles {
             let written = crate::fill_triangle(
                 &sink,
                 &target,
                 [vertices[a], vertices[b], vertices[c]],
-                sampler,
+                samplers,
                 pipeline,
                 Some(&combiner),
             );
             self.stats.triangles += 1;
             self.stats.shaded_pixels += written;
+            drawn += written;
             *self.pixels_by_target.entry(target.base).or_insert(0) += written;
             if written > 0 {
                 self.operations += 1;
@@ -1382,6 +1550,26 @@ impl PushbufferEngine {
                 history.geometry = (target.pitch, target.width, target.height);
                 history.blended += written;
             }
+        }
+        if drawn > self.busiest_vertices.0 {
+            self.busiest_vertices = (drawn, vertices.iter().copied().take(3).collect());
+            self.busiest_textures = std::array::from_fn(|unit| {
+                let texture = textures[unit];
+                let sampler = bound[unit].as_ref()?;
+                // The texel at the origin: the whole contribution of a
+                // unit whose coordinates are degenerate.
+                texture.enabled.then_some((
+                    texture.format,
+                    texture.rect,
+                    texture.pitch,
+                    crate::TextureSource::texel(sampler, 0, 0),
+                ))
+            });
+        }
+        if drawn > 0 {
+            let entry = self.combiner_census.entry((target.base, census_key)).or_insert((0, 0));
+            entry.0 += drawn;
+            entry.1 += 1;
         }
     }
 
@@ -1484,9 +1672,9 @@ impl PushbufferEngine {
         attributes: &[[f32; 4]],
     ) -> Option<crate::ScreenVertex> {
         let color = |value: f32| ((value.clamp(0.0, 1.0) * 255.0) as u32) & 0xFF;
-        let (position, diffuse, texcoord) = if transform.programmed && !program.is_empty() {
+        let (position, diffuse, texcoords) = if transform.programmed && !program.is_empty() {
             let result = crate::execute(program, &transform.constants, attributes)?;
-            (result.position, result.diffuse, result.texcoord0)
+            (result.position, result.diffuse, result.texcoords)
         } else {
             // The fixed pipeline transforms by the composite matrix, which
             // a title builds with the viewport already folded in: its third
@@ -1499,8 +1687,11 @@ impl PushbufferEngine {
             for (row, lane) in clip.iter_mut().enumerate() {
                 *lane = (0..4).map(|column| source[column] * matrix[row * 4 + column]).sum();
             }
-            let texcoord = attributes[ATTRIBUTE_TEXCOORD0];
-            (clip, attributes[ATTRIBUTE_DIFFUSE], [texcoord[0], texcoord[1]])
+            let texcoords = std::array::from_fn(|unit| {
+                let texcoord = attributes[ATTRIBUTE_TEXCOORD0 + unit];
+                [texcoord[0], texcoord[1]]
+            });
+            (clip, attributes[ATTRIBUTE_DIFFUSE], texcoords)
         };
 
         let [x, y, z, w] = position;
@@ -1524,8 +1715,7 @@ impl PushbufferEngine {
                 | (color(diffuse[0]) << 16)
                 | (color(diffuse[1]) << 8)
                 | color(diffuse[2]),
-            u: texcoord[0],
-            v: texcoord[1],
+            texcoords,
             // Depth reaches the surface already divided, as the transform
             // that produced it folded in the depth scale.
             z: z * inverse_w,
@@ -1545,7 +1735,7 @@ impl PushbufferEngine {
         vertex_dma: &[Option<DmaObject>; 2],
     ) -> Vec<crate::ScreenVertex> {
         let program = transform.program_from_start();
-        let mut attributes = default_attributes();
+        let mut attributes = state.attribute_defaults();
         let mut vertices = Vec::with_capacity(state.elements.len());
         for index in &state.elements {
             for (attribute, format) in state.formats.iter().enumerate() {
@@ -1649,12 +1839,16 @@ impl PushbufferEngine {
             .copied()
             .map(Self::attribute_dwords)
             .sum::<u32>() as usize;
-        let texcoord = state.formats[ATTRIBUTE_TEXCOORD0];
-        let texcoord_offset: usize = state.formats[..ATTRIBUTE_TEXCOORD0]
-            .iter()
-            .copied()
-            .map(Self::attribute_dwords)
-            .sum::<u32>() as usize;
+        // Each coordinate set's own format and offset within the vertex.
+        let texcoord: [AttributeFormat; TEXTURE_UNITS] =
+            std::array::from_fn(|unit| state.formats[ATTRIBUTE_TEXCOORD0 + unit]);
+        let texcoord_offset: [usize; TEXTURE_UNITS] = std::array::from_fn(|unit| {
+            state.formats[..ATTRIBUTE_TEXCOORD0 + unit]
+                .iter()
+                .copied()
+                .map(Self::attribute_dwords)
+                .sum::<u32>() as usize
+        });
 
         // The declared layout, once per primitive: it is the only record of
         // what a title's vertices actually contain.
@@ -1697,7 +1891,7 @@ impl PushbufferEngine {
         let program = transform.program_from_start();
         let mut vertices = Vec::with_capacity(state.inline.len() / stride as usize);
         // Attribute values as the program reads them, rebuilt per vertex.
-        let mut attributes = default_attributes();
+        let mut attributes = state.attribute_defaults();
         for chunk in state.inline.chunks_exact(stride as usize) {
             if programmed {
                 Self::load_attributes(state, chunk, &mut attributes);
@@ -1727,20 +1921,22 @@ impl PushbufferEngine {
                 // No color attribute: white keeps the geometry visible.
                 _ => 0xFFFF_FFFF,
             };
-            let (u, v) = if texcoord.kind == ATTRIBUTE_TYPE_FLOAT && texcoord.size >= 2 {
-                (
-                    chunk.get(texcoord_offset).map_or(0.0, |bits| f32::from_bits(*bits)),
-                    chunk.get(texcoord_offset + 1).map_or(0.0, |bits| f32::from_bits(*bits)),
-                )
-            } else {
-                (0.0, 0.0)
-            };
+            let texcoords: [[f32; 2]; TEXTURE_UNITS] = std::array::from_fn(|unit| {
+                let format = texcoord[unit];
+                if format.kind != ATTRIBUTE_TYPE_FLOAT || format.size < 2 {
+                    return [0.0, 0.0];
+                }
+                let offset = texcoord_offset[unit];
+                [
+                    chunk.get(offset).map_or(0.0, |bits| f32::from_bits(*bits)),
+                    chunk.get(offset + 1).map_or(0.0, |bits| f32::from_bits(*bits)),
+                ]
+            });
             vertices.push(crate::ScreenVertex {
                 x: f32::from_bits(chunk[0]),
                 y: f32::from_bits(chunk[1]),
                 color,
-                u,
-                v,
+                texcoords,
                 // Pre-transformed geometry arrives with its depth already
                 // in surface units and no perspective left to correct.
                 z: chunk.get(2).map_or(0.0, |bits| f32::from_bits(*bits)),
@@ -1827,6 +2023,39 @@ impl PushbufferEngine {
     #[must_use]
     pub fn last_combiner(&self) -> &crate::CombinerState {
         &self.last_combiner
+    }
+
+    /// The first few vertices of the draw that shaded the most pixels.
+    #[must_use]
+    pub fn busiest_vertices(&self) -> &[crate::ScreenVertex] {
+        &self.busiest_vertices.1
+    }
+
+    /// The texture units that draw had bound.
+    #[must_use]
+    pub fn busiest_textures(&self) -> [Option<BoundTexture>; TEXTURE_UNITS] {
+        self.busiest_textures
+    }
+
+    /// The combiner programs that shaded the most pixels, with the pixels
+    /// and draws charged to each.
+    #[must_use]
+    pub fn busiest_combiners(
+        &self,
+        target: Option<u32>,
+        limit: usize,
+    ) -> Vec<(crate::CombinerState, u64, u64)> {
+        let mut entries: Vec<_> = self
+            .combiner_census
+            .iter()
+            .filter(|((base, _), _)| target.is_none_or(|wanted| *base == wanted))
+            .collect();
+        entries.sort_unstable_by_key(|(key, (pixels, _))| (std::cmp::Reverse(*pixels), **key));
+        entries
+            .into_iter()
+            .take(limit)
+            .map(|((_, key), (pixels, draws))| (combiner_from_key(key), *pixels, *draws))
+            .collect()
     }
 
     /// Decodes the most recently sampled texture into 8-bit RGBA pixels.

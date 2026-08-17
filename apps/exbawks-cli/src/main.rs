@@ -782,6 +782,51 @@ Graphics methods (object, method, submissions):"
         }
         println!("  final: {:08x} {:08x}", combiner.final_first, combiner.final_second);
         println!();
+
+        let stats = emulator.gpu_stats();
+        println!(
+            "Texture units bound: {:?} of {} textured draws, degenerate coords {:?}",
+            stats.bound_by_unit, stats.textured_primitives, stats.degenerate_texcoords
+        );
+        for vertex in emulator.gpu_busiest_vertices() {
+            println!(
+                "  vertex ({:7.1},{:7.1}) color {:08x}  uv {:?}",
+                vertex.x, vertex.y, vertex.color, vertex.texcoords
+            );
+        }
+        for (attribute, (value, count)) in stats.constant_attributes.iter().enumerate() {
+            if *count > 0 {
+                println!("  attribute {attribute:2}: constant {value:08x} set {count} times");
+            }
+        }
+        for (unit, bound) in emulator.gpu_busiest_textures().iter().enumerate() {
+            match bound {
+                Some((format, rect, pitch, origin)) => println!(
+                    "  unit {unit}: format {format:08x} rect {}x{} pitch {pitch}                      texel(0,0) {origin:08x}",
+                    rect.0, rect.1
+                ),
+                None => println!("  unit {unit}: disabled"),
+            }
+        }
+        let captured = screenshot_address.or_else(|| emulator.presented_surface());
+        println!("Busiest combiner programs for {captured:08x?}:");
+        for (program, pixels, draws) in emulator.gpu_busiest_combiners(captured, 6) {
+            println!(
+                "  {pixels:>12} px  {draws:>6} draws  {} stage(s)  final {:08x} {:08x}",
+                program.active, program.final_first, program.final_second
+            );
+            for stage in 0..program.active.min(program.stages.len()) {
+                let programmed = program.stages[stage];
+                println!(
+                    "      {stage}: color in {:08x} out {:08x}  alpha in {:08x} out {:08x}",
+                    programmed.color_inputs,
+                    programmed.color_outputs,
+                    programmed.alpha_inputs,
+                    programmed.alpha_outputs
+                );
+            }
+        }
+        println!();
     }
 
     if let Some(path) = dump_texture {

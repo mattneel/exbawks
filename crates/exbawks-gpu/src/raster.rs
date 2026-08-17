@@ -18,10 +18,10 @@ pub struct ScreenVertex {
     pub y: f32,
     /// The color as 8-bit ARGB.
     pub color: u32,
-    /// The horizontal texture coordinate, in units of the texture width.
-    pub u: f32,
-    /// The vertical texture coordinate, in units of the texture height.
-    pub v: f32,
+    /// The four texture coordinate sets, in units of each texture's
+    /// extent. A combiner stage reads whichever unit it names, and a title
+    /// gives each its own coordinates.
+    pub texcoords: [[f32; 2]; 4],
     /// The depth, in the units the depth surface stores.
     pub z: f32,
     /// The reciprocal of the clip-space `w`, for perspective-correct
@@ -309,7 +309,7 @@ pub fn fill_triangle(
     sink: &dyn PixelSink,
     target: &RenderTarget,
     vertices: [ScreenVertex; 3],
-    texture: Option<&dyn TextureSource>,
+    textures: [Option<&dyn TextureSource>; 4],
     state: PipelineState,
     combiner: Option<&crate::CombinerState>,
 ) -> u64 {
@@ -385,30 +385,34 @@ pub fn fill_triangle(
 
             let diffuse = interpolate_color([a.color, b.color, c.color], weights);
             let mut color = diffuse;
-            let mut texel = None;
-            if let Some(texture) = texture {
-                // Texture coordinates interpolate in the plane of the
-                // triangle, not the screen: weight each by the vertex's
-                // reciprocal `w` and divide by the interpolated reciprocal,
-                // or a textured surface seen at an angle skews.
-                let inverse_w =
-                    weights[0] * a.inverse_w + weights[1] * b.inverse_w + weights[2] * c.inverse_w;
-                let scale = if inverse_w == 0.0 { 1.0 } else { 1.0 / inverse_w };
-                let u = (weights[0] * a.u * a.inverse_w
-                    + weights[1] * b.u * b.inverse_w
-                    + weights[2] * c.u * c.inverse_w)
-                    * scale;
-                let v = (weights[0] * a.v * a.inverse_w
-                    + weights[1] * b.v * b.inverse_w
-                    + weights[2] * c.v * c.inverse_w)
-                    * scale;
-                let texel_x = (u * texture.width() as f32) as i64;
-                let texel_y = (v * texture.height() as f32) as i64;
-                let sampled = texture.texel(
+            // Texture coordinates interpolate in the plane of the triangle,
+            // not the screen: weight each by the vertex's reciprocal `w`
+            // and divide by the interpolated reciprocal, or a textured
+            // surface seen at an angle skews.
+            let inverse_w =
+                weights[0] * a.inverse_w + weights[1] * b.inverse_w + weights[2] * c.inverse_w;
+            let scale = if inverse_w == 0.0 { 1.0 } else { 1.0 / inverse_w };
+            let mut texels = [None; 4];
+            for (unit, sampled) in texels.iter_mut().enumerate() {
+                let Some(texture) = textures[unit] else {
+                    continue;
+                };
+                let coordinate = |axis: usize| {
+                    (weights[0] * a.texcoords[unit][axis] * a.inverse_w
+                        + weights[1] * b.texcoords[unit][axis] * b.inverse_w
+                        + weights[2] * c.texcoords[unit][axis] * c.inverse_w)
+                        * scale
+                };
+                let texel_x = (coordinate(0) * texture.width() as f32) as i64;
+                let texel_y = (coordinate(1) * texture.height() as f32) as i64;
+                *sampled = Some(texture.texel(
                     texel_x.clamp(0, i64::from(texture.width().saturating_sub(1))) as u32,
                     texel_y.clamp(0, i64::from(texture.height().saturating_sub(1))) as u32,
-                );
-                texel = Some(sampled);
+                ));
+            }
+            // Without a combiner program the first unit modulates the
+            // vertex color, which is what an unprogrammed stage does.
+            if let Some(sampled) = texels[0] {
                 color = modulate(sampled, color);
             }
             // The combiners, once a title has programmed them, are the
@@ -417,9 +421,11 @@ pub fn fill_triangle(
             if let Some(combiner) = combiner {
                 let registers = crate::CombinerRegisters {
                     diffuse: unpack_channels(diffuse),
-                    // An unbound texture unit reads white, so a stage that
+                    // An unbound unit reads white, so a stage that
                     // modulates by one leaves its other input alone.
-                    textures: [unpack_channels(texel.unwrap_or(0xFFFF_FFFF)); 4],
+                    textures: std::array::from_fn(|unit| {
+                        unpack_channels(texels[unit].unwrap_or(0xFFFF_FFFF))
+                    }),
                     ..crate::CombinerRegisters::default()
                 };
                 if let Some(computed) = crate::evaluate_combiner(combiner, &registers) {
@@ -502,7 +508,7 @@ mod tests {
     }
 
     fn vertex(x: f32, y: f32, color: u32) -> ScreenVertex {
-        ScreenVertex { x, y, color, u: 0.0, v: 0.0, z: 0.0, inverse_w: 1.0 }
+        ScreenVertex { x, y, color, texcoords: [[0.0, 0.0]; 4], z: 0.0, inverse_w: 1.0 }
     }
 
     /// A two-by-two texture whose texels are their own coordinates.
@@ -539,7 +545,7 @@ mod tests {
                 vertex(10.0, 0.0, 0xFFFFFFFF),
                 vertex(0.0, 10.0, 0xFFFFFFFF),
             ],
-            None,
+            [None; 4],
             PipelineState::default(),
             None,
         );
@@ -558,7 +564,7 @@ mod tests {
                 vertex(8.0, 1.0, 0xFF00FF00),
                 vertex(1.0, 8.0, 0xFF00FF00),
             ],
-            None,
+            [None; 4],
             PipelineState::default(),
             None,
         );
@@ -570,7 +576,7 @@ mod tests {
                 vertex(1.0, 8.0, 0xFF00FF00),
                 vertex(8.0, 1.0, 0xFF00FF00),
             ],
-            None,
+            [None; 4],
             PipelineState::default(),
             None,
         );
@@ -588,7 +594,7 @@ mod tests {
                 vertex(4.0, 0.0, 0xFF112233),
                 vertex(0.0, 4.0, 0xFF112233),
             ],
-            None,
+            [None; 4],
             PipelineState::default(),
             None,
         );
@@ -611,7 +617,7 @@ mod tests {
                 vertex(30.0, 20.0, 0xFFFFFFFF),
                 vertex(20.0, 30.0, 0xFFFFFFFF),
             ],
-            None,
+            [None; 4],
             PipelineState::default(),
             None,
         );
@@ -630,7 +636,7 @@ mod tests {
                 vertex(5.0, 1.0, 0xFFFFFFFF),
                 vertex(9.0, 1.0, 0xFFFFFFFF),
             ],
-            None,
+            [None; 4],
             PipelineState::default(),
             None,
         );
@@ -648,7 +654,7 @@ mod tests {
                 vertex(9.0, 0.0, 0xFF00FF00),
                 vertex(0.0, 9.0, 0xFF0000FF),
             ],
-            None,
+            [None; 4],
             PipelineState::default(),
             None,
         );
@@ -676,13 +682,13 @@ mod tests {
             vertex(10.0, 0.0, 0xFFFFFFFF),
             vertex(0.0, 10.0, 0xFFFFFFFF),
         ];
-        vertices[1].u = 1.0;
-        vertices[2].v = 1.0;
+        vertices[1].texcoords[0][0] = 1.0;
+        vertices[2].texcoords[0][1] = 1.0;
         let written = fill_triangle(
             &canvas,
             &target(),
             vertices,
-            Some(&Checker),
+            [Some(&Checker), None, None, None],
             PipelineState::default(),
             None,
         );
@@ -704,7 +710,14 @@ mod tests {
             vertex(4.0, 0.0, 0xFF80_8080),
             vertex(0.0, 4.0, 0xFF80_8080),
         ];
-        fill_triangle(&canvas, &target(), vertices, Some(&Checker), PipelineState::default(), None);
+        fill_triangle(
+            &canvas,
+            &target(),
+            vertices,
+            [Some(&Checker), None, None, None],
+            PipelineState::default(),
+            None,
+        );
 
         let pixels = canvas.0.lock().expect("lock");
         let (_, color) = pixels[0];
@@ -722,7 +735,7 @@ mod tests {
             vertex(8.0, 0.0, 0x0000_0000),
             vertex(0.0, 8.0, 0x0000_0000),
         ];
-        let written = fill_triangle(&canvas, &target(), vertices, None, over_blend(), None);
+        let written = fill_triangle(&canvas, &target(), vertices, [None; 4], over_blend(), None);
 
         assert_eq!(written, 0, "nothing is drawn through zero alpha");
         assert!(canvas.0.lock().expect("lock").is_empty());
@@ -738,7 +751,7 @@ mod tests {
             vertex(4.0, 0.0, 0x8000_0000),
             vertex(0.0, 4.0, 0x8000_0000),
         ];
-        fill_triangle(&canvas, &target(), vertices, None, over_blend(), None);
+        fill_triangle(&canvas, &target(), vertices, [None; 4], over_blend(), None);
 
         let pixels = canvas.0.lock().expect("lock");
         let (_, color) = *pixels
@@ -777,7 +790,7 @@ mod tests {
             depth: DepthState { test: true, write: true, function: 3 },
             ..PipelineState::default()
         };
-        fill_triangle(&canvas, &target, vertices, None, state, None);
+        fill_triangle(&canvas, &target, vertices, [None; 4], state, None);
 
         let pixels = canvas.0.lock().expect("lock");
         assert!(
@@ -812,7 +825,7 @@ mod tests {
             depth: DepthState { test: true, write: true, function: 3 },
             ..PipelineState::default()
         };
-        let written = fill_triangle(&canvas, &target, vertices, None, state, None);
+        let written = fill_triangle(&canvas, &target, vertices, [None; 4], state, None);
 
         assert!(written > 0, "a nearer fragment draws");
         let pixels = canvas.0.lock().expect("lock");
@@ -831,9 +844,16 @@ mod tests {
             vertex(9.0, 0.0, 0xFFFFFFFF),
             vertex(0.0, 9.0, 0xFFFFFFFF),
         ];
-        vertices[1].u = 1.0;
+        vertices[1].texcoords[0][0] = 1.0;
         vertices[1].inverse_w = 0.1;
-        fill_triangle(&canvas, &target(), vertices, Some(&Checker), PipelineState::default(), None);
+        fill_triangle(
+            &canvas,
+            &target(),
+            vertices,
+            [Some(&Checker), None, None, None],
+            PipelineState::default(),
+            None,
+        );
 
         let pixels = canvas.0.lock().expect("lock");
         // With a perspective divide the midpoint still samples the first
@@ -861,7 +881,7 @@ mod tests {
             vertex(4.0, 0.0, 0x0040_4040),
             vertex(0.0, 4.0, 0x0040_4040),
         ];
-        fill_triangle(&canvas, &target(), vertices, None, state, None);
+        fill_triangle(&canvas, &target(), vertices, [None; 4], state, None);
 
         let pixels = canvas.0.lock().expect("lock");
         let (_, color) = *pixels
@@ -886,7 +906,7 @@ mod tests {
             vertex(4.0, 0.0, 0x0020_2020),
             vertex(0.0, 4.0, 0x0020_2020),
         ];
-        let written = fill_triangle(&canvas, &target(), vertices, None, state, None);
+        let written = fill_triangle(&canvas, &target(), vertices, [None; 4], state, None);
 
         assert!(written > 0, "an additive pass is not skipped for its alpha");
     }
@@ -904,8 +924,8 @@ mod tests {
             vertex(1.0, 8.0, 0xFFFFFFFF),
         ];
         let counter = [clockwise[0], clockwise[2], clockwise[1]];
-        let first = fill_triangle(&canvas, &target(), clockwise, None, state, None);
-        let second = fill_triangle(&canvas, &target(), counter, None, state, None);
+        let first = fill_triangle(&canvas, &target(), clockwise, [None; 4], state, None);
+        let second = fill_triangle(&canvas, &target(), counter, [None; 4], state, None);
 
         assert!(first > 0 || second > 0, "one winding survives");
         assert_eq!(first.min(second), 0, "and the other is discarded");
@@ -929,8 +949,8 @@ mod tests {
             vertex(4.0, 0.0, 0xFFFF_FFFF),
             vertex(0.0, 4.0, 0xFFFF_FFFF),
         ];
-        assert_eq!(fill_triangle(&canvas, &target(), below, None, state, None), 0);
-        assert!(fill_triangle(&canvas, &target(), above, None, state, None) > 0);
+        assert_eq!(fill_triangle(&canvas, &target(), below, [None; 4], state, None), 0);
+        assert!(fill_triangle(&canvas, &target(), above, [None; 4], state, None) > 0);
     }
 
     #[test]
@@ -954,7 +974,7 @@ mod tests {
                 vertex(10.0, 0.0, 0xFFFFFFFF),
                 vertex(0.0, 10.0, 0xFFFFFFFF),
             ],
-            None,
+            [None; 4],
             PipelineState::default(),
             None,
         );
