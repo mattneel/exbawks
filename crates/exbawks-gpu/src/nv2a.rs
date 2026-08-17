@@ -174,6 +174,16 @@ struct VertexState {
     formats: [AttributeFormat; 16],
     /// Dwords received through `INLINE_ARRAY` for the current primitive.
     inline: Vec<u32>,
+    /// Vertex indices received through `ARRAY_ELEMENT` for the current
+    /// primitive, when the title draws from arrays in memory instead.
+    elements: Vec<u32>,
+    /// Each attribute's byte offset inside the vertex context DMA.
+    array_offsets: [u32; 16],
+    /// Each attribute's stride in bytes, from its format word.
+    array_strides: [u32; 16],
+    /// The composite (model-view-projection) matrix the fixed pipeline
+    /// transforms by, in the order the title uploads it.
+    composite: [f32; 16],
     /// The viewport's scale, as programmed. A title reaches its geometry
     /// through a transform program, which receives the same scale and
     /// offset as constants and applies them itself; these are recorded for
@@ -218,6 +228,8 @@ struct ChannelState {
     texture: TextureState,
     /// The context-DMA objects textures address through (`A` and `B`).
     texture_dma: [Option<DmaObject>; 2],
+    /// The context-DMA objects vertex arrays address through (`A` and `B`).
+    vertex_dma: [Option<DmaObject>; 2],
 }
 
 /// Aggregate statistics for diagnostics.
@@ -471,6 +483,27 @@ const METHOD_SET_BEGIN_END: u16 = 0x17FC;
 const METHOD_INLINE_ARRAY: u16 = 0x1818;
 /// The first `SET_VERTEX_DATA_ARRAY_FORMAT` method; sixteen follow.
 const METHOD_SET_VERTEX_DATA_ARRAY_FORMAT: u16 = 0x1760;
+/// Kelvin `SET_COMPOSITE_MATRIX`: sixteen floats, the fixed pipeline's
+/// model-view-projection product.
+const METHOD_SET_COMPOSITE_MATRIX: u16 = 0x0680;
+/// The last of its sixteen methods.
+const COMPOSITE_MATRIX_LAST: u16 = 0x06BC;
+/// The first `SET_VERTEX_DATA_ARRAY_OFFSET` method; sixteen follow.
+const METHOD_SET_VERTEX_DATA_ARRAY_OFFSET: u16 = 0x1720;
+/// The last of them.
+const VERTEX_ARRAY_OFFSET_LAST: u16 = 0x175C;
+/// Kelvin `ARRAY_ELEMENT16`: two vertex indices per dword.
+const METHOD_ARRAY_ELEMENT16: u16 = 0x1800;
+/// Kelvin `ARRAY_ELEMENT32`: one vertex index per dword.
+const METHOD_ARRAY_ELEMENT32: u16 = 0x1808;
+/// Kelvin `SET_CONTEXT_DMA_VERTEX_A`.
+const METHOD_SET_CONTEXT_DMA_VERTEX_A: u16 = 0x019C;
+/// Kelvin `SET_CONTEXT_DMA_VERTEX_B`.
+const METHOD_SET_CONTEXT_DMA_VERTEX_B: u16 = 0x01A0;
+/// The offset bit selecting the second vertex context.
+const VERTEX_ARRAY_CONTEXT_B: u32 = 0x8000_0000;
+/// The most vertex indices one primitive may carry.
+const MAX_ELEMENTS: usize = 1 << 18;
 /// The vertex attribute carrying position.
 const ATTRIBUTE_POSITION: usize = 0;
 /// The vertex attribute carrying the diffuse color.
@@ -807,6 +840,40 @@ impl PushbufferEngine {
                 let index = ((method - METHOD_SET_VERTEX_DATA_ARRAY_FORMAT) / 4) as usize;
                 state.vertex.formats[index & 15] =
                     AttributeFormat { kind: argument & 0xF, size: (argument >> 4) & 0xF };
+                state.vertex.array_strides[index & 15] = argument >> 8;
+            }
+            METHOD_SET_VERTEX_DATA_ARRAY_OFFSET..=VERTEX_ARRAY_OFFSET_LAST => {
+                let index = ((method - METHOD_SET_VERTEX_DATA_ARRAY_OFFSET) / 4) as usize;
+                state.vertex.array_offsets[index & 15] = argument;
+            }
+            METHOD_SET_COMPOSITE_MATRIX..=COMPOSITE_MATRIX_LAST => {
+                let index = ((method - METHOD_SET_COMPOSITE_MATRIX) / 4) as usize;
+                state.vertex.composite[index & 15] = f32::from_bits(argument);
+            }
+            METHOD_ARRAY_ELEMENT16 => {
+                // Two indices per dword, low half first.
+                if state.vertex.primitive.is_some()
+                    && state.vertex.elements.len() + 2 <= MAX_ELEMENTS
+                {
+                    state.vertex.elements.push(argument & 0xFFFF);
+                    state.vertex.elements.push(argument >> 16);
+                }
+            }
+            METHOD_ARRAY_ELEMENT32 => {
+                if state.vertex.primitive.is_some() && state.vertex.elements.len() < MAX_ELEMENTS {
+                    state.vertex.elements.push(argument);
+                }
+            }
+            METHOD_SET_CONTEXT_DMA_VERTEX_A | METHOD_SET_CONTEXT_DMA_VERTEX_B => {
+                let resolved = Self::resolve_dma_object(
+                    memory,
+                    context.pramin,
+                    context.ramht_raw,
+                    channel,
+                    argument,
+                );
+                let state = self.channels.entry(channel).or_default();
+                state.vertex_dma[usize::from(method == METHOD_SET_CONTEXT_DMA_VERTEX_B)] = resolved;
             }
             METHOD_SET_TRANSFORM_PROGRAM..=TRANSFORM_PROGRAM_LAST => {
                 let slot = (state.transform.program_load / 4) as usize;
@@ -873,6 +940,7 @@ impl PushbufferEngine {
                 } else {
                     state.vertex.primitive = Some(argument);
                     state.vertex.inline.clear();
+                    state.vertex.elements.clear();
                 }
             }
             METHOD_INLINE_ARRAY => {
@@ -915,8 +983,23 @@ impl PushbufferEngine {
             let Some(primitive) = state.vertex.primitive.take() else {
                 return;
             };
-            let vertices = Self::assemble_inline(&state.vertex, &state.transform);
+            if std::env::var("EXBAWKS_GPU_ELEM").is_ok() && !state.vertex.elements.is_empty() {
+                tracing::info!(
+                    elements = state.vertex.elements.len(),
+                    programmed = state.transform.programmed,
+                    dma_a = format_args!("{:?}", state.vertex_dma[0].map(|o| o.base)),
+                    stride0 = state.vertex.array_strides[0],
+                    offset0 = format_args!("{:#010x}", state.vertex.array_offsets[0]),
+                    "nv2a array draw"
+                );
+            }
+            let vertices = if state.vertex.elements.is_empty() {
+                Self::assemble_inline(&state.vertex, &state.transform)
+            } else {
+                Self::assemble_arrays(memory, &state.vertex, &state.transform, &state.vertex_dma)
+            };
             state.vertex.inline.clear();
+            state.vertex.elements.clear();
             let dma = state.texture_dma[(state.texture.format & 3).saturating_sub(1) as usize & 1];
             (primitive, vertices, state.surface, state.texture, dma, state.blend)
         };
@@ -1083,6 +1166,103 @@ impl PushbufferEngine {
         }
     }
 
+    /// Places one vertex on the surface.
+    ///
+    /// With a program the transform stage has already applied the viewport,
+    /// so only the perspective divide remains; without one the fixed
+    /// pipeline transforms by the composite matrix and the viewport scale
+    /// and offset map the result onto the surface.
+    fn place_vertex(
+        transform: &TransformState,
+        program: &[[u32; 4]],
+        attributes: &[[f32; 4]],
+    ) -> Option<crate::ScreenVertex> {
+        let color = |value: f32| ((value.clamp(0.0, 1.0) * 255.0) as u32) & 0xFF;
+        // Only a program's result can be placed truthfully. The fixed
+        // pipeline's composite matrix is tracked but not yet trusted:
+        // multiplying by it in either convention collapses the title's
+        // geometry to a point or throws it off the surface, so those
+        // primitives are counted rather than drawn wrong.
+        if !transform.programmed || program.is_empty() {
+            return None;
+        }
+        let result = crate::execute(program, &transform.constants, attributes)?;
+        let (position, diffuse, texcoord) = (result.position, result.diffuse, result.texcoord0);
+
+        let [x, y, _, w] = position;
+        if w == 0.0 || !w.is_finite() {
+            return None;
+        }
+        // A program applies the viewport itself, from constants the title
+        // uploads, so only the perspective divide remains.
+        let (x, y) = (x / w, y / w);
+        Some(crate::ScreenVertex {
+            x,
+            y,
+            color: (color(diffuse[3]) << 24)
+                | (color(diffuse[0]) << 16)
+                | (color(diffuse[1]) << 8)
+                | color(diffuse[2]),
+            u: texcoord[0],
+            v: texcoord[1],
+        })
+    }
+
+    /// Builds screen-space vertices from arrays in memory.
+    ///
+    /// Each index names one vertex; every enabled attribute is fetched from
+    /// its own array at that index's stride, which is how a title draws
+    /// geometry it uploaded once and reuses.
+    fn assemble_arrays(
+        memory: &dyn Nv2aMemory,
+        state: &VertexState,
+        transform: &TransformState,
+        vertex_dma: &[Option<DmaObject>; 2],
+    ) -> Vec<crate::ScreenVertex> {
+        let program = &transform.program[transform.program_start as usize..];
+        let mut attributes = vec![[0.0_f32; 4]; crate::INPUT_REGISTERS];
+        let mut vertices = Vec::with_capacity(state.elements.len());
+        for index in &state.elements {
+            for (attribute, format) in state.formats.iter().enumerate() {
+                if format.size == 0 {
+                    continue;
+                }
+                let stride = state.array_strides[attribute];
+                let raw_offset = state.array_offsets[attribute];
+                let context = usize::from(raw_offset & VERTEX_ARRAY_CONTEXT_B != 0);
+                let Some(object) = vertex_dma[context].or(vertex_dma[0]) else {
+                    continue;
+                };
+                let base = object
+                    .base
+                    .wrapping_add(raw_offset & !VERTEX_ARRAY_CONTEXT_B)
+                    .wrapping_add(index.wrapping_mul(stride));
+                let register = &mut attributes[attribute];
+                match format.kind {
+                    ATTRIBUTE_TYPE_D3DCOLOR | ATTRIBUTE_TYPE_UBYTE_RGBA => {
+                        let packed = memory.read_dword(base).unwrap_or(0);
+                        let channel = |shift: u32| f32::from((packed >> shift) as u8) / 255.0;
+                        *register = [channel(16), channel(8), channel(0), channel(24)];
+                    }
+                    _ => {
+                        *register = [0.0, 0.0, 0.0, 1.0];
+                        for (component, lane) in
+                            register.iter_mut().enumerate().take(format.size.min(4) as usize)
+                        {
+                            *lane = memory
+                                .read_dword(base.wrapping_add(component as u32 * 4))
+                                .map_or(0.0, f32::from_bits);
+                        }
+                    }
+                }
+            }
+            if let Some(vertex) = Self::place_vertex(transform, program, &attributes) {
+                vertices.push(vertex);
+            }
+        }
+        vertices
+    }
+
     /// Unpacks one vertex's dwords into the attribute registers a program
     /// reads.
     fn load_attributes(state: &VertexState, chunk: &[u32], attributes: &mut [[f32; 4]]) {
@@ -1193,28 +1373,9 @@ impl PushbufferEngine {
         for chunk in state.inline.chunks_exact(stride as usize) {
             if programmed {
                 Self::load_attributes(state, chunk, &mut attributes);
-                let Some(result) = crate::execute(program, &transform.constants, &attributes)
-                else {
-                    continue;
-                };
-                let [x, y, _, w] = result.position;
-                if w == 0.0 || !w.is_finite() {
-                    continue;
+                if let Some(vertex) = Self::place_vertex(transform, program, &attributes) {
+                    vertices.push(vertex);
                 }
-                let color = |value: f32| ((value.clamp(0.0, 1.0) * 255.0) as u32) & 0xFF;
-                // A program emits screen coordinates: the viewport scale
-                // and offset reach it as constants, and it applies them
-                // itself, so only the perspective divide remains.
-                vertices.push(crate::ScreenVertex {
-                    x: x / w,
-                    y: y / w,
-                    color: (color(result.diffuse[3]) << 24)
-                        | (color(result.diffuse[0]) << 16)
-                        | (color(result.diffuse[1]) << 8)
-                        | color(result.diffuse[2]),
-                    u: result.texcoord0[0],
-                    v: result.texcoord0[1],
-                });
                 continue;
             }
             let color = match diffuse.kind {

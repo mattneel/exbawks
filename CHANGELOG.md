@@ -260,6 +260,14 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- Vertex arrays: a title that draws from arrays it uploaded once — indices
+  through `ARRAY_ELEMENT16` and `ARRAY_ELEMENT32`, attributes at their own
+  offsets and strides in a vertex context DMA — now assembles the same way
+  inline data does. The composite matrix the fixed pipeline transforms by is
+  tracked, but not yet trusted: multiplying by it in either convention
+  collapses the retail title's geometry to a point or throws it off the
+  surface, so those primitives are counted rather than drawn wrong.
+
 - GPU-M4: the vertex program. A title uploads 128-bit instructions and runs
   them once per vertex, two operations at a time — a vector one and a scalar
   one — over sixteen attribute registers, twelve temporaries, and a constant

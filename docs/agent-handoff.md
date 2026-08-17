@@ -312,11 +312,22 @@ Two active threads:
    layout was confirmed: identity swizzles read `0x1B`, and exactly one
    instruction carries the final bit.
 
-   **What is left:** the title draws most of its 3D scene through vertex
-   *arrays* — `ARRAY_ELEMENT16` at `0x1800`, tens of millions of
-   submissions — and this engine only assembles `INLINE_ARRAY`, so those
-   primitives are counted in `skipped_primitives`. After that: the pixel
-   combiner (approximated as texture times vertex color) and depth testing.
+   Vertex arrays assemble too: indices through `ARRAY_ELEMENT16`/`32`,
+   attributes fetched at their own offsets and strides from a vertex context
+   DMA. **But the title draws its scene through the fixed pipeline**
+   (`SET_TRANSFORM_EXECUTION_MODE` reads `4`, not `6`), and the composite
+   matrix at `0x0680` does not place that geometry: multiplied one way every
+   vertex lands within a pixel of the screen centre (`w` comes out near
+   50,000), and transposed they land far off the surface. The matrix is
+   tracked and the primitives are counted rather than drawn wrong, so the
+   next person picks up a measurement, not a mess. Worth checking first:
+   whether the matrix needs its own load pointer (like the program and
+   constants do), whether `0x0680` is the composite or another of the four
+   matrices in that block, and what the fixed pipeline does with `w` before
+   the viewport.
+
+   After that: the pixel combiner (approximated as texture times vertex
+   color) and depth testing.
 
    Two techniques earned their keep and are worth reaching for again: the
    cancel pump's RIP sampling (`RUST_LOG=exbawks_core::emulator=trace`,
