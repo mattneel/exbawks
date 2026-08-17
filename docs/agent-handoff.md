@@ -345,8 +345,28 @@ Two active threads:
    A title cannot be committed, so its digest belongs beside the private
    image under `fixtures/private/`, never in a test this repository runs.
 
+   The graphics stack has since been reviewed adversarially, and the review
+   was worth its cost: malformed pushbuffer data could panic the engine four
+   ways and hang it two more, all of it now fixed and pinned by regression
+   tests that submit the hostile streams. The pattern behind most of them is
+   worth carrying forward — a guest value used as an index, a length, or a
+   loop bound needs its ceiling written down at the point it enters, not
+   where it is used. Two correctness bugs came out of the same pass: `DXT3`
+   and `DXT5` colour halves always carry four colours, and a compressed
+   texture's size comes from its format word rather than a rectangle an
+   earlier linear texture left behind.
+
+   **Where the title stops now:** a forty-million-exit run ends in
+   `GuestFault { address: 4 }` — a null dereference somewhere past the title
+   logo, and the next thing to chase if the sequence should go further. The
+   frame the run keeps is unchanged, so whatever fails happens after the
+   part that renders.
+
    After that: the pixel combiner, which this engine still approximates as
-   texture times vertex color.
+   texture times vertex color. The title programs all eight stages
+   (`0x0260`/`0x0AC0` input words, `0x0A60` factors, `0x1E60` control,
+   ~192,000 updates each), so this is the last large piece of shading
+   fidelity outstanding.
 
    Two techniques earned their keep and are worth reaching for again: the
    cancel pump's RIP sampling (`RUST_LOG=exbawks_core::emulator=trace`,
