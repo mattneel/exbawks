@@ -16,7 +16,8 @@ pub use error::GraphicsError;
 pub use frontend::GraphicsFrontend;
 pub use nv2a::{DmaObject, Nv2aMemory, PushbufferEngine, PusherStats};
 pub use raster::{
-    BlendMode, DepthState, PixelSink, RenderTarget, ScreenVertex, TextureSource, fill_triangle,
+    AlphaTest, BlendState, CullState, DepthState, PipelineState, PixelSink, RenderTarget,
+    ScreenVertex, TextureSource, fill_triangle,
 };
 pub use shader::{INPUT_REGISTERS, ShaderResult, execute};
 pub use texture::{dxt_opaque_texel, dxt1_texel, dxt3_alpha, dxt5_alpha};

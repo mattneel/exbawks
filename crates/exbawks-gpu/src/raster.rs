@@ -134,34 +134,140 @@ impl DepthState {
 }
 
 /// How a drawn pixel combines with what is already on the surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BlendMode {
-    /// The drawn pixel replaces the destination.
-    #[default]
-    Replace,
-    /// The drawn pixel is weighted by its own alpha and the destination by
-    /// the remainder — the combination a title's transparent art needs, and
-    /// what its interface is authored against.
-    SourceAlpha,
+///
+/// The factors are the hardware's own codes, which a title programs per
+/// draw: it leans on `ONE` for the passes that add light and on
+/// `ONE_MINUS_SRC_ALPHA` for the ones that lay art over a background, and
+/// treating the first like the second darkens exactly what should glow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlendState {
+    /// Whether the drawn pixel is combined at all.
+    pub enabled: bool,
+    /// The factor the drawn pixel is weighted by.
+    pub source: u32,
+    /// The factor the destination is weighted by.
+    pub destination: u32,
 }
 
-/// Combines a source and destination color by a blend mode.
-fn combine(mode: BlendMode, source: u32, destination: u32) -> u32 {
-    match mode {
-        BlendMode::Replace => source,
-        BlendMode::SourceAlpha => {
-            let alpha = (source >> 24) & 0xFF;
-            let mut out = 0xFF00_0000;
-            for shift in [0, 8, 16] {
-                let from = (source >> shift) & 0xFF;
-                let onto = (destination >> shift) & 0xFF;
-                let value = (from * alpha + onto * (255 - alpha) + 127) / 255;
-                out |= (value & 0xFF) << shift;
-            }
-            out
+impl Default for BlendState {
+    fn default() -> Self {
+        // Blending off: the drawn pixel replaces what is there.
+        Self { enabled: false, source: BLEND_ONE, destination: BLEND_ZERO }
+    }
+}
+
+/// The blend factor codes this engine reads.
+pub const BLEND_ZERO: u32 = 0x0000;
+/// One.
+pub const BLEND_ONE: u32 = 0x0001;
+const BLEND_SRC_COLOR: u32 = 0x0300;
+const BLEND_ONE_MINUS_SRC_COLOR: u32 = 0x0301;
+const BLEND_SRC_ALPHA: u32 = 0x0302;
+const BLEND_ONE_MINUS_SRC_ALPHA: u32 = 0x0303;
+const BLEND_DST_ALPHA: u32 = 0x0304;
+const BLEND_ONE_MINUS_DST_ALPHA: u32 = 0x0305;
+const BLEND_DST_COLOR: u32 = 0x0306;
+const BLEND_ONE_MINUS_DST_COLOR: u32 = 0x0307;
+const BLEND_SRC_ALPHA_SATURATE: u32 = 0x0308;
+
+/// One blend factor, as a weight in `0..=255` for one channel.
+fn blend_factor(code: u32, source: u32, destination: u32, shift: u32) -> u32 {
+    let channel = |color: u32| (color >> shift) & 0xFF;
+    let source_alpha = (source >> 24) & 0xFF;
+    let destination_alpha = (destination >> 24) & 0xFF;
+    match code {
+        BLEND_ZERO => 0,
+        BLEND_SRC_COLOR => channel(source),
+        BLEND_ONE_MINUS_SRC_COLOR => 255 - channel(source),
+        BLEND_SRC_ALPHA => source_alpha,
+        BLEND_ONE_MINUS_SRC_ALPHA => 255 - source_alpha,
+        BLEND_DST_ALPHA => destination_alpha,
+        BLEND_ONE_MINUS_DST_ALPHA => 255 - destination_alpha,
+        BLEND_DST_COLOR => channel(destination),
+        BLEND_ONE_MINUS_DST_COLOR => 255 - channel(destination),
+        BLEND_SRC_ALPHA_SATURATE if shift != 24 => source_alpha.min(255 - destination_alpha),
+        // `ONE`, and anything this engine does not model, leaves the term
+        // as it is rather than dropping it.
+        _ => 255,
+    }
+}
+
+/// Combines a source and destination color by the programmed factors.
+fn combine(state: BlendState, source: u32, destination: u32) -> u32 {
+    let mut out = 0;
+    for shift in [0, 8, 16, 24] {
+        let from = (source >> shift) & 0xFF;
+        let onto = (destination >> shift) & 0xFF;
+        let source_weight = blend_factor(state.source, source, destination, shift);
+        let destination_weight = blend_factor(state.destination, source, destination, shift);
+        let value = (from * source_weight + onto * destination_weight + 127) / 255;
+        out |= (value.min(255) & 0xFF) << shift;
+    }
+    out
+}
+
+/// Which faces are discarded before they are drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CullState {
+    /// Whether facing is tested at all.
+    pub enabled: bool,
+    /// The face discarded: `0x0404` front, `0x0405` back, `0x0408` both.
+    pub face: u32,
+    /// The winding that counts as front: `0x0900` clockwise on screen.
+    pub front_face: u32,
+}
+
+/// The comparison a fragment's alpha must pass to be drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AlphaTest {
+    /// Whether the comparison runs.
+    pub enabled: bool,
+    /// The comparison, in the hardware's numbering.
+    pub function: u32,
+    /// The value compared against, in `0..=255`.
+    pub reference: u32,
+}
+
+impl AlphaTest {
+    /// Whether a fragment's alpha passes.
+    fn passes(self, alpha: u32) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        match self.function & 0x7 {
+            0 => false,
+            1 => alpha < self.reference,
+            2 => alpha == self.reference,
+            3 => alpha <= self.reference,
+            4 => alpha > self.reference,
+            5 => alpha != self.reference,
+            6 => alpha >= self.reference,
+            _ => true,
         }
     }
 }
+
+/// Everything a primitive is drawn under besides its geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PipelineState {
+    /// How a drawn pixel combines with the surface.
+    pub blend: BlendState,
+    /// How a fragment is compared against the depth surface.
+    pub depth: DepthState,
+    /// Which faces are discarded.
+    pub cull: CullState,
+    /// The comparison a fragment's alpha must pass.
+    pub alpha: AlphaTest,
+}
+
+/// The cull-face code discarding front faces.
+const CULL_FACE_FRONT: u32 = 0x0404;
+/// The cull-face code discarding back faces.
+const CULL_FACE_BACK: u32 = 0x0405;
+/// The cull-face code discarding both.
+const CULL_FACE_BOTH: u32 = 0x0408;
+/// The front-face code naming clockwise winding.
+const FRONT_FACE_CLOCKWISE: u32 = 0x0900;
 
 /// The signed area of the triangle formed by three points, doubled.
 fn edge(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
@@ -194,16 +300,29 @@ pub fn fill_triangle(
     target: &RenderTarget,
     vertices: [ScreenVertex; 3],
     texture: Option<&dyn TextureSource>,
-    blend: BlendMode,
-    depth: DepthState,
+    state: PipelineState,
 ) -> u64 {
+    let (blend, depth) = (state.blend, state.depth);
     let [a, b, c] = vertices;
     let area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
     if area == 0.0 || !area.is_finite() {
         return 0;
     }
-    // A back-facing triangle is drawn the same way; culling is the
-    // pipeline's decision, not the rasterizer's.
+    // Screen space runs downward, so a positive signed area is a clockwise
+    // triangle as the viewer sees it.
+    if state.cull.enabled {
+        let clockwise = area > 0.0;
+        let front = clockwise == (state.cull.front_face == FRONT_FACE_CLOCKWISE);
+        let discarded = match state.cull.face {
+            CULL_FACE_FRONT => front,
+            CULL_FACE_BACK => !front,
+            CULL_FACE_BOTH => true,
+            _ => false,
+        };
+        if discarded {
+            return 0;
+        }
+    }
     let (a, b, c) = if area < 0.0 { (a, c, b) } else { (a, b, c) };
     let area = area.abs();
 
@@ -278,17 +397,22 @@ pub fn fill_triangle(
                 );
                 color = modulate(texel, color);
             }
-            if blend == BlendMode::SourceAlpha {
+            if !state.alpha.passes((color >> 24) & 0xFF) {
+                continue;
+            }
+            if blend.enabled {
                 let alpha = (color >> 24) & 0xFF;
-                if alpha == 0 {
-                    // Fully transparent art must not touch the surface: its
-                    // color channels are black, and writing them would
-                    // erase whatever the title drew underneath.
+                // A transparent pixel under the usual over-blend leaves the
+                // surface exactly as it was, and its color channels are
+                // black; skipping it saves a read and a write. The additive
+                // passes a title uses for light have no such shortcut.
+                let transparent_is_a_no_op = alpha == 0
+                    && blend.source == BLEND_SRC_ALPHA
+                    && blend.destination == BLEND_ONE_MINUS_SRC_ALPHA;
+                if transparent_is_a_no_op {
                     continue;
                 }
-                if alpha != 0xFF {
-                    color = combine(blend, color, sink.read_pixel(address));
-                }
+                color = combine(blend, color, sink.read_pixel(address));
             }
             sink.write_pixel(address, color);
             if let Some((address, value)) = depth_address {
@@ -340,6 +464,14 @@ mod tests {
         }
     }
 
+    /// The over-blend a title uses for transparent art.
+    fn over_blend() -> PipelineState {
+        PipelineState {
+            blend: BlendState { enabled: true, source: 0x0302, destination: 0x0303 },
+            ..PipelineState::default()
+        }
+    }
+
     fn vertex(x: f32, y: f32, color: u32) -> ScreenVertex {
         ScreenVertex { x, y, color, u: 0.0, v: 0.0, z: 0.0, inverse_w: 1.0 }
     }
@@ -379,8 +511,7 @@ mod tests {
                 vertex(0.0, 10.0, 0xFFFFFFFF),
             ],
             None,
-            BlendMode::Replace,
-            DepthState::default(),
+            PipelineState::default(),
         );
         // Half of a hundred pixels, within the diagonal's rounding.
         assert!((45..=60).contains(&written), "covered {written} pixels");
@@ -398,8 +529,7 @@ mod tests {
                 vertex(1.0, 8.0, 0xFF00FF00),
             ],
             None,
-            BlendMode::Replace,
-            DepthState::default(),
+            PipelineState::default(),
         );
         let counter = fill_triangle(
             &canvas,
@@ -410,8 +540,7 @@ mod tests {
                 vertex(8.0, 1.0, 0xFF00FF00),
             ],
             None,
-            BlendMode::Replace,
-            DepthState::default(),
+            PipelineState::default(),
         );
         assert_eq!(clockwise, counter, "both windings fill the same pixels");
     }
@@ -428,8 +557,7 @@ mod tests {
                 vertex(0.0, 4.0, 0xFF112233),
             ],
             None,
-            BlendMode::Replace,
-            DepthState::default(),
+            PipelineState::default(),
         );
         let written = canvas.0.lock().expect("lock");
         let (first_address, first_color) = written[0];
@@ -451,8 +579,7 @@ mod tests {
                 vertex(20.0, 30.0, 0xFFFFFFFF),
             ],
             None,
-            BlendMode::Replace,
-            DepthState::default(),
+            PipelineState::default(),
         );
         assert_eq!(written, 0);
         assert!(canvas.0.lock().expect("lock").is_empty());
@@ -470,8 +597,7 @@ mod tests {
                 vertex(9.0, 1.0, 0xFFFFFFFF),
             ],
             None,
-            BlendMode::Replace,
-            DepthState::default(),
+            PipelineState::default(),
         );
         assert_eq!(written, 0, "a zero-area triangle covers nothing");
     }
@@ -488,8 +614,7 @@ mod tests {
                 vertex(0.0, 9.0, 0xFF0000FF),
             ],
             None,
-            BlendMode::Replace,
-            DepthState::default(),
+            PipelineState::default(),
         );
         let written = canvas.0.lock().expect("lock");
         let colors: Vec<u32> = written.iter().map(|(_, color)| *color).collect();
@@ -517,14 +642,8 @@ mod tests {
         ];
         vertices[1].u = 1.0;
         vertices[2].v = 1.0;
-        let written = fill_triangle(
-            &canvas,
-            &target(),
-            vertices,
-            Some(&Checker),
-            BlendMode::Replace,
-            DepthState::default(),
-        );
+        let written =
+            fill_triangle(&canvas, &target(), vertices, Some(&Checker), PipelineState::default());
 
         assert!(written > 0);
         let pixels = canvas.0.lock().expect("lock");
@@ -543,14 +662,7 @@ mod tests {
             vertex(4.0, 0.0, 0xFF80_8080),
             vertex(0.0, 4.0, 0xFF80_8080),
         ];
-        fill_triangle(
-            &canvas,
-            &target(),
-            vertices,
-            Some(&Checker),
-            BlendMode::Replace,
-            DepthState::default(),
-        );
+        fill_triangle(&canvas, &target(), vertices, Some(&Checker), PipelineState::default());
 
         let pixels = canvas.0.lock().expect("lock");
         let (_, color) = pixels[0];
@@ -568,14 +680,7 @@ mod tests {
             vertex(8.0, 0.0, 0x0000_0000),
             vertex(0.0, 8.0, 0x0000_0000),
         ];
-        let written = fill_triangle(
-            &canvas,
-            &target(),
-            vertices,
-            None,
-            BlendMode::SourceAlpha,
-            DepthState::default(),
-        );
+        let written = fill_triangle(&canvas, &target(), vertices, None, over_blend());
 
         assert_eq!(written, 0, "nothing is drawn through zero alpha");
         assert!(canvas.0.lock().expect("lock").is_empty());
@@ -591,14 +696,7 @@ mod tests {
             vertex(4.0, 0.0, 0x8000_0000),
             vertex(0.0, 4.0, 0x8000_0000),
         ];
-        fill_triangle(
-            &canvas,
-            &target(),
-            vertices,
-            None,
-            BlendMode::SourceAlpha,
-            DepthState::default(),
-        );
+        fill_triangle(&canvas, &target(), vertices, None, over_blend());
 
         let pixels = canvas.0.lock().expect("lock");
         let (_, color) = *pixels
@@ -633,8 +731,11 @@ mod tests {
         for vertex in &mut vertices {
             vertex.z = 500.0;
         }
-        let depth = DepthState { test: true, write: true, function: 3 };
-        fill_triangle(&canvas, &target, vertices, None, BlendMode::Replace, depth);
+        let state = PipelineState {
+            depth: DepthState { test: true, write: true, function: 3 },
+            ..PipelineState::default()
+        };
+        fill_triangle(&canvas, &target, vertices, None, state);
 
         let pixels = canvas.0.lock().expect("lock");
         assert!(
@@ -665,8 +766,11 @@ mod tests {
         for vertex in &mut vertices {
             vertex.z = 100.0;
         }
-        let depth = DepthState { test: true, write: true, function: 3 };
-        let written = fill_triangle(&canvas, &target, vertices, None, BlendMode::Replace, depth);
+        let state = PipelineState {
+            depth: DepthState { test: true, write: true, function: 3 },
+            ..PipelineState::default()
+        };
+        let written = fill_triangle(&canvas, &target, vertices, None, state);
 
         assert!(written > 0, "a nearer fragment draws");
         let pixels = canvas.0.lock().expect("lock");
@@ -687,14 +791,7 @@ mod tests {
         ];
         vertices[1].u = 1.0;
         vertices[1].inverse_w = 0.1;
-        fill_triangle(
-            &canvas,
-            &target(),
-            vertices,
-            Some(&Checker),
-            BlendMode::Replace,
-            DepthState::default(),
-        );
+        fill_triangle(&canvas, &target(), vertices, Some(&Checker), PipelineState::default());
 
         let pixels = canvas.0.lock().expect("lock");
         // With a perspective divide the midpoint still samples the first
@@ -705,6 +802,93 @@ mod tests {
             .find(|(address, _)| *address == 0x1000 + 4 * 4)
             .expect("the midpoint was drawn");
         assert_eq!(midpoint.1, 0xFFFF_0000, "still the near vertex's texel");
+    }
+
+    #[test]
+    fn an_additive_blend_adds_light_instead_of_replacing_it() {
+        let canvas = Canvas::default();
+        // A grey surface with a grey pass added over it: the result is
+        // brighter than either, which an over-blend could never produce.
+        canvas.write_pixel(0x1000, 0xFF40_4040);
+        let state = PipelineState {
+            blend: BlendState { enabled: true, source: BLEND_ONE, destination: BLEND_ONE },
+            ..PipelineState::default()
+        };
+        let vertices = [
+            vertex(0.0, 0.0, 0x0040_4040),
+            vertex(4.0, 0.0, 0x0040_4040),
+            vertex(0.0, 4.0, 0x0040_4040),
+        ];
+        fill_triangle(&canvas, &target(), vertices, None, state);
+
+        let pixels = canvas.0.lock().expect("lock");
+        let (_, color) = *pixels
+            .iter()
+            .rev()
+            .find(|(address, _)| *address == 0x1000)
+            .expect("the pixel was drawn");
+        assert_eq!((color >> 16) & 0xFF, 0x80, "two greys add to a brighter one");
+    }
+
+    #[test]
+    fn a_transparent_additive_pass_still_adds() {
+        let canvas = Canvas::default();
+        canvas.write_pixel(0x1000, 0xFF00_0000);
+        let state = PipelineState {
+            blend: BlendState { enabled: true, source: BLEND_ONE, destination: BLEND_ONE },
+            ..PipelineState::default()
+        };
+        // Zero alpha, but additive: the colour still reaches the surface.
+        let vertices = [
+            vertex(0.0, 0.0, 0x0020_2020),
+            vertex(4.0, 0.0, 0x0020_2020),
+            vertex(0.0, 4.0, 0x0020_2020),
+        ];
+        let written = fill_triangle(&canvas, &target(), vertices, None, state);
+
+        assert!(written > 0, "an additive pass is not skipped for its alpha");
+    }
+
+    #[test]
+    fn culling_discards_one_winding_and_keeps_the_other() {
+        let canvas = Canvas::default();
+        let state = PipelineState {
+            cull: CullState { enabled: true, face: 0x0405, front_face: 0x0900 },
+            ..PipelineState::default()
+        };
+        let clockwise = [
+            vertex(1.0, 1.0, 0xFFFFFFFF),
+            vertex(8.0, 1.0, 0xFFFFFFFF),
+            vertex(1.0, 8.0, 0xFFFFFFFF),
+        ];
+        let counter = [clockwise[0], clockwise[2], clockwise[1]];
+        let first = fill_triangle(&canvas, &target(), clockwise, None, state);
+        let second = fill_triangle(&canvas, &target(), counter, None, state);
+
+        assert!(first > 0 || second > 0, "one winding survives");
+        assert_eq!(first.min(second), 0, "and the other is discarded");
+    }
+
+    #[test]
+    fn the_alpha_test_discards_what_fails_it() {
+        let canvas = Canvas::default();
+        // Greater than 0x80: a fragment at 0x40 fails, one at 0xFF passes.
+        let state = PipelineState {
+            alpha: AlphaTest { enabled: true, function: 4, reference: 0x80 },
+            ..PipelineState::default()
+        };
+        let below = [
+            vertex(0.0, 0.0, 0x4000_0000),
+            vertex(4.0, 0.0, 0x4000_0000),
+            vertex(0.0, 4.0, 0x4000_0000),
+        ];
+        let above = [
+            vertex(0.0, 0.0, 0xFFFF_FFFF),
+            vertex(4.0, 0.0, 0xFFFF_FFFF),
+            vertex(0.0, 4.0, 0xFFFF_FFFF),
+        ];
+        assert_eq!(fill_triangle(&canvas, &target(), below, None, state), 0);
+        assert!(fill_triangle(&canvas, &target(), above, None, state) > 0);
     }
 
     #[test]
@@ -729,8 +913,7 @@ mod tests {
                 vertex(0.0, 10.0, 0xFFFFFFFF),
             ],
             None,
-            BlendMode::Replace,
-            DepthState::default(),
+            PipelineState::default(),
         );
         // Only the part of the triangle inside the clip is drawn, and the
         // clip's own corner is outside the triangle's half-space.

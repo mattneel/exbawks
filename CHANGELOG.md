@@ -260,6 +260,15 @@ The project follows Keep a Changelog structure before its first release.
   now takes ownership of mapped regions), and non-page-granular region sizes
   the platform rejects (now rounded); all fixed and re-proven on hardware.
 
+- The blend factors, face culling, and the alpha test a title programs are
+  now obeyed rather than assumed. Half of this title's blended draws ask for
+  a destination factor of `ONE` — the additive passes that add light — and
+  rendering them as source-alpha darkened exactly what should glow. Culling
+  removes about a fifth of the shading work that was back faces painting
+  over front ones. The winding convention is read from the title's own
+  front-face and cull-face registers; if a scene ever appears inside out,
+  that is the sign to check first.
+
 ### Fixed (graphics, from an adversarial review)
 
 - Malformed pushbuffer data can no longer panic or hang the engine. A

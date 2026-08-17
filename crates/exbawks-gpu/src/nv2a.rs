@@ -290,6 +290,18 @@ struct ChannelState {
     depth_write: bool,
     /// The depth comparison the title selected.
     depth_function: u32,
+    /// The blend factors, and whether blending runs.
+    blend_source: u32,
+    blend_destination: u32,
+    /// Whether facing is tested, which face is discarded, and which
+    /// winding counts as front.
+    cull: bool,
+    cull_face: u32,
+    front_face: u32,
+    /// The alpha comparison a fragment must pass.
+    alpha_test: bool,
+    alpha_function: u32,
+    alpha_reference: u32,
     /// The first texture unit's state.
     texture: TextureState,
     /// The context-DMA objects textures address through (`A` and `B`).
@@ -639,6 +651,22 @@ const TRANSFORM_MODE_PROGRAM: u32 = 2;
 
 /// Kelvin `SET_BLEND_ENABLE`.
 const METHOD_SET_BLEND_ENABLE: u16 = 0x0304;
+/// Kelvin `SET_ALPHA_TEST_ENABLE`.
+const METHOD_SET_ALPHA_TEST_ENABLE: u16 = 0x0300;
+/// Kelvin `SET_ALPHA_FUNC`.
+const METHOD_SET_ALPHA_FUNC: u16 = 0x033C;
+/// Kelvin `SET_ALPHA_REF`.
+const METHOD_SET_ALPHA_REF: u16 = 0x0340;
+/// Kelvin `SET_BLEND_FUNC_SFACTOR`.
+const METHOD_SET_BLEND_FUNC_SFACTOR: u16 = 0x0344;
+/// Kelvin `SET_BLEND_FUNC_DFACTOR`.
+const METHOD_SET_BLEND_FUNC_DFACTOR: u16 = 0x0348;
+/// Kelvin `SET_CULL_FACE_ENABLE`.
+const METHOD_SET_CULL_FACE_ENABLE: u16 = 0x0308;
+/// Kelvin `SET_CULL_FACE`.
+const METHOD_SET_CULL_FACE: u16 = 0x039C;
+/// Kelvin `SET_FRONT_FACE`.
+const METHOD_SET_FRONT_FACE: u16 = 0x03A0;
 /// Kelvin `SET_DEPTH_TEST_ENABLE`.
 const METHOD_SET_DEPTH_TEST_ENABLE: u16 = 0x030C;
 /// Kelvin `SET_DEPTH_FUNC`.
@@ -926,6 +954,30 @@ impl PushbufferEngine {
             METHOD_SET_SURFACE_ZETA_OFFSET => {
                 state.surface.zeta_offset = argument;
             }
+            METHOD_SET_ALPHA_TEST_ENABLE => {
+                state.alpha_test = argument != 0;
+            }
+            METHOD_SET_ALPHA_FUNC => {
+                state.alpha_function = argument;
+            }
+            METHOD_SET_ALPHA_REF => {
+                state.alpha_reference = argument;
+            }
+            METHOD_SET_BLEND_FUNC_SFACTOR => {
+                state.blend_source = argument;
+            }
+            METHOD_SET_BLEND_FUNC_DFACTOR => {
+                state.blend_destination = argument;
+            }
+            METHOD_SET_CULL_FACE_ENABLE => {
+                state.cull = argument != 0;
+            }
+            METHOD_SET_CULL_FACE => {
+                state.cull_face = argument;
+            }
+            METHOD_SET_FRONT_FACE => {
+                state.front_face = argument;
+            }
             METHOD_SET_DEPTH_TEST_ENABLE => {
                 state.depth_test = argument != 0;
             }
@@ -1114,7 +1166,7 @@ impl PushbufferEngine {
     /// anything else is counted and skipped, so what is missing stays
     /// visible in the statistics rather than quietly drawing nothing.
     fn end_primitive(&mut self, memory: &dyn Nv2aMemory, channel: u32) {
-        let (primitive, vertices, surface, texture, texture_dma, blend, depth) = {
+        let (primitive, vertices, surface, texture, texture_dma, pipeline) = {
             let state = self.channels.entry(channel).or_default();
             let Some(primitive) = state.vertex.primitive.take() else {
                 return;
@@ -1127,14 +1179,31 @@ impl PushbufferEngine {
             state.vertex.inline.clear();
             state.vertex.elements.clear();
             let dma = state.texture_dma[(state.texture.format & 3).saturating_sub(1) as usize & 1];
-            let depth = crate::DepthState {
-                test: state.depth_test,
-                write: state.depth_write,
-                // The hardware's comparisons are numbered from a base of
-                // `never`; a title programs them as `0x200 + comparison`.
-                function: state.depth_function & 0x7,
+            let pipeline = crate::PipelineState {
+                blend: crate::BlendState {
+                    enabled: state.blend,
+                    source: state.blend_source,
+                    destination: state.blend_destination,
+                },
+                depth: crate::DepthState {
+                    test: state.depth_test,
+                    write: state.depth_write,
+                    // The hardware's comparisons are numbered from a base
+                    // of `never`; a title programs `0x200 + comparison`.
+                    function: state.depth_function & 0x7,
+                },
+                cull: crate::CullState {
+                    enabled: state.cull,
+                    face: state.cull_face,
+                    front_face: state.front_face,
+                },
+                alpha: crate::AlphaTest {
+                    enabled: state.alpha_test,
+                    function: state.alpha_function & 0x7,
+                    reference: state.alpha_reference & 0xFF,
+                },
             };
-            (primitive, vertices, state.surface, state.texture, dma, state.blend, depth)
+            (primitive, vertices, state.surface, state.texture, dma, pipeline)
         };
         let Some(target) = Self::render_target(&surface).filter(|_| !vertices.is_empty()) else {
             self.stats.skipped_primitives += 1;
@@ -1173,7 +1242,6 @@ impl PushbufferEngine {
         }
         let bound = bound.flatten();
         let sampler = bound.as_ref().map(|texture| texture as &dyn crate::TextureSource);
-        let mode = if blend { crate::BlendMode::SourceAlpha } else { crate::BlendMode::Replace };
 
         // Primitive assembly follows the hardware's numbering; triangles,
         // strips, fans, and quads are what a title draws with.
@@ -1219,8 +1287,7 @@ impl PushbufferEngine {
                 &target,
                 [vertices[a], vertices[b], vertices[c]],
                 sampler,
-                mode,
-                depth,
+                pipeline,
             );
             self.stats.triangles += 1;
             self.stats.shaded_pixels += written;
