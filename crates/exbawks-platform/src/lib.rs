@@ -4,6 +4,8 @@ mod aligned;
 mod capabilities;
 mod code_memory;
 mod error;
+#[cfg(windows)]
+pub mod hid;
 mod system_memory;
 pub mod virtual_memory;
 

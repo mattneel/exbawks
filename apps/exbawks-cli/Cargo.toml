@@ -23,6 +23,7 @@ exbawks-whp.workspace = true
 miette = { workspace = true, features = ["fancy"] }
 exbawks-platform.workspace = true
 exbawks-types.workspace = true
+exbawks-usb.workspace = true
 exbawks-xbe.workspace = true
 serde.workspace = true
 serde_json.workspace = true

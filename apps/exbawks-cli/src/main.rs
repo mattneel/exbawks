@@ -151,6 +151,10 @@ struct RunArgs {
     /// Attaches a gamepad to the emulated controller's root port.
     #[arg(long)]
     gamepad: bool,
+    /// Reads a real controller from the host and feeds it to that gamepad.
+    /// A run using one is not reproducible and may not record a golden.
+    #[arg(long)]
+    gamepad_live: bool,
     /// Reports every guest write to this address, with its writer.
     #[arg(long, value_parser = parse_u32)]
     watch_write: Option<u32>,
@@ -274,6 +278,7 @@ fn main() -> Result<()> {
                 gpu_combiner,
                 gpu_method_value,
                 gamepad,
+                gamepad_live,
                 watch_write,
                 frame_digest,
                 expect_frame,
@@ -301,6 +306,7 @@ fn main() -> Result<()> {
                     gpu_combiner,
                     gpu_method_value: &gpu_method_value,
                     gamepad,
+                    gamepad_live,
                     watch_write,
                     frame_digest,
                     expect_frame: expect_frame.as_deref(),
@@ -625,6 +631,8 @@ struct RunOptions<'a> {
     gpu_method_value: &'a [u32],
     /// Whether a gamepad is attached to the emulated controller.
     gamepad: bool,
+    /// Whether that gamepad is fed by a real controller.
+    gamepad_live: bool,
     /// A guest address whose writers should be reported.
     watch_write: Option<u32>,
     /// Whether to print the captured frame's digest.
@@ -650,6 +658,7 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
         gpu_combiner,
         gpu_method_value,
         gamepad,
+        gamepad_live,
         watch_write,
         frame_digest,
         expect_frame,
@@ -685,8 +694,15 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
         Ok(hdd) => emulator.set_hdd_root(hdd),
         Err(error) => eprintln!("warning: no writable hard-disk mount: {error:#}"),
     }
-    if gamepad {
+    if gamepad || gamepad_live {
         emulator.attach_gamepad(true);
+    }
+    if gamepad_live {
+        if emulator.use_live_gamepad() {
+            println!("Gamepad:      reading a controller from the host");
+        } else {
+            eprintln!("warning: no controller found; the gamepad reports nothing pressed");
+        }
     }
     if let Some(address) = watch_write {
         emulator.watch_writes(GuestVa(address));
@@ -877,12 +893,31 @@ Graphics methods (object, method, submissions):"
         println!();
     }
 
-    if gamepad {
+    if gamepad || gamepad_live {
         println!(
             "USB:          controller {}, communication area {:#010x}",
             if emulator.usb_operational() { "running" } else { "stopped" },
             emulator.usb_hcca()
         );
+        if gamepad_live {
+            let seen = emulator.gamepad_buttons_seen();
+            let names = [
+                (exbawks_usb::button::UP, "up"),
+                (exbawks_usb::button::DOWN, "down"),
+                (exbawks_usb::button::LEFT, "left"),
+                (exbawks_usb::button::RIGHT, "right"),
+                (exbawks_usb::button::START, "start"),
+                (exbawks_usb::button::BACK, "back"),
+                (exbawks_usb::button::LEFT_STICK, "left stick"),
+                (exbawks_usb::button::RIGHT_STICK, "right stick"),
+            ];
+            let pressed: Vec<&str> =
+                names.iter().filter(|(bit, _)| seen & bit != 0).map(|(_, name)| *name).collect();
+            println!(
+                "              buttons pressed during the run: {}",
+                if pressed.is_empty() { "none".to_owned() } else { pressed.join(", ") }
+            );
+        }
         let (address, configured) = emulator.usb_device_state();
         println!(
             "              gamepad address {address}, {}",

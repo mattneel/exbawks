@@ -269,6 +269,21 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- `exbawks run --gamepad-live` reads a real controller from the host and
+  feeds it to the emulated one. A DualSense, DualSense Edge, or either
+  DualShock 4 is opened over raw HID, read on its own thread because a
+  report read blocks until the device sends one, and translated into the
+  console's twenty-byte report — a translation rather than a
+  pass-through, since none of those controllers presents the descriptors
+  or report layout the title's driver is written against. The run reports
+  which buttons it saw pressed, so a person can tell whether their
+  controller reached the guest.
+
+  A run reading a live controller is not reproducible by construction and
+  may not record a golden (ADR 0019). The default remains no controller at
+  all, and `--gamepad` without `--gamepad-live` attaches one that presses
+  nothing, both of which keep a run a pure function of the image.
+
 - **The title enumerates the gamepad.** Its own USB driver now walks the
   whole sequence and is answered at every step: the device descriptor,
   `SET_ADDRESS`, the configuration descriptor, `SET_CONFIGURATION`, a

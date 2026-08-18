@@ -197,6 +197,90 @@ const XBOX_TSC_PER_MILLISECOND: u64 = 733_333;
 /// address as the end of the call rather than as a guest error.
 const INTERRUPT_RETURN_SENTINEL: GuestVa = GuestVa(0xFFBF_FFE8);
 
+/// A controller read from the host on its own thread.
+///
+/// A report read blocks until the device sends one, so it cannot happen on
+/// the thread running the guest: a reader thread owns the device and
+/// publishes what it last saw, and the run samples that whenever it likes.
+#[cfg(windows)]
+#[derive(Debug)]
+struct LiveGamepad {
+    /// The most recent state, shared with the reader thread.
+    state: std::sync::Arc<std::sync::Mutex<exbawks_usb::GamepadState>>,
+    /// Cleared to ask the reader to stop.
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Every button seen pressed during the run, so a person can tell
+    /// whether their controller reached the guest at all.
+    seen: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+#[cfg(windows)]
+impl LiveGamepad {
+    /// Opens the first controller the host has, if any.
+    fn open() -> Option<Self> {
+        let mut device =
+            exbawks_platform::hid::open_controller(&exbawks_platform::hid::known_controllers())
+                .ok()
+                .flatten()?;
+        let (vendor, product) = device.identity();
+        tracing::info!(
+            vendor = format_args!("{vendor:#06x}"),
+            product = format_args!("{product:#06x}"),
+            "reading a controller from the host"
+        );
+
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(exbawks_usb::GamepadState::default()));
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let writer = std::sync::Arc::clone(&state);
+        let reading = std::sync::Arc::clone(&running);
+        let pressed = std::sync::Arc::clone(&seen);
+        std::thread::Builder::new()
+            .name("gamepad".to_owned())
+            .spawn(move || {
+                let mut report = [0_u8; 64];
+                while reading.load(std::sync::atomic::Ordering::Relaxed) {
+                    let Ok(read) = device.read(&mut report) else {
+                        break;
+                    };
+                    // A controller sends reports this translation does not
+                    // recognise as well; those leave the last state alone
+                    // rather than clearing it.
+                    if let Some(translated) =
+                        exbawks_usb::translate_controller_report(&report[..read])
+                        && let Ok(mut held) = writer.lock()
+                    {
+                        *held = translated;
+                        pressed.fetch_or(
+                            u32::from(translated.buttons),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self { state, running, seen })
+    }
+
+    /// The state the reader last published.
+    fn state(&self) -> exbawks_usb::GamepadState {
+        self.state.lock().map(|held| *held).unwrap_or_default()
+    }
+
+    /// Every button seen pressed during the run.
+    fn seen(&self) -> u16 {
+        self.seen.load(std::sync::atomic::Ordering::Relaxed) as u16
+    }
+}
+
+#[cfg(windows)]
+impl Drop for LiveGamepad {
+    fn drop(&mut self) {
+        self.running.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The interrupt vector the graphics processor is wired to.
 ///
 /// A title asks the abstraction layer for it and connects a routine there;
@@ -304,6 +388,7 @@ impl EmulatorBuilder {
             gdt_fs_base: std::cell::Cell::new(u32::MAX),
             gamepad_wanted: false,
             gamepad_ready_frame: None,
+            live_gamepad: None,
             interrupted: None,
             watch_write: None,
             brightest_frame: None,
@@ -344,6 +429,10 @@ pub struct Emulator {
     /// The `fs` base the descriptor table currently carries, so the table
     /// is rewritten on a thread switch rather than on every exit.
     gdt_fs_base: std::cell::Cell<u32>,
+    /// A controller read from the host, which a background reader keeps
+    /// up to date. A run using one is not reproducible by construction
+    /// (ADR 0019), so it may not record a golden.
+    live_gamepad: Option<std::sync::Arc<LiveGamepad>>,
     /// The frame the driver was first seen ready on, so the attach can be
     /// held until its hub work will act on the interrupt.
     gamepad_ready_frame: Option<u64>,
@@ -1268,6 +1357,35 @@ impl Emulator {
         }
     }
 
+    /// Reads a real controller from the host for as long as the run lasts.
+    ///
+    /// Returns whether one was found. Nothing else changes when none is:
+    /// the guest sees a gamepad with nothing pressed, as it does with a
+    /// scripted source that presses nothing.
+    #[cfg(windows)]
+    pub fn use_live_gamepad(&mut self) -> bool {
+        match LiveGamepad::open() {
+            Some(live) => {
+                self.live_gamepad = Some(std::sync::Arc::new(live));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Every button a real controller was seen pressing during the run.
+    #[must_use]
+    pub fn gamepad_buttons_seen(&self) -> u16 {
+        self.live_gamepad.as_ref().map_or(0, |live| live.seen())
+    }
+
+    /// Samples the host controller, if one is attached, into the device.
+    fn sample_gamepad(&self) {
+        if let Some(live) = self.live_gamepad.as_ref() {
+            self.devices.set_gamepad_state(live.state());
+        }
+    }
+
     /// Records the controller state the guest's next read will report.
     pub fn set_gamepad_state(&self, state: exbawks_usb::GamepadState) {
         self.devices.set_gamepad_state(state);
@@ -1766,6 +1884,7 @@ impl Emulator {
                         &mut vblank_owed,
                     );
                     self.attach_gamepad_when_ready();
+                    self.sample_gamepad();
                     // A deferred procedure an interrupt routine queued runs
                     // before the next interrupt is taken, as it would at
                     // its own lower interrupt level.

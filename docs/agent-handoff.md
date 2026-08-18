@@ -553,11 +553,20 @@ Two active threads:
    than skipped as "nothing to send". The last of those is why the driver
    polled five thousand times after `SET_ADDRESS`.
 
-   **Next: the host side.** The pad reports all zeroes because nothing
-   feeds it. `exbawks-platform` is where a real controller is read
-   (`VID_054C&PID_0CE6` is a DualSense on this machine), mapped to the
-   twenty-byte report, and handed to `set_gamepad_state`. After that a
-   button press reaches the title.
+   **The host side is wired.** `exbawks run --gamepad-live` opens a
+   DualSense, DualSense Edge, or DualShock 4 over raw HID
+   (`exbawks-platform/src/hid.rs`, the only place with the operating
+   system calls), reads it on its own thread because a report read blocks,
+   and translates it into the console's report
+   (`exbawks-usb/src/dualsense.rs`, pure and tested without a controller
+   attached). The run prints which buttons it saw, which is how to tell
+   whether a press reached the guest.
+
+   What has not been confirmed is a press actually moving the title, since
+   that needs someone at the controller. The chain either side of that is
+   verified: the host device opens and reads, the translation is tested,
+   and the guest polls the interrupt endpoint about sixteen hundred times
+   a run.
 
    **Superseded:** the driver used to ask the same question six times and
    give up, cycling the port.
