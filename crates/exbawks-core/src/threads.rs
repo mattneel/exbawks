@@ -200,6 +200,8 @@ pub(crate) struct ThreadManager {
 const EVENT_HANDLE_BASE: u32 = 0x0000_A000;
 /// The first guest handle the mutant table hands out.
 const MUTANT_HANDLE_BASE: u32 = 0x0000_B000;
+/// The first thread handle; each thread's is four apart.
+const THREAD_HANDLE_BASE: u32 = 0x0000_E000;
 
 /// The data-export ordinal of the kernel `LaunchDataPage` pointer variable.
 const LAUNCH_DATA_PAGE_ORDINAL: u16 = 164;
@@ -718,7 +720,7 @@ impl KernelServices for ThreadManager {
 
         let index = self.threads.len();
         let id = index as u32 + 1;
-        let handle = 0x0000_E000 + (index as u32) * 4;
+        let handle = THREAD_HANDLE_BASE + (index as u32) * 4;
         self.handles.insert(handle);
         self.threads.push(GuestThread {
             cpu,
@@ -943,6 +945,16 @@ impl KernelServices for ThreadManager {
                 thread.state = ThreadState::Ready;
             }
         }
+    }
+
+    fn object_for_handle(&self, handle: u32) -> Option<u32> {
+        // A thread handle names its own control block, which is the object
+        // a caller expects to be handed and to read fields from. Handles
+        // this runtime keeps no body for report nothing, so a caller is
+        // told the handle is not one it can reference.
+        let index = handle.checked_sub(THREAD_HANDLE_BASE)? / 4;
+        let thread = self.threads.get(index as usize)?;
+        Some(thread.kpcr.0 + KTHREAD_OFFSET)
     }
 
     fn yield_thread(&mut self) -> bool {

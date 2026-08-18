@@ -408,10 +408,11 @@ impl KernelExport for NtResumeThread {
 
 /// Resolves a handle to the object it names.
 ///
-/// The object manager is high-level emulated and keeps no object bodies,
-/// so a handle stands for itself: what a caller receives back is the
-/// handle, which is the only token this runtime has and the only one it
-/// will be handed back later.
+/// A caller reads fields off what it is given — a thread's control block
+/// has its own — so it is handed the structure the runtime built for that
+/// handle. A handle with no body behind it is refused rather than answered
+/// with itself, because a caller that dereferences the answer would fault
+/// on an address that is a handle rather than a pointer.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ObReferenceObjectByHandle;
 
@@ -433,8 +434,11 @@ impl KernelExport for ObReferenceObjectByHandle {
         let Some(handle) = stack_argument(context, 0).filter(|handle| *handle != 0) else {
             return KernelStatus::INVALID_HANDLE;
         };
+        let Some(object) = context.services.object_for_handle(handle) else {
+            return KernelStatus::INVALID_HANDLE;
+        };
         let object_out = stack_argument(context, 2).unwrap_or(0);
-        if object_out != 0 && context.memory.write_u32(GuestVa(object_out), handle).is_err() {
+        if object_out != 0 && context.memory.write_u32(GuestVa(object_out), object).is_err() {
             return KernelStatus::INVALID_PARAMETER;
         }
         KernelStatus::SUCCESS

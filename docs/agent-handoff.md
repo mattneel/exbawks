@@ -569,6 +569,20 @@ Two active threads:
    buttons it saw, so a press that reaches the guest is visible even when
    the title does not visibly react.
 
+   Interactive input works: with a controller attached, the difficulty
+   menu's selection moves with the direction pad —
+   `fixtures/private/frames/live.png` catches `NORMAL` lit while `EASY`
+   and `HARD` are not.
+
+   That press then faulted at `0x001A93CF`, `cmp byte ptr [ecx+4],0` with
+   `ecx` = `0xE00C`, which was this emulator's own doing:
+   `ObReferenceObjectByHandle` had been handing a caller the handle back
+   as its object, and thread handles start at `0xE000`. A handle now
+   resolves to a real structure — a thread's to its control block at
+   `KTHREAD_OFFSET` inside its KPCR page — and one with no body is refused.
+   **That fix has not been exercised against a press yet**; the run that
+   followed it had no controller input and took the old path.
+
    Each press opened a new wall, and each was a missing export on a path
    the title had never taken: `NtYieldExecution`, then
    `ObReferenceObjectByHandle`, then `ObfDereferenceObject` — the last a

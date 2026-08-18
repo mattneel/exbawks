@@ -286,6 +286,14 @@ The project follows Keep a Changelog structure before its first release.
 
 ### Added
 
+- `ObReferenceObjectByHandle` hands back the object a handle names rather
+  than the handle itself. A caller reads fields off what it is given, and
+  a thread handle is a small number, so dereferencing one faulted on a low
+  address — which is exactly what the title did after a press moved it
+  through its menu. A thread handle now resolves to that thread's own
+  control block, and a handle this runtime keeps no body for is refused
+  rather than answered with something that cannot be dereferenced.
+
 - `NtYieldExecution`, `ObReferenceObjectByHandle`, and
   `ObfDereferenceObject`. These are the exports the title asks for once a
   button is pressed, and each was a wall in turn: pressing start took it

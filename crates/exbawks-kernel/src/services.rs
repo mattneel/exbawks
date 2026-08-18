@@ -329,6 +329,14 @@ pub trait KernelServices {
     /// only called while it is connected.
     fn connect_interrupt(&mut self, _object: u32, _connected: bool) {}
 
+    /// The guest object a handle names, when the runtime has one.
+    ///
+    /// A caller reads fields off what it is given, so it has to be a real
+    /// structure in guest memory rather than the handle over again.
+    fn object_for_handle(&self, _handle: u32) -> Option<u32> {
+        None
+    }
+
     /// Queues a deferred procedure call, reporting whether it was not
     /// already queued.
     fn queue_dpc(&mut self, _dpc: u32) -> bool {
