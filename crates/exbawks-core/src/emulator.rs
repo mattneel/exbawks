@@ -197,6 +197,15 @@ const XBOX_TSC_PER_MILLISECOND: u64 = 733_333;
 /// address as the end of the call rather than as a guest error.
 const INTERRUPT_RETURN_SENTINEL: GuestVa = GuestVa(0xFFBF_FFE8);
 
+/// The interrupt vector the graphics processor is wired to.
+///
+/// A title asks the abstraction layer for it and connects a routine there;
+/// this one lands on vector fifty-one, the third bus interrupt.
+const GPU_INTERRUPT_VECTOR: u32 = 51;
+
+/// Milliseconds between vertical blanks, near enough sixty a second.
+const VBLANK_INTERVAL_MS: u64 = 16;
+
 /// The interrupt vector the first USB host controller is wired to.
 ///
 /// A title asks the abstraction layer for it and connects a routine there;
@@ -1179,6 +1188,16 @@ impl Emulator {
 
     /// Whether a modelled device is asking for an interrupt right now.
     fn interrupt_requested(&self) -> Option<u32> {
+        // The display's blank comes first: a title's frame loop waits on
+        // it, and everything else it does waits behind that.
+        if self.devices.vblank_interrupt_pending()
+            && self
+                .threads
+                .as_ref()
+                .is_some_and(|threads| threads.interrupt_routine(GPU_INTERRUPT_VECTOR).is_some())
+        {
+            return Some(GPU_INTERRUPT_VECTOR);
+        }
         (self.devices.usb_interrupt_pending()
             && self
                 .threads
@@ -1263,6 +1282,12 @@ impl Emulator {
     #[must_use]
     pub fn usb_port(&self) -> (u32, u64) {
         self.devices.usb_port()
+    }
+
+    /// The device registers the guest read most.
+    #[must_use]
+    pub fn busiest_device_reads(&self, limit: usize) -> Vec<(u32, u64)> {
+        self.devices.busiest_reads(limit)
     }
 
     /// The value last written to one device register.
@@ -1582,6 +1607,7 @@ impl Emulator {
             cpu: &mut CpuState,
             tick_cell: Option<GuestVa>,
             last_tick: &mut std::time::Instant,
+            vblank_owed: &mut u64,
         ) {
             let elapsed = last_tick.elapsed();
             let ticks = u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX);
@@ -1590,6 +1616,13 @@ impl Emulator {
                 // debounce interval in frames before it resets a port it
                 // has just seen a device appear on.
                 devices.advance_usb_frames(&WindowMemory(memory), ticks.min(64));
+                // The picture reaches the bottom of the screen about sixty
+                // times a second, whatever the guest is doing.
+                *vblank_owed += u64::from(ticks);
+                if *vblank_owed >= VBLANK_INTERVAL_MS {
+                    *vblank_owed = 0;
+                    devices.raise_vblank();
+                }
                 if let Some(cell) = tick_cell
                     && let Ok(current) = memory.read_u32(cell)
                 {
@@ -1603,6 +1636,7 @@ impl Emulator {
             }
         }
 
+        let mut vblank_owed = 0_u64;
         let mut relaunches = 0_u32;
         let mut serviced = 0_usize;
         let mut cancels = 0_u64;
@@ -1702,6 +1736,7 @@ impl Emulator {
                         &mut self.cpu,
                         tick_cell,
                         &mut last_tick,
+                        &mut vblank_owed,
                     );
                     self.attach_gamepad_when_ready();
                     // A deferred procedure an interrupt routine queued runs
@@ -1922,6 +1957,7 @@ impl Emulator {
                         &mut self.cpu,
                         tick_cell,
                         &mut last_tick,
+                        &mut vblank_owed,
                     );
                     if let Some(stop) = self.dispatch_gate_by_eip(ordinal, GuestVa(fault_va))? {
                         if let StopReason::Reboot { .. } = stop

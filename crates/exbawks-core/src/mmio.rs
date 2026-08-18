@@ -58,6 +58,32 @@ struct RegionStats {
     writes: u64,
 }
 
+/// The graphics processor's master interrupt status and enable.
+const PMC_INTR: u32 = 0xFD00_0100;
+const PMC_INTR_ENABLE: u32 = 0xFD00_0140;
+/// The bit the display controller raises in that master status.
+const PMC_INTR_PCRTC: u32 = 1 << 24;
+/// The display controller's own interrupt status and enable.
+const PCRTC_INTR: u32 = 0xFD60_0100;
+const PCRTC_INTR_ENABLE: u32 = 0xFD60_0140;
+/// Its vertical blank bit, in both registers.
+const PCRTC_INTR_VBLANK: u32 = 1 << 0;
+
+/// The display controller's interrupt state.
+///
+/// A title waits for the picture to reach the bottom of the screen before
+/// it draws the next one. With nothing raising that, its frame loop spins
+/// on a register that never changes.
+#[derive(Debug, Default)]
+struct Vblank {
+    /// Whether a blank has happened that the guest has not acknowledged.
+    pending: bool,
+    /// The display controller's own enable.
+    enable: u32,
+    /// The master enable, without which nothing is delivered at all.
+    master_enable: u32,
+}
+
 /// The first USB host controller's register window.
 pub const USB_BASE: u32 = 0xFED0_0000;
 /// One past its last register.
@@ -72,6 +98,11 @@ const USB_LAST: u32 = USB_BASE + 0x0FFF;
 #[derive(Debug, Default)]
 pub struct DeviceSpace {
     stats: Mutex<[RegionStats; 5]>,
+    /// The display controller's interrupt state.
+    vblank: Mutex<Vblank>,
+    /// Reads per device register. A guest spinning on one register is
+    /// waiting for something, and this says which one.
+    read_counts: Mutex<std::collections::HashMap<u32, u64>>,
     /// The first USB host controller, and the gamepad on its root port.
     /// A title's own USB stack drives these registers directly, so the
     /// model has to behave like the hardware (ADR 0019).
@@ -164,6 +195,36 @@ impl DeviceSpace {
         (usb.device_address(), usb.device_configured())
     }
 
+    /// The device registers the guest read most, largest first.
+    #[must_use]
+    pub fn busiest_reads(&self, limit: usize) -> Vec<(u32, u64)> {
+        let counts = self.read_counts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut entries: Vec<_> = counts.iter().map(|(a, n)| (*a, *n)).collect();
+        entries.sort_unstable_by_key(|(address, count)| (std::cmp::Reverse(*count), *address));
+        entries.truncate(limit);
+        entries
+    }
+
+    /// Raises a vertical blank, if the guest has asked to hear about one.
+    pub fn raise_vblank(&self) {
+        let mut vblank = self.vblank.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        tracing::trace!(
+            enable = format_args!("{:#x}", vblank.enable),
+            master = format_args!("{:#x}", vblank.master_enable),
+            "vblank"
+        );
+        if vblank.enable & PCRTC_INTR_VBLANK != 0 {
+            vblank.pending = true;
+        }
+    }
+
+    /// Whether the display controller is asking for an interrupt.
+    #[must_use]
+    pub fn vblank_interrupt_pending(&self) -> bool {
+        let vblank = self.vblank.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        vblank.pending && vblank.enable & PCRTC_INTR_VBLANK != 0 && vblank.master_enable & 1 != 0
+    }
+
     /// Whether the USB controller is asking for an interrupt.
     #[must_use]
     pub fn usb_interrupt_pending(&self) -> bool {
@@ -200,6 +261,38 @@ impl DeviceSpace {
     /// Serves one device read: the latched value, a ready-bit override, or
     /// zero.
     fn read(&self, address: u32, output: &mut [u8]) {
+        {
+            let mut counts =
+                self.read_counts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Bounded by the device address space the guest can reach,
+            // and capped so a sweep cannot grow it without limit.
+            if counts.len() < 4096 || counts.contains_key(&address) {
+                *counts.entry(address).or_insert(0) += 1;
+            }
+        }
+        if matches!(address, PMC_INTR | PMC_INTR_ENABLE | PCRTC_INTR | PCRTC_INTR_ENABLE) {
+            let vblank = self.vblank.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let value = match address {
+                PCRTC_INTR => u32::from(vblank.pending) * PCRTC_INTR_VBLANK,
+                PCRTC_INTR_ENABLE => vblank.enable,
+                PMC_INTR_ENABLE => vblank.master_enable,
+                // The master status reports the engine that is asking,
+                // and only while that engine's own interrupt is enabled.
+                _ => {
+                    if vblank.pending && vblank.enable & PCRTC_INTR_VBLANK != 0 {
+                        PMC_INTR_PCRTC
+                    } else {
+                        0
+                    }
+                }
+            };
+            let bytes = value.to_le_bytes();
+            let take = output.len().min(4);
+            output[..take].copy_from_slice(&bytes[..take]);
+            let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            stats[Self::slot(DeviceRegion::Gpu)].reads += 1;
+            return;
+        }
         if DeviceRegion::of(address) == DeviceRegion::Usb {
             let value = self
                 .usb
@@ -255,8 +348,9 @@ impl DeviceSpace {
         // modeled, status reads back clear: PMC `0xFD00_0100`, PFIFO
         // `0xFD00_2100`, PTIMER `0xFD00_9100`, PGRAPH `0xFD40_0100`, and
         // PCRTC `0xFD60_0100`.
-        const SELF_CLEAR: [u32; 6] =
-            [0xFD10_0410, 0xFD00_0100, 0xFD00_2100, 0xFD00_9100, 0xFD40_0100, 0xFD60_0100];
+        // `PMC` and `PCRTC` interrupt status are modelled above rather
+        // than read as permanently clear.
+        const SELF_CLEAR: [u32; 4] = [0xFD10_0410, 0xFD00_2100, 0xFD00_9100, 0xFD40_0100];
         if READY_OVERRIDES.contains(&address) {
             output.fill(0xFF);
         } else if let Some((_, value)) = VALUE_OVERRIDES.iter().find(|(fixed, _)| *fixed == address)
@@ -287,6 +381,35 @@ impl DeviceSpace {
         let take = input.len().min(4);
         bytes[..take].copy_from_slice(&input[..take]);
         let value = u32::from_le_bytes(bytes);
+        if matches!(address, PMC_INTR | PMC_INTR_ENABLE | PCRTC_INTR | PCRTC_INTR_ENABLE) {
+            let mut vblank = self.vblank.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match address {
+                // Write one to clear, which is how a routine acknowledges
+                // the blank it was called for.
+                PCRTC_INTR => {
+                    if value & PCRTC_INTR_VBLANK != 0 {
+                        vblank.pending = false;
+                    }
+                }
+                PCRTC_INTR_ENABLE => {
+                    tracing::debug!(value = format_args!("{value:#010x}"), "guest enables vblank");
+                    vblank.enable = value;
+                }
+                PMC_INTR_ENABLE => {
+                    tracing::debug!(
+                        value = format_args!("{value:#010x}"),
+                        "guest enables the master interrupt"
+                    );
+                    vblank.master_enable = value;
+                }
+                // The master status is derived from the engines and holds
+                // nothing of its own to clear.
+                _ => {}
+            }
+            let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            stats[Self::slot(DeviceRegion::Gpu)].writes += 1;
+            return;
+        }
         if DeviceRegion::of(address) == DeviceRegion::Usb {
             self.usb
                 .lock()

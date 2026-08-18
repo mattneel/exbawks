@@ -531,15 +531,30 @@ Two active threads:
    which is only a hint that something new arrived. With both fixed the
    driver went from writing one port register to working all four.
 
-   **The title is not blocked on USB — it is blocked on the GPU.** RIP
-   sampling over a full run puts **84.5% of samples at `0x001CB97B`**, deep
-   in Direct3D, with GPU device reads climbing from 123 to 18,897 between
-   two heartbeats. It is spinning on a graphics register, and its frame
-   loop is not advancing; the hub work behind it never gets its turn. The
-   title connects vector **51**, which is IRQ 3 — the GPU — so a vertical
-   blank interrupt that this emulator never raises is the most likely
-   thing it is waiting for, and is the next thing to try now that
-   delivering an interrupt is possible at all.
+   **The vertical blank interrupt is delivered** (vector 51, about 2,600
+   times a run) and it did not change the frame or free the USB path.
+   `PCRTC_INTR_0`, its enable, and the `PMC_INTR_0` master status are
+   modelled instead of reading as permanently clear; the title enables the
+   blank and masks the master enable around its critical sections, which
+   is why both had to be real.
+
+   **A correction worth carrying:** RIP sampling puts about 82% of a run at
+   `0x001CB97B`, which was read here as a spin. Disassembling it says
+   otherwise. The bytes from `0x001CB960` are `test dword [eax+0x100410],
+   0x10000` (the write-back cache flush bit) and a `jne` back — a loop that
+   exits immediately — then `mov [ecx+0x40], edx`, which is the write to
+   `DMA_PUT` that submits the pushbuffer, and `0x001CB97B` is the
+   instruction after it. A `DMA_PUT` write processes the whole submission
+   synchronously, rendering included, so the samples pile up at the
+   instruction the guest resumes on. **That figure is this emulator's
+   rasterizer cost, not a guest wait**, and any conclusion drawn from it
+   about what the title is waiting for is unfounded.
+
+   The busiest device registers, which `--gpu-methods` now reports, agree:
+   `0xFD100410` (`NV_PFB_WBC`, the flush bit) 33,960 reads, `0xFD800044`
+   (the channel's `DMA_GET`) 9,849, and `0xFD400B10`
+   (`NV_PGRAPH_PATT_COLOR0`) 9,843 — the last being a read-back to order
+   posted writes rather than a wait on anything.
 
 2. **Kernel HLE burndown** (substrate-independent, needed under either
    engine). Done this session, in order the retail image demanded them:

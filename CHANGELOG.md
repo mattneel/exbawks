@@ -269,6 +269,18 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- The graphics processor's vertical blank interrupt. `PCRTC_INTR_0` and its
+  enable, and the `PMC_INTR_0` master status that surfaces them, are
+  modelled rather than read as permanently clear, and a blank is raised
+  about sixty times a second. The title enables it, and its routine is now
+  called about 2,600 times in a run where it was never called at all. The
+  captured frame is unchanged, so recorded digests keep their meaning.
+
+- `exbawks run --gpu-methods` also reports the device registers the guest
+  read most. That is what identified what Direct3D actually touches: the
+  write-back cache flush bit it polls, the channel's `DMA_GET`, and a
+  pattern register it reads back to order its writes.
+
 - The root hub reports the four downstream ports the console's controller
   has, rather than one, and its port count is read-only as the hardware's
   is — an initialisation sweep could previously tell the hub it had no

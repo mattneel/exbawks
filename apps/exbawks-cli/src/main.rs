@@ -897,6 +897,14 @@ Graphics methods (object, method, submissions):"
         }
     }
 
+    if gpu_methods.is_some() {
+        println!("Busiest device registers:");
+        for (address, reads) in emulator.busiest_device_reads(10) {
+            println!("  {address:#010x}: {reads} reads");
+        }
+        println!();
+    }
+
     if !gpu_method_value.is_empty() {
         let stats = emulator.gpu_stats();
         println!("Method values:");
