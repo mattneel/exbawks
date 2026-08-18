@@ -8,6 +8,14 @@ The project follows Keep a Changelog structure before its first release.
 
 ### Added
 
+- ADR 0020 proposes a hardware graphics backend. Neither xemu nor
+  Cxbx-Reloaded rasterizes in software: xemu registers a renderer over
+  OpenGL or Vulkan and generates shaders from the console's vertex programs
+  and register combiners, and the graphics processor draws the pixels. That
+  is the difference in kind no arrangement of a scalar loop reaches, and
+  the pushbuffer decode this project already has is the input such a
+  backend needs. The software rasterizer stays as the reference the goldens
+  are recorded from.
 - Host memory geometry queries; `exbawks doctor` reports the host page size
   and allocation granularity (`MEM-001`).
 - Single-owner placeholder split and coalesce operations for the sparse
@@ -270,6 +278,32 @@ The project follows Keep a Changelog structure before its first release.
   frame now comes out lit, and the recorded golden digest moves with it.
 
 ### Changed
+
+- Drawing spreads a surface's rows across the host's processors, which took
+  a run of the retail title from 79 seconds to 26 and its unfiltered form
+  from 57 to 22. The frame is byte-for-byte the one a single thread drew —
+  the digest is unchanged — because a row's pixels depend only on the
+  triangles covering them and on what is already beneath them, so every
+  pair of triangles that meet stay on one thread and in submission order.
+
+  Two things had to be true first. Guest RAM is now held as dwords the
+  threads share rather than as a slice one of them owns, which is what says
+  the rows are disjoint; on x86-64 a relaxed load or store of an aligned
+  dword is an ordinary move, so nothing pays for the possibility. And the
+  bands run on a pool that outlives the draw: a title submits a draw every
+  few hundred microseconds, and creating threads for each of the 111,000 of
+  them cost more than the drawing did — the first attempt this way was
+  barely faster than one thread.
+
+  How many bands a draw is divided into comes from its triangles' own areas
+  rather than the box around them, because a draw of narrow slivers spans
+  as many rows as one of full-width bars and is a fraction of the work.
+
+  Pixels now cost 16 seconds of a 26-second run, down from about 71. What
+  is left is 6 seconds of guest and geometry and 5 of per-triangle setup,
+  and the drawing that remains scales poorly with more threads — random
+  texture reads make it memory-bound, which is the wall a software
+  rasterizer reaches and the reason ADR 0020 exists.
 
 - `exbawks run --unfiltered` takes the nearest texel instead of blending
   four, which draws about a third faster and looks coarser. Blending is

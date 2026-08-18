@@ -63,6 +63,40 @@ impl AlignedBuffer {
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// The buffer as dwords that several threads may share.
+    ///
+    /// Guest RAM is one resource several emulated devices reach at once, and
+    /// a rasterizer covering a surface wants to spread its rows across the
+    /// host's processors. A plain slice cannot express that: the rows are
+    /// disjoint, but they are strided rather than contiguous, so the borrow
+    /// checker cannot see it. Viewing RAM as dwords each thread loads and
+    /// stores individually says exactly what is true — the memory is shared,
+    /// and who writes which part of it is the caller's arrangement.
+    ///
+    /// This costs nothing on the hosts this targets: a relaxed load or store
+    /// of an aligned dword is an ordinary move. It buys the guarantee that
+    /// two threads touching neighbouring pixels is defined behaviour rather
+    /// than something that merely happens to work.
+    ///
+    /// The exclusive borrow is what makes the view sound — while it is
+    /// alive, no other reference to these bytes can exist.
+    pub fn as_atomic_dwords(&mut self) -> &[core::sync::atomic::AtomicU32] {
+        // `AtomicU32` has the same size and layout as `u32`, and every bit
+        // pattern is a valid one, so the bytes themselves need no
+        // conversion; the allocation being page-aligned and page-granular
+        // is what makes them aligned and a whole number of dwords.
+        //
+        // SAFETY: `pointer` addresses `len` live, initialized, owned bytes,
+        // aligned for `AtomicU32`; the exclusive borrow of `self` outlives
+        // the view, so nothing else references them while it is alive.
+        unsafe {
+            core::slice::from_raw_parts(
+                self.pointer.as_ptr().cast::<core::sync::atomic::AtomicU32>(),
+                self.len / 4,
+            )
+        }
+    }
 }
 
 impl core::fmt::Debug for AlignedBuffer {
@@ -114,6 +148,38 @@ mod tests {
         buffer[4096] = 0xAB;
         assert_eq!(buffer.base_ptr(), before, "the address is stable");
         assert_eq!(buffer[4096], 0xAB);
+    }
+
+    #[test]
+    fn shares_dwords_between_threads() {
+        use core::sync::atomic::Ordering;
+
+        let mut buffer = AlignedBuffer::new_zeroed(4096).expect("allocation succeeds");
+        let dwords = buffer.as_atomic_dwords();
+        assert_eq!(dwords.len(), 1024, "a page holds this many dwords");
+        assert_eq!(dwords.as_ptr() as usize % align_of::<u32>(), 0, "aligned");
+
+        // Two threads writing disjoint halves is the arrangement the
+        // rasterizer makes of a surface's rows.
+        std::thread::scope(|scope| {
+            let (low, high) = dwords.split_at(512);
+            scope.spawn(|| {
+                for (index, slot) in low.iter().enumerate() {
+                    slot.store(index as u32, Ordering::Relaxed);
+                }
+            });
+            scope.spawn(|| {
+                for (index, slot) in high.iter().enumerate() {
+                    slot.store(0xFFFF_0000 | index as u32, Ordering::Relaxed);
+                }
+            });
+        });
+
+        assert_eq!(dwords[0].load(Ordering::Relaxed), 0);
+        assert_eq!(dwords[511].load(Ordering::Relaxed), 511);
+        assert_eq!(dwords[512].load(Ordering::Relaxed), 0xFFFF_0000);
+        // The bytes read back through the ordinary view as little endian.
+        assert_eq!(&buffer[2044..2048], &[0xFF, 0x01, 0x00, 0x00]);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::collections::HashMap;
 /// Addresses are guest physical; the emulator reaches them through the
 /// cached window. Reads and writes are best-effort: an out-of-range access
 /// returns `false` and the pusher abandons the submission.
-pub trait Nv2aMemory {
+pub trait Nv2aMemory: Sync {
     /// Reads one little-endian dword at a physical address.
     fn read_dword(&self, physical: u32) -> Option<u32>;
 
@@ -1921,35 +1921,38 @@ impl PushbufferEngine {
             );
         }
         self.last_draw_geometry = (target.pitch, target.width, target.height);
-        let mut drawn = 0_u64;
-        for [a, b, c] in triangles {
-            // Proper clipping would split a straddling triangle against
-            // the near plane; this drops it, which is visible as a missing
-            // sliver rather than as a wedge across the whole frame.
-            if [a, b, c].iter().any(|index| vertices[*index].inverse_w <= 0.0) {
-                self.stats.triangles_behind_eye += 1;
-                continue;
-            }
-            let written = crate::fill_triangle(
-                &sink,
-                &target,
-                [vertices[a], vertices[b], vertices[c]],
-                samplers,
-                pipeline,
-                Some(&combiner),
-            );
-            self.stats.triangles += 1;
-            self.stats.shaded_pixels += written;
-            drawn += written;
-            *self.pixels_by_target.entry(target.base).or_insert(0) += written;
-            if written > 0 {
-                self.operations += 1;
-                let operation = self.operations;
-                let history = self.surface_history.entry(target.base).or_default();
-                history.drawn = operation;
-                history.geometry = (target.pitch, target.width, target.height);
-                history.blended += written;
-            }
+        // Proper clipping would split a straddling triangle against the
+        // near plane; this drops it, which is visible as a missing sliver
+        // rather than as a wedge across the whole frame.
+        let drawable: Vec<[usize; 3]> = triangles
+            .into_iter()
+            .filter(|corners| {
+                let behind = corners.iter().any(|index| vertices[*index].inverse_w <= 0.0);
+                if behind {
+                    self.stats.triangles_behind_eye += 1;
+                }
+                !behind
+            })
+            .collect();
+        self.stats.triangles += drawable.len() as u64;
+        let drawn = crate::rasterize_draw(
+            &sink,
+            &target,
+            &vertices,
+            &drawable,
+            samplers,
+            pipeline,
+            Some(&combiner),
+        );
+        self.stats.shaded_pixels += drawn;
+        *self.pixels_by_target.entry(target.base).or_insert(0) += drawn;
+        if drawn > 0 {
+            self.operations += 1;
+            let operation = self.operations;
+            let history = self.surface_history.entry(target.base).or_default();
+            history.drawn = operation;
+            history.geometry = (target.pitch, target.width, target.height);
+            history.blended += drawn;
         }
         if drawn > self.busiest_vertices.0 {
             self.busiest_vertices = (drawn, vertices.iter().copied().take(3).collect());

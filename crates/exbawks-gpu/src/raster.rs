@@ -30,7 +30,7 @@ pub struct ScreenVertex {
 }
 
 /// A bound texture the rasterizer can sample.
-pub trait TextureSource {
+pub trait TextureSource: Sync {
     /// The texel at integer coordinates, as 8-bit ARGB.
     ///
     /// Coordinates are already brought inside the texture's extent.
@@ -287,7 +287,7 @@ impl RenderTarget {
 }
 
 /// A pixel sink: the emulator reads and writes guest physical memory.
-pub trait PixelSink {
+pub trait PixelSink: Sync {
     /// Writes one 32-bit pixel at a physical address.
     fn write_pixel(&self, physical: u32, color: u32);
 
@@ -504,6 +504,182 @@ pub fn fill_triangle(
     state: PipelineState,
     combiner: Option<&crate::CombinerState>,
 ) -> u64 {
+    fill_triangle_rows(sink, target, vertices, textures, state, combiner, (0, u32::MAX))
+}
+
+/// Draws every triangle of one draw call, spreading the surface's rows
+/// across the host's processors, and reports how many pixels were written.
+///
+/// Every triangle in a draw call shares its textures, its pipeline state,
+/// and its combiner program, so the only thing ordering them matters for is
+/// what they leave in the surface — and two triangles only interact where
+/// they cover the same pixel. Splitting by rows keeps every such pair on one
+/// thread and in submission order, so the frame is the frame a single thread
+/// would have drawn, whatever the host's processor count. That is what keeps
+/// a recorded digest meaningful.
+///
+/// Small draws are drawn on the calling thread, because handing out a few
+/// hundred pixels costs more than doing the work.
+pub fn rasterize_draw(
+    sink: &dyn PixelSink,
+    target: &RenderTarget,
+    vertices: &[ScreenVertex],
+    triangles: &[[usize; 3]],
+    textures: [Option<&dyn TextureSource>; 4],
+    state: PipelineState,
+    combiner: Option<&crate::CombinerState>,
+) -> u64 {
+    let one_band = |rows: (u32, u32)| -> u64 {
+        let mut written = 0;
+        for [a, b, c] in triangles {
+            written += fill_triangle_rows(
+                sink,
+                target,
+                [vertices[*a], vertices[*b], vertices[*c]],
+                textures,
+                state,
+                combiner,
+                rows,
+            );
+        }
+        written
+    };
+
+    // The rows this draw could touch at all, so a draw covering a corner of
+    // the screen is split across that corner rather than across the screen.
+    let (mut first, mut last) = (u32::MAX, 0_u32);
+    for [a, b, c] in triangles {
+        for index in [a, b, c] {
+            let y = vertices[*index].y;
+            if y.is_finite() {
+                first = first.min(y.floor().max(0.0) as u32);
+                last = last.max(y.ceil().max(0.0) as u32 + 1);
+            }
+        }
+    }
+    let first = first.max(target.clip_y);
+    let last = last.min(target.clip_y + target.height);
+    if first >= last {
+        return 0;
+    }
+
+    // How much drawing this actually is, from the triangles' own areas
+    // rather than from the box around them: a draw of narrow slivers spans
+    // as many rows as a draw of full-width bars and is a fraction of the
+    // work, and dividing it by its box hands each band an overhead it
+    // cannot pay for.
+    let height = last - first;
+    let covered: u64 = triangles
+        .iter()
+        .map(|corners| {
+            let [a, b, c] = corners.map(|index| vertices[index]);
+            let area = edge(a.x, a.y, b.x, b.y, c.x, c.y).abs() * 0.5;
+            if area.is_finite() { area as u64 } else { 0 }
+        })
+        .sum();
+    // Bands are given enough pixels to be worth handing to a processor.
+    let bands = (covered / PIXELS_PER_BAND) as usize;
+    let bands = bands.min(host_parallelism()).min(height as usize).min(MAX_DRAW_BANDS);
+    if bands <= 1 || covered < PARALLEL_DRAW_PIXELS {
+        return one_band((first, last));
+    }
+
+    // Bands are equal in height rather than in work: which rows are
+    // expensive is not known until they are drawn, and an uneven split
+    // still spends far less than one thread would.
+    let rows_each = height.div_ceil(bands as u32);
+    let band_of = |y: u32| ((y.saturating_sub(first)) / rows_each) as usize;
+
+    // Each band is given the triangles that reach its rows, rather than the
+    // whole draw. A band that walked the entire list would decide, for
+    // every triangle, that it belongs to another band — and a draw of many
+    // small triangles is mostly that decision, paid once per band. A tall
+    // triangle lands in each band it crosses, which is what draws its part
+    // of it there.
+    let mut binned: Vec<Vec<[usize; 3]>> = vec![Vec::new(); bands];
+    for corners in triangles {
+        let ys = corners.map(|index| vertices[index].y);
+        let (top, bottom) = (ys[0].min(ys[1]).min(ys[2]), ys[0].max(ys[1]).max(ys[2]));
+        if !top.is_finite() || !bottom.is_finite() {
+            continue;
+        }
+        let top = (top.floor().max(0.0) as u32).max(first);
+        let bottom = (bottom.ceil().max(0.0) as u32 + 1).min(last);
+        if top >= bottom {
+            continue;
+        }
+        for band in binned.iter_mut().take(band_of(bottom - 1) + 1).skip(band_of(top)) {
+            band.push(*corners);
+        }
+    }
+
+    // The bands run on a pool that outlives the draw. A title submits a
+    // draw every few hundred microseconds, and creating threads for each
+    // one costs more than the drawing does — the work is there, but it has
+    // to be handed to processors that are already running.
+    use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+    binned
+        .par_iter()
+        .enumerate()
+        .map(|(band, own)| {
+            let start = first + rows_each * band as u32;
+            let rows = (start.min(last), (start + rows_each).min(last));
+            let mut written = 0;
+            for [a, b, c] in own {
+                written += fill_triangle_rows(
+                    sink,
+                    target,
+                    [vertices[*a], vertices[*b], vertices[*c]],
+                    textures,
+                    state,
+                    combiner,
+                    rows,
+                );
+            }
+            written
+        })
+        .sum()
+}
+
+/// The most bands one draw is divided into. Past this the threads cost more
+/// than the rows they are given, and every band walks the whole triangle
+/// list to find the part of it that lands in its own rows.
+const MAX_DRAW_BANDS: usize = 64;
+
+/// How many pixels a draw must cover before it is worth dividing.
+const PARALLEL_DRAW_PIXELS: u64 = 4_096;
+
+/// How many pixels each band is given before another band is worth adding.
+/// Below this a band spends more reaching a processor than drawing.
+const PIXELS_PER_BAND: u64 = 512;
+
+/// How many processors the host has, asked once.
+///
+/// A title submits over a hundred thousand draws in a run, and asking the
+/// operating system this for each of them is a system call per draw.
+fn host_parallelism() -> usize {
+    use std::sync::OnceLock;
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
+}
+
+/// Fills the part of a triangle lying in `rows`, a half-open range of
+/// scanlines, and reports how many pixels it wrote.
+///
+/// A row's pixels depend on the triangle and on what is already in the
+/// surface beneath them, never on another row, so covering a triangle in
+/// several row ranges writes exactly what covering it in one would. That is
+/// what lets a draw spread its rows across the host's processors and still
+/// produce the frame a single thread would have.
+pub fn fill_triangle_rows(
+    sink: &dyn PixelSink,
+    target: &RenderTarget,
+    vertices: [ScreenVertex; 3],
+    textures: [Option<&dyn TextureSource>; 4],
+    state: PipelineState,
+    combiner: Option<&crate::CombinerState>,
+    rows: (u32, u32),
+) -> u64 {
     let (blend, depth) = (state.blend, state.depth);
     let [a, b, c] = vertices;
     let area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
@@ -530,8 +706,9 @@ pub fn fill_triangle(
 
     let left = a.x.min(b.x).min(c.x).floor().max(target.clip_x as f32);
     let right = a.x.max(b.x).max(c.x).ceil().min((target.clip_x + target.width) as f32);
-    let top = a.y.min(b.y).min(c.y).floor().max(target.clip_y as f32);
-    let bottom = a.y.max(b.y).max(c.y).ceil().min((target.clip_y + target.height) as f32);
+    let top = a.y.min(b.y).min(c.y).floor().max(target.clip_y as f32).max(rows.0 as f32);
+    let bottom =
+        a.y.max(b.y).max(c.y).ceil().min((target.clip_y + target.height) as f32).min(rows.1 as f32);
     if !(left < right && top < bottom) {
         return 0;
     }
@@ -785,6 +962,109 @@ mod tests {
         }
     }
 
+    /// A surface addressed by pixel, so two runs can be compared.
+    #[derive(Default)]
+    struct Surface(Mutex<std::collections::BTreeMap<u32, u32>>);
+
+    impl PixelSink for Surface {
+        fn write_pixel(&self, physical: u32, color: u32) {
+            self.0.lock().expect("lock").insert(physical, color);
+        }
+
+        fn read_pixel(&self, physical: u32) -> u32 {
+            self.0.lock().expect("lock").get(&physical).copied().unwrap_or(0xFF00_0000)
+        }
+    }
+
+    #[test]
+    fn splitting_the_rows_draws_the_same_surface() {
+        // The whole of drawing on several processors rests on this: a
+        // triangle covered in row ranges leaves exactly what covering it in
+        // one pass leaves, blending included, whatever order the ranges are
+        // taken in. If this ever stops holding, a recorded frame stops
+        // meaning anything.
+        let target = RenderTarget {
+            base: 0x1000,
+            pitch: 64,
+            clip_x: 0,
+            clip_y: 0,
+            width: 16,
+            height: 16,
+            zeta: None,
+            zeta_pitch: 0,
+        };
+        // Overlapping triangles, so the blend order matters.
+        let triangles = [
+            [
+                vertex(0.0, 0.0, 0xC0FF_0000),
+                vertex(15.0, 2.0, 0xC000_FF00),
+                vertex(3.0, 15.0, 0xC000_00FF),
+            ],
+            [
+                vertex(2.0, 1.0, 0x8000_FFFF),
+                vertex(14.0, 9.0, 0x80FF_00FF),
+                vertex(1.0, 14.0, 0x80FF_FF00),
+            ],
+        ];
+
+        let whole = Surface::default();
+        for corners in triangles {
+            fill_triangle(&whole, &target, corners, [None; 4], over_blend(), None);
+        }
+
+        // The same drawing, but every triangle covered three rows at a
+        // time — which is what a band is.
+        let banded = Surface::default();
+        for rows in [(0, 3), (3, 6), (6, 9), (9, 12), (12, 16)] {
+            for corners in triangles {
+                fill_triangle_rows(&banded, &target, corners, [None; 4], over_blend(), None, rows);
+            }
+        }
+
+        let expected = whole.0.lock().expect("lock").clone();
+        let actual = banded.0.lock().expect("lock").clone();
+        assert!(!expected.is_empty(), "the triangles cover something");
+        assert_eq!(actual, expected, "banded drawing matches a single pass");
+    }
+
+    #[test]
+    fn a_whole_draw_matches_one_triangle_at_a_time() {
+        // And the same for the entry point that spreads the bands, which
+        // chooses how many to use from how much the draw covers.
+        let target = RenderTarget {
+            base: 0x2000,
+            pitch: 1024,
+            clip_x: 0,
+            clip_y: 0,
+            width: 256,
+            height: 256,
+            zeta: None,
+            zeta_pitch: 0,
+        };
+        // Large enough that the draw is worth dividing.
+        let corners = [
+            vertex(0.0, 0.0, 0xC0FF_0000),
+            vertex(255.0, 20.0, 0xC000_FF00),
+            vertex(40.0, 255.0, 0xC000_00FF),
+            vertex(250.0, 250.0, 0x80FF_00FF),
+        ];
+        let triangles = [[0_usize, 1, 2], [1, 3, 2]];
+
+        let sequential = Surface::default();
+        for indices in triangles {
+            let picked = indices.map(|index| corners[index]);
+            fill_triangle(&sequential, &target, picked, [None; 4], over_blend(), None);
+        }
+
+        let spread = Surface::default();
+        let drawn =
+            rasterize_draw(&spread, &target, &corners, &triangles, [None; 4], over_blend(), None);
+
+        let expected = sequential.0.lock().expect("lock").clone();
+        assert!(drawn > 0 && !expected.is_empty(), "the draw covers something");
+        assert_eq!(spread.0.lock().expect("lock").clone(), expected, "same surface");
+    }
+
     #[test]
     fn a_right_triangle_covers_its_half() {
         let canvas = Canvas::default();
@@ -947,7 +1227,7 @@ mod tests {
     }
 
     /// A texture that reports a chain and which level it was read at.
-    struct Chain(std::cell::Cell<u32>);
+    struct Chain(std::sync::atomic::AtomicU32);
 
     impl TextureSource for Chain {
         fn texel(&self, x: u32, y: u32) -> u32 {
@@ -955,7 +1235,7 @@ mod tests {
         }
 
         fn texel_in(&self, level: u32, _x: u32, _y: u32) -> u32 {
-            self.0.set(level);
+            self.0.store(level, std::sync::atomic::Ordering::Relaxed);
             0xFFFF_FFFF
         }
 
@@ -1001,7 +1281,7 @@ mod tests {
 
     #[test]
     fn the_mip_level_follows_how_far_a_texture_is_squeezed() {
-        let texture = Chain(std::cell::Cell::new(0));
+        let texture = Chain(std::sync::atomic::AtomicU32::new(0));
         let area = |side: f32| side * side;
 
         // One texel per pixel reads the level the title authored.
@@ -1018,11 +1298,19 @@ mod tests {
 
     #[test]
     fn a_sample_reads_the_level_it_was_given() {
-        let texture = Chain(std::cell::Cell::new(0));
+        let texture = Chain(std::sync::atomic::AtomicU32::new(0));
         nearest_sample(&texture, 3, 0.5, 0.5);
-        assert_eq!(texture.0.get(), 3, "the nearest sample reads its level");
+        assert_eq!(
+            texture.0.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "the nearest sample reads its level"
+        );
         filtered_sample_at(&texture, 5, 0.5, 0.5);
-        assert_eq!(texture.0.get(), 5, "and so does the filtered one");
+        assert_eq!(
+            texture.0.load(std::sync::atomic::Ordering::Relaxed),
+            5,
+            "and so does the filtered one"
+        );
     }
 
     #[test]

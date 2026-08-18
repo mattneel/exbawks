@@ -110,49 +110,80 @@ impl exbawks_usb::UsbMemory for WindowMemory<'_> {
     }
 }
 
-/// Guest physical memory as a borrowed slice, addressed physically.
+/// Guest physical memory as borrowed dwords, addressed physically.
 ///
 /// The graphics engine reads texels and writes pixels by the million; going
 /// through the address space for each of them spends a range validation, a
 /// lock, and two page-table walks on four bytes. This holds RAM for the
 /// whole submission and indexes it.
-struct PhysicalMemory<'a>(std::cell::RefCell<&'a mut [u8]>);
+///
+/// RAM is held as dwords rather than as bytes so the engine may draw a
+/// surface's rows on several threads at once: the rows are disjoint, but
+/// they are strided, and this is what says so. On the hosts this targets a
+/// relaxed load or store of an aligned dword is an ordinary move, so the
+/// single-threaded path pays nothing for the possibility.
+struct PhysicalMemory<'a>(&'a [core::sync::atomic::AtomicU32]);
 
 impl PhysicalMemory<'_> {
-    /// The four bytes at a physical address, when they are all in RAM.
-    fn dword_at(ram: &[u8], physical: u32) -> Option<u32> {
-        let start = physical as usize;
-        let bytes = ram.get(start..start.checked_add(4)?)?;
-        Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    /// One whole dword by its index.
+    fn load(&self, index: usize) -> Option<u32> {
+        Some(self.0.get(index)?.load(core::sync::atomic::Ordering::Relaxed))
     }
 }
 
 impl exbawks_gpu::Nv2aMemory for PhysicalMemory<'_> {
     fn read_dword(&self, physical: u32) -> Option<u32> {
-        Self::dword_at(&self.0.borrow(), physical)
+        let index = (physical / 4) as usize;
+        let offset = physical % 4;
+        let low = self.load(index)?;
+        if offset == 0 {
+            return Some(low);
+        }
+        // An address that straddles two dwords still reads the four bytes
+        // at it, as addressing RAM as bytes did: a surface or texture the
+        // hardware would accept is aligned, and one that is not still
+        // reads rather than disappearing.
+        let shift = offset * 8;
+        let high = self.load(index + 1)?;
+        Some((low >> shift) | (high << (32 - shift)))
     }
 
     fn write_dword(&self, physical: u32, value: u32) -> bool {
-        let mut ram = self.0.borrow_mut();
-        let start = physical as usize;
-        let Some(slot) = start.checked_add(4).and_then(|end| ram.get_mut(start..end)) else {
+        let index = (physical / 4) as usize;
+        let offset = physical % 4;
+        if offset == 0 {
+            let Some(slot) = self.0.get(index) else {
+                return false;
+            };
+            slot.store(value, core::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        // A straddling write keeps the bytes on either side of it. Two
+        // threads writing the same pair of dwords this way could lose one
+        // of the halves, which no surface this engine draws into can
+        // provoke: every one of them is dword aligned.
+        let shift = offset * 8;
+        let (Some(low), Some(high)) = (self.0.get(index), self.0.get(index + 1)) else {
             return false;
         };
-        slot.copy_from_slice(&value.to_le_bytes());
+        let keep_low = low.load(core::sync::atomic::Ordering::Relaxed) & !(u32::MAX << shift);
+        let keep_high = high.load(core::sync::atomic::Ordering::Relaxed) & (u32::MAX << shift);
+        low.store(keep_low | (value << shift), core::sync::atomic::Ordering::Relaxed);
+        high.store(keep_high | (value >> (32 - shift)), core::sync::atomic::Ordering::Relaxed);
         true
     }
 
     fn fill_dwords(&self, physical: u32, value: u32, count: u32) -> u32 {
-        let mut ram = self.0.borrow_mut();
-        let start = physical as usize;
-        let Some(bytes) = (count as usize).checked_mul(4) else {
+        let index = (physical / 4) as usize;
+        if !physical.is_multiple_of(4) {
+            return 0;
+        }
+        let Some(slots) = index.checked_add(count as usize).and_then(|end| self.0.get(index..end))
+        else {
             return 0;
         };
-        let Some(slot) = start.checked_add(bytes).and_then(|end| ram.get_mut(start..end)) else {
-            return 0;
-        };
-        for cell in slot.chunks_exact_mut(4) {
-            cell.copy_from_slice(&value.to_le_bytes());
+        for slot in slots {
+            slot.store(value, core::sync::atomic::Ordering::Relaxed);
         }
         count
     }
@@ -2585,8 +2616,8 @@ impl Emulator {
         // what makes drawing cost what the pixels cost rather than what the
         // address space charges per four bytes.
         let pusher = &mut self.gpu_pusher;
-        let ends: Vec<(u32, u32)> = memory.with_physical_memory(|ram| {
-            let view = PhysicalMemory(std::cell::RefCell::new(ram));
+        let ends: Vec<(u32, u32)> = memory.with_physical_dwords(|ram| {
+            let view = PhysicalMemory(ram);
             submissions
                 .iter()
                 .map(|(channel, get, put)| {

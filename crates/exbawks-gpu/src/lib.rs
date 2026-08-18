@@ -22,7 +22,7 @@ pub use frontend::GraphicsFrontend;
 pub use nv2a::{BoundTexture, DmaObject, Nv2aMemory, PushbufferEngine, PusherStats};
 pub use raster::{
     AlphaTest, BlendState, CullState, DepthState, PipelineState, PixelSink, RenderTarget,
-    ScreenVertex, TextureSource, fill_triangle,
+    ScreenVertex, TextureSource, fill_triangle, fill_triangle_rows, rasterize_draw,
 };
 pub use shader::{INPUT_REGISTERS, ShaderResult, execute};
 pub use texture::{dxt_opaque_texel, dxt1_texel, dxt3_alpha, dxt5_alpha};

@@ -234,6 +234,25 @@ impl SoftwareAddressSpace {
         action(&mut physical)
     }
 
+    /// Runs `action` over physical RAM as dwords several threads may share.
+    ///
+    /// This is [`Self::with_physical_memory`] for work that wants to spread
+    /// itself across the host's processors: the graphics engine draws a
+    /// surface's rows independently, and rows are disjoint but strided, so a
+    /// plain slice cannot be split along them. The lock is still held for
+    /// the whole call, so RAM is this caller's for the duration and how its
+    /// threads divide the writing is their own arrangement.
+    ///
+    /// As with the slice form, the caller bumps the written generations of
+    /// whatever it changed, because this cannot see what that was.
+    pub fn with_physical_dwords<R>(
+        &self,
+        action: impl FnOnce(&[core::sync::atomic::AtomicU32]) -> R,
+    ) -> R {
+        let mut physical = self.physical.write();
+        action(physical.as_atomic_dwords())
+    }
+
     /// Bumps the written generation of every page in a range, as an
     /// ordinary write would, so cached translations of code in it are
     /// discarded (ADR 0005).
