@@ -8,6 +8,8 @@ mod error;
 pub mod hid;
 mod system_memory;
 pub mod virtual_memory;
+#[cfg(windows)]
+pub mod window;
 
 pub use aligned::AlignedBuffer;
 pub use capabilities::{HostCapabilities, probe_host_capabilities};

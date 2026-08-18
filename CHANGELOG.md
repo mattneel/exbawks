@@ -269,6 +269,14 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- `exbawks run --display` shows what the title is drawing, in a window,
+  while it runs. The window has its own thread and message loop, because a
+  window that is not pumped stops repainting and the system declares it
+  hung; what crosses between it and the run is a buffer of pixels and two
+  flags, so the run never touches a window handle. Closing the window
+  stops the run, which is how a person ends one they are watching. It
+  costs about three percent of a run's time.
+
 - `exbawks run --gamepad-live` reads a real controller from the host and
   feeds it to the emulated one. A DualSense, DualSense Edge, or either
   DualShock 4 is opened over raw HID, read on its own thread because a

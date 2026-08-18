@@ -155,6 +155,9 @@ struct RunArgs {
     /// A run using one is not reproducible and may not record a golden.
     #[arg(long)]
     gamepad_live: bool,
+    /// Shows what the title is drawing in a window. Closing it ends the run.
+    #[arg(long)]
+    display: bool,
     /// Reports every guest write to this address, with its writer.
     #[arg(long, value_parser = parse_u32)]
     watch_write: Option<u32>,
@@ -279,6 +282,7 @@ fn main() -> Result<()> {
                 gpu_method_value,
                 gamepad,
                 gamepad_live,
+                display,
                 watch_write,
                 frame_digest,
                 expect_frame,
@@ -307,6 +311,7 @@ fn main() -> Result<()> {
                     gpu_method_value: &gpu_method_value,
                     gamepad,
                     gamepad_live,
+                    display,
                     watch_write,
                     frame_digest,
                     expect_frame: expect_frame.as_deref(),
@@ -633,6 +638,8 @@ struct RunOptions<'a> {
     gamepad: bool,
     /// Whether that gamepad is fed by a real controller.
     gamepad_live: bool,
+    /// Whether to show what the title draws in a window.
+    display: bool,
     /// A guest address whose writers should be reported.
     watch_write: Option<u32>,
     /// Whether to print the captured frame's digest.
@@ -659,6 +666,7 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
         gpu_method_value,
         gamepad,
         gamepad_live,
+        display,
         watch_write,
         frame_digest,
         expect_frame,
@@ -693,6 +701,17 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
     match hdd_root_for(&bytes) {
         Ok(hdd) => emulator.set_hdd_root(hdd),
         Err(error) => eprintln!("warning: no writable hard-disk mount: {error:#}"),
+    }
+    if display {
+        let name = path.file_name().map_or_else(
+            || "Exbawks".to_owned(),
+            |name| format!("Exbawks — {}", name.to_string_lossy()),
+        );
+        if emulator.show_display(&name) {
+            println!("Display:      showing the title; close the window to stop");
+        } else {
+            eprintln!("warning: no window could be opened");
+        }
     }
     if gamepad || gamepad_live {
         emulator.attach_gamepad(true);

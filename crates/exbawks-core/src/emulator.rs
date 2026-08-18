@@ -389,6 +389,8 @@ impl EmulatorBuilder {
             gamepad_wanted: false,
             gamepad_ready_frame: None,
             #[cfg(windows)]
+            display: None,
+            #[cfg(windows)]
             live_gamepad: None,
             interrupted: None,
             watch_write: None,
@@ -436,6 +438,9 @@ pub struct Emulator {
     /// a host operation, so it exists only where there is one.
     #[cfg(windows)]
     live_gamepad: Option<std::sync::Arc<LiveGamepad>>,
+    /// A window showing what the title is drawing, when one was asked for.
+    #[cfg(windows)]
+    display: Option<exbawks_platform::window::Display>,
     /// The frame the driver was first seen ready on, so the attach can be
     /// held until its hub work will act on the interrupt.
     gamepad_ready_frame: Option<u64>,
@@ -1376,6 +1381,54 @@ impl Emulator {
         }
     }
 
+    /// Opens a window showing what the title draws, and reports whether
+    /// one could be opened.
+    ///
+    /// The run then stops when the window is closed, so closing it is how
+    /// a person ends a run they are watching.
+    #[cfg(windows)]
+    pub fn show_display(&mut self, title: &str) -> bool {
+        self.display = exbawks_platform::window::Display::open(title, 640, 480);
+        self.display.is_some()
+    }
+
+    /// Opens a window showing what the title draws.
+    #[cfg(not(windows))]
+    pub fn show_display(&mut self, _title: &str) -> bool {
+        false
+    }
+
+    /// Whether a window was opened and has since been closed.
+    #[must_use]
+    pub fn display_closed(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.display.as_ref().is_some_and(|display| !display.is_open())
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// Shows the surface the title is drawing into, if a window is open.
+    fn present_display(&mut self) {
+        #[cfg(windows)]
+        {
+            if self.display.is_none() {
+                return;
+            }
+            // The surface being drawn into, not the brightest one kept for
+            // a golden: a person watching wants what is on screen now.
+            let Ok(frame) = self.capture_surface(None) else {
+                return;
+            };
+            if let Some(display) = self.display.as_ref() {
+                display.present(frame.width, frame.height, &frame.pixels);
+            }
+        }
+    }
+
     /// Every button a real controller was seen pressing during the run.
     #[must_use]
     pub fn gamepad_buttons_seen(&self) -> u16 {
@@ -1753,23 +1806,34 @@ impl Emulator {
         let _pump = PumpGuard { stop: stop_flag, handle: Some(handle) };
 
         let tick_cell = self.threads.as_ref().and_then(ThreadManager::tick_count_cell);
-        let mut last_tick = std::time::Instant::now();
         // Advances both guest clocks by wall time: the KeTickCount cell
         // (milliseconds) and the virtual TSC that KeQuerySystemTime derives
         // from (100 ns units — frozen otherwise under WHP, where the
         // interpreter that normally advances it only runs for MMIO steps;
         // DirectSound's time-based startup waits forever on a frozen clock).
+        /// What the clock's periodic work keeps between ticks.
+        struct Pacing {
+            /// When the clock last advanced.
+            last_tick: std::time::Instant,
+            /// Milliseconds owed before the next vertical blank.
+            vblank_owed: u64,
+            /// Milliseconds the most recent tick advanced by.
+            advanced: u32,
+        }
+
         fn advance_clock(
             memory: &SoftwareAddressSpace,
             devices: &crate::mmio::DeviceSpace,
             threads: Option<&mut ThreadManager>,
             cpu: &mut CpuState,
             tick_cell: Option<GuestVa>,
-            last_tick: &mut std::time::Instant,
-            vblank_owed: &mut u64,
+            pacing: &mut Pacing,
         ) {
+            let (last_tick, vblank_owed, advanced) =
+                (&mut pacing.last_tick, &mut pacing.vblank_owed, &mut pacing.advanced);
             let elapsed = last_tick.elapsed();
             let ticks = u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX);
+            *advanced = ticks;
             if ticks > 0 {
                 // A USB frame is a millisecond, and a driver waits out a
                 // debounce interval in frames before it resets a port it
@@ -1800,7 +1864,9 @@ impl Emulator {
             }
         }
 
-        let mut vblank_owed = 0_u64;
+        let mut pacing =
+            Pacing { last_tick: std::time::Instant::now(), vblank_owed: 0, advanced: 0 };
+        let mut presented_owed = 0_u64;
         let mut relaunches = 0_u32;
         let mut serviced = 0_usize;
         let mut cancels = 0_u64;
@@ -1900,11 +1966,20 @@ impl Emulator {
                         self.threads.as_mut(),
                         &mut self.cpu,
                         tick_cell,
-                        &mut last_tick,
-                        &mut vblank_owed,
+                        &mut pacing,
                     );
                     self.attach_gamepad_when_ready();
                     self.sample_gamepad();
+                    // A frame for the window, at the rate a screen changes
+                    // rather than at every cancellation.
+                    presented_owed += u64::from(pacing.advanced);
+                    if presented_owed >= VBLANK_INTERVAL_MS {
+                        presented_owed = 0;
+                        self.present_display();
+                    }
+                    if self.display_closed() {
+                        return Ok(StopReason::HostRequested);
+                    }
                     // A deferred procedure an interrupt routine queued runs
                     // before the next interrupt is taken, as it would at
                     // its own lower interrupt level.
@@ -2123,8 +2198,7 @@ impl Emulator {
                         self.threads.as_mut(),
                         &mut self.cpu,
                         tick_cell,
-                        &mut last_tick,
-                        &mut vblank_owed,
+                        &mut pacing,
                     );
                     if let Some(stop) = self.dispatch_gate_by_eip(ordinal, GuestVa(fault_va))? {
                         if let StopReason::Reboot { .. } = stop

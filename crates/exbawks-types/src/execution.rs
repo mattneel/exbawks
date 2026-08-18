@@ -82,6 +82,8 @@ pub enum StopReason {
     GuestFault { address: GuestVa },
     /// The configured execution budget expired.
     BudgetExhausted,
+    /// A person watching the run asked it to stop, by closing its window.
+    HostRequested,
     /// The runtime is not implemented yet.
     RuntimeIncomplete,
 }
