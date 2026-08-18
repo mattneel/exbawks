@@ -538,12 +538,26 @@ Two active threads:
 
    **Where it stops:** the driver asks that same question six times and
    gives up, cycling the port (forty-four writes where there were two).
-   Its completion handler at `0x0024E480` reads the descriptor's condition
-   code (`shr eax, 1Ch`) and special-cases 9 (`DataUnderrun`) and 15
-   (`NotAccessed`); this engine reports 0 (`NoError`), which takes the
-   ordinary path, so the rejection is something else about the answer or
-   the transfer's bookkeeping — the data toggle and the endpoint's toggle
-   carry are the obvious suspects, neither of which this engine maintains.
+
+   The data toggle was the leading suspect and has been implemented from
+   xemu's controller — a retired descriptor is marked explicit, its toggle
+   flipped, and the value copied into the endpoint's carry — along with
+   the `DelayInterrupt` field, which defers handing over the done queue
+   rather than reporting every transfer at once. **Neither changed the
+   retries**, so the toggle was not it.
+
+   What is known about the rejection, from disassembling the handler at
+   `0x0024E480`: it reads the condition code (`shr eax, 1Ch`),
+   special-cases 9 (`DataUnderrun`) and 15 (`NotAccessed`), and every
+   other value — including the 0 this engine reports — reaches
+   `0x0024E4F2`, which does `mov eax,[edx]; shr eax,1Ch; or eax,
+   0C0000000h; mov [ebx+4],eax`: it builds a `USBD_STATUS` failure out of
+   the condition code. That is an error path, so the question is not what
+   status it computes but why the driver is in that function at all. The
+   answer data itself is confirmed to land — eight bytes at `0x0061F954`,
+   written and verified — so the next move is to find this function's
+   caller and the branch that chooses it, rather than to keep adjusting
+   what it reads.
 
    **The descriptor walk is built and tested, and the title does not yet
    finish enumerating.** `exbawks-usb` answers the standard control requests and

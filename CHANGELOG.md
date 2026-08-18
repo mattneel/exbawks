@@ -269,6 +269,14 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- A retired transfer advances the data toggle and carries it back to its
+  endpoint, and the done queue is handed over only once the shortest delay
+  a retired descriptor asked for has run out. Both are how the hardware
+  behaves, checked against xemu's controller: it marks the descriptor's
+  toggle explicit, flips it, and copies it into the endpoint's carry bit,
+  and it defers the completion interrupt by the descriptor's own delay
+  field rather than raising it on every transfer.
+
 - Completed transfers are handed to the driver through the communication
   area, as the hardware does, rather than left in the done-head register:
   a driver reads its completions from `HccaDoneHead` and never looks at

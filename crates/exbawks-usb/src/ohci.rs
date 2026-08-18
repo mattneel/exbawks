@@ -132,6 +132,17 @@ const MAX_TRANSFERS: u32 = 64;
 /// The most bytes one transfer may move.
 const MAX_TRANSFER_BYTES: u32 = 4096;
 
+/// A transfer descriptor's data toggle. `T1` says the descriptor carries
+/// its own toggle rather than taking the endpoint's, and `T0` is the value.
+const TD_TOGGLE_EXPLICIT: u32 = 1 << 25;
+const TD_TOGGLE_VALUE: u32 = 1 << 24;
+/// The endpoint's carried toggle, in its head pointer.
+const ED_TOGGLE_CARRY: u32 = 1 << 1;
+/// The descriptor field asking how many frames the controller may wait
+/// before reporting the completion. Seven means never report it.
+const TD_DELAY_SHIFT: u32 = 21;
+const TD_DELAY_NEVER: u32 = 7;
+
 /// A transfer descriptor's direction field.
 const PID_SETUP: u32 = 0;
 const PID_OUT: u32 = 1;
@@ -163,6 +174,10 @@ pub struct OhciController {
     port_writes: u64,
     /// How many transfers have been retired.
     completed: u64,
+    /// Frames still to wait before handing the done queue over, from the
+    /// shortest delay any retired descriptor asked for. `None` means
+    /// nothing is waiting to be reported.
+    done_delay: Option<u32>,
     /// Reads and writes per register offset, for finding out what a
     /// driver is waiting on when it stops making progress.
     accesses: [(u64, u64); 32],
@@ -187,6 +202,7 @@ impl Default for OhciController {
             pending: Vec::new(),
             port_writes: 0,
             completed: 0,
+            done_delay: None,
             accesses: [(0, 0); 32],
         }
     }
@@ -500,12 +516,17 @@ impl OhciController {
                     if transfer == 0 || transfer == tail & !0xF {
                         break;
                     }
-                    let Some(following) = self.run_transfer(memory, number, transfer) else {
+                    let Some((following, retired)) = self.run_transfer(memory, number, transfer)
+                    else {
                         break;
                     };
-                    // The head advances past the transfer just completed,
-                    // keeping the toggle-carry bit the driver left there.
-                    current = (following & !0xF) | (current & 0x2);
+                    // The head advances past the transfer just completed
+                    // and takes its toggle: the endpoint carries the value
+                    // the next transfer will use, and a driver that sees
+                    // the wrong one treats the answer as a mismatch and
+                    // asks again.
+                    let carry = if retired & TD_TOGGLE_VALUE != 0 { ED_TOGGLE_CARRY } else { 0 };
+                    current = (following & !0xF) | carry;
                     moved = true;
                 }
                 if moved {
@@ -522,7 +543,7 @@ impl OhciController {
         memory: &dyn UsbMemory,
         endpoint: u32,
         transfer: u32,
-    ) -> Option<u32> {
+    ) -> Option<(u32, u32)> {
         let control = memory.read_dword(transfer)?;
         let buffer = memory.read_dword(transfer.wrapping_add(4))?;
         let next = memory.read_dword(transfer.wrapping_add(8))?;
@@ -575,7 +596,15 @@ impl OhciController {
                     // alone so the driver can ask again.
                     return None;
                 }
-                memory.write_bytes(buffer, &bytes);
+                let landed = memory.write_bytes(buffer, &bytes);
+                tracing::trace!(
+                    buffer = format_args!("{buffer:#010x}"),
+                    end = format_args!("{end:#010x}"),
+                    length,
+                    sent = bytes.len(),
+                    landed,
+                    "wrote a transfer's data"
+                );
                 // A completed transfer reports how much of its buffer is
                 // left, which is none when it filled it.
                 memory.write_dword(transfer.wrapping_add(4), 0);
@@ -588,10 +617,19 @@ impl OhciController {
             _ => {}
         }
 
-        // The condition code says the transfer succeeded.
-        memory.write_dword(transfer, control & 0x0FFF_FFFF);
+        // A retired descriptor reports no error, no error count, and
+        // carries the toggle the next one will start from: the hardware
+        // marks the toggle explicit and advances it.
+        let retired = ((control & 0x03FF_FFFF) | TD_TOGGLE_EXPLICIT) ^ TD_TOGGLE_VALUE;
+        memory.write_dword(transfer, retired);
+
+        // How long the driver is willing to wait to hear about it.
+        let delay = (control >> TD_DELAY_SHIFT) & 0x7;
+        if delay != TD_DELAY_NEVER {
+            self.done_delay = Some(self.done_delay.map_or(delay, |waiting| waiting.min(delay)));
+        }
         self.complete(memory, transfer);
-        Some(next)
+        Some((next, retired))
     }
 
     /// Advances the schedule by one frame.
@@ -614,12 +652,22 @@ impl OhciController {
         self.raise(INTERRUPT_START_OF_FRAME);
         self.service_lists(memory);
 
-        // The completions of this frame are handed over through the
-        // communication area, not through the register: a driver reads the
-        // list from `HccaDoneHead` and never looks at `HcDoneHead`, so
-        // leaving it in the register alone means it walks nothing.
+        // The completions are handed over through the communication
+        // area, not through the register: a driver reads the list from
+        // `HccaDoneHead` and never looks at `HcDoneHead`. It is handed
+        // over when the shortest delay any retired descriptor asked for
+        // has run out, which is what that field is for.
+        let ready = match self.done_delay {
+            None => false,
+            Some(0) => true,
+            Some(remaining) => {
+                self.done_delay = Some(remaining - 1);
+                false
+            }
+        };
         let done = self.registers[(register::DONE_HEAD / 4) as usize];
-        if done != 0 && hcca != 0 {
+        if ready && done != 0 && hcca != 0 {
+            self.done_delay = None;
             memory.write_dword(hcca.wrapping_add(0x84), done);
             self.registers[(register::DONE_HEAD / 4) as usize] = 0;
             self.raise(INTERRUPT_WRITEBACK_DONE);
@@ -666,7 +714,7 @@ impl OhciController {
     /// Reports a completed transfer to the driver's done queue.
     pub fn complete(&mut self, memory: &dyn UsbMemory, descriptor: u32) {
         self.completed = self.completed.saturating_add(1);
-        tracing::debug!(descriptor = format_args!("{descriptor:#010x}"), "transfer completed");
+        tracing::trace!(descriptor = format_args!("{descriptor:#010x}"), "transfer completed");
         let previous = self.registers[(register::DONE_HEAD / 4) as usize];
         // The queue is a list the controller pushes onto, linked through
         // the descriptor's own next pointer at offset eight — the word
