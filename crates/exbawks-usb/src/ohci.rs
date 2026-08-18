@@ -231,6 +231,12 @@ impl OhciController {
         self.registers[(register::HCCA / 4) as usize] & !0xFF
     }
 
+    /// The frame the schedule has reached.
+    #[must_use]
+    pub fn frame(&self) -> u64 {
+        self.frame
+    }
+
     /// The gamepad port's status word, as the driver would read it.
     #[must_use]
     pub fn port_status(&self) -> u32 {
@@ -308,6 +314,11 @@ impl OhciController {
             register::INTERRUPT_ENABLE => {
                 let index = (register::INTERRUPT_ENABLE / 4) as usize;
                 self.registers[index] |= value;
+                tracing::debug!(
+                    wanted = format_args!("{value:#010x}"),
+                    now = format_args!("{:#010x}", self.registers[index]),
+                    "guest enables usb interrupts"
+                );
             }
             register::INTERRUPT_DISABLE => {
                 let index = (register::INTERRUPT_ENABLE / 4) as usize;

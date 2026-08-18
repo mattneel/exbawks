@@ -269,6 +269,22 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- Timers fire. `KeSetTimer` arms one and the runtime queues its deferred
+  procedure when it comes due, calling it the same way an interrupt
+  routine's is; `KeCancelTimer` disarms one. A driver that polls its own
+  state machine from a repeating timer had been initialising and never
+  being heard from again.
+
+  This is what the USB stack was waiting for. Its hub handler does nothing
+  unless twenty frames have passed since it last ran — read straight out
+  of the code, `cmp eax, 14h` against the frame number in the
+  communication area — so it needed re-entering periodically, and only one
+  interrupt was ever going to arrive. With timers firing, **the title
+  resets and enables the root port**: the port went from `0x00000101`
+  (connected) to `0x00000103` (connected and enabled) with thirteen writes
+  where there had been two, and the driver is now executing its
+  enumeration code.
+
 - The graphics processor's vertical blank interrupt. `PCRTC_INTR_0` and its
   enable, and the `PMC_INTR_0` master status that surfaces them, are
   modelled rather than read as permanently clear, and a blank is raised

@@ -128,6 +128,19 @@ pub(crate) enum PendingAction {
 }
 
 /// The guest thread table, kernel-object allocator, and service surface.
+/// One armed timer.
+#[derive(Debug, Clone, Copy)]
+struct ArmedTimer {
+    /// The guest `KTIMER` object.
+    object: u32,
+    /// The deferred procedure to queue when it comes due.
+    dpc: u32,
+    /// The millisecond of guest time it is due at.
+    due_at: u64,
+    /// Its repeat interval in milliseconds, zero for a single shot.
+    period: u64,
+}
+
 pub(crate) struct ThreadManager {
     memory: Arc<SoftwareAddressSpace>,
     threads: Vec<GuestThread>,
@@ -145,6 +158,11 @@ pub(crate) struct ThreadManager {
     /// Deferred procedure calls an interrupt routine has queued, in the
     /// order they were queued.
     dpc_queue: Vec<u32>,
+    /// Armed timers: the object, the deferred procedure to queue when it
+    /// is due, the millisecond it is due at, and its repeat interval.
+    timers: Vec<ArmedTimer>,
+    /// Milliseconds of guest time the runtime has counted.
+    elapsed_ms: u64,
     /// The interrupt service routines the title has registered, and
     /// whether each is currently connected. A device that raises an
     /// interrupt calls the connected routine for its vector.
@@ -204,6 +222,8 @@ impl ThreadManager {
             files: HostFileSystem::new(disc_root, hdd_root),
             interrupts: Vec::new(),
             dpc_queue: Vec::new(),
+            timers: Vec::new(),
+            elapsed_ms: 0,
             persisted: Vec::new(),
             launch_data_page_cell: None,
             tick_count_cell: None,
@@ -614,6 +634,35 @@ impl ThreadManager {
             .map(|(known, _)| *known)
     }
 
+    /// Advances guest time and queues the deferred procedures of any
+    /// timers that have come due.
+    pub(crate) fn advance_timers(&mut self, milliseconds: u64) {
+        if milliseconds == 0 || self.timers.is_empty() {
+            self.elapsed_ms = self.elapsed_ms.saturating_add(milliseconds);
+            return;
+        }
+        self.elapsed_ms = self.elapsed_ms.saturating_add(milliseconds);
+        let now = self.elapsed_ms;
+        let mut due = Vec::new();
+        self.timers.retain_mut(|timer| {
+            if timer.due_at > now {
+                return true;
+            }
+            if timer.dpc != 0 {
+                due.push(timer.dpc);
+            }
+            // A repeating timer re-arms itself; a one-shot is done.
+            if timer.period > 0 {
+                timer.due_at = now.saturating_add(timer.period);
+                return true;
+            }
+            false
+        });
+        for dpc in due {
+            self.queue_dpc(dpc);
+        }
+    }
+
     /// Takes the next queued deferred procedure call.
     pub(crate) fn take_dpc(&mut self) -> Option<u32> {
         if self.dpc_queue.is_empty() {
@@ -754,6 +803,34 @@ impl KernelServices for ThreadManager {
             "guest registered an interrupt routine"
         );
         self.interrupts.push((interrupt, false));
+    }
+
+    fn set_timer(&mut self, timer: u32, due: i64, period: u32, dpc: u32) -> bool {
+        // A negative due time is an interval from now in hundred-nanosecond
+        // units; a positive one is an absolute time this runtime has no
+        // clock to compare against, so it is treated as immediate.
+        let delay_ms =
+            if due < 0 { (due.unsigned_abs() / 10_000).min(u64::from(u32::MAX)) } else { 0 };
+        let due_at = self.elapsed_ms.saturating_add(delay_ms);
+        let armed = ArmedTimer { object: timer, dpc, due_at, period: u64::from(period) };
+        if let Some(existing) = self.timers.iter_mut().find(|known| known.object == timer) {
+            *existing = armed;
+            return true;
+        }
+        tracing::debug!(
+            timer = format_args!("{timer:#010x}"),
+            dpc = format_args!("{dpc:#010x}"),
+            delay_ms,
+            "guest armed a timer"
+        );
+        self.timers.push(armed);
+        false
+    }
+
+    fn cancel_timer(&mut self, timer: u32) -> bool {
+        let before = self.timers.len();
+        self.timers.retain(|known| known.object != timer);
+        before != self.timers.len()
     }
 
     fn queue_dpc(&mut self, dpc: u32) -> bool {

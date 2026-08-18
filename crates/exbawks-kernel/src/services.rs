@@ -326,6 +326,20 @@ pub trait KernelServices {
         false
     }
 
+    /// Arms a timer, reporting whether it was already armed.
+    ///
+    /// `due` is the guest's own `LARGE_INTEGER`: negative is an interval
+    /// from now in hundred-nanosecond units, positive an absolute time.
+    /// `period` is a repeat interval in milliseconds, zero for one shot.
+    fn set_timer(&mut self, _timer: u32, _due: i64, _period: u32, _dpc: u32) -> bool {
+        false
+    }
+
+    /// Disarms a timer, reporting whether it was armed.
+    fn cancel_timer(&mut self, _timer: u32) -> bool {
+        false
+    }
+
     /// Resumes a suspended thread, returning its previous suspend count.
     fn resume_thread(&mut self, _handle: u32) -> Result<u32, KernelServiceError> {
         Err(KernelServiceError::Unsupported)

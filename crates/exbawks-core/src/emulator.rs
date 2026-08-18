@@ -203,6 +203,11 @@ const INTERRUPT_RETURN_SENTINEL: GuestVa = GuestVa(0xFFBF_FFE8);
 /// this one lands on vector fifty-one, the third bus interrupt.
 const GPU_INTERRUPT_VECTOR: u32 = 51;
 
+/// Frames to let pass after the driver is ready before announcing a
+/// device, so its hub work has more than its twenty-frame threshold of
+/// elapsed time to act on.
+const GAMEPAD_SETTLE_FRAMES: u64 = 64;
+
 /// Milliseconds between vertical blanks, near enough sixty a second.
 const VBLANK_INTERVAL_MS: u64 = 16;
 
@@ -298,6 +303,7 @@ impl EmulatorBuilder {
             gpu_pusher: exbawks_gpu::PushbufferEngine::default(),
             gdt_fs_base: std::cell::Cell::new(u32::MAX),
             gamepad_wanted: false,
+            gamepad_ready_frame: None,
             interrupted: None,
             watch_write: None,
             brightest_frame: None,
@@ -338,6 +344,9 @@ pub struct Emulator {
     /// The `fs` base the descriptor table currently carries, so the table
     /// is rewritten on a thread switch rather than on every exit.
     gdt_fs_base: std::cell::Cell<u32>,
+    /// The frame the driver was first seen ready on, so the attach can be
+    /// held until its hub work will act on the interrupt.
+    gamepad_ready_frame: Option<u64>,
     /// Whether a gamepad should be attached once the guest's own driver
     /// is ready for one. A device present before the driver initialises is
     /// announced and then swept away by its initialisation, exactly as a
@@ -1083,11 +1092,22 @@ impl Emulator {
             .threads
             .as_ref()
             .is_some_and(|threads| threads.interrupt_routine(USB_INTERRUPT_VECTOR).is_some());
-        if ready {
-            self.gamepad_wanted = false;
-            self.devices.set_gamepad_attached(true);
-            tracing::debug!("gamepad attached to a driver that can hear about it");
+        if !ready {
+            return;
         }
+        // The driver's hub work does nothing unless twenty frames have
+        // passed since it last ran, and it runs on the interrupt this
+        // attach raises. Announcing a device the moment the driver is
+        // ready gets the one interrupt it will receive spent on a pass
+        // that returns immediately.
+        let frame = self.devices.usb_frame();
+        let settled = *self.gamepad_ready_frame.get_or_insert(frame);
+        if frame.saturating_sub(settled) < GAMEPAD_SETTLE_FRAMES {
+            return;
+        }
+        self.gamepad_wanted = false;
+        self.devices.set_gamepad_attached(true);
+        tracing::debug!(frame, "gamepad attached to a driver that can hear about it");
     }
 
     /// Calls a connected interrupt routine on the guest processor.
@@ -1604,6 +1624,7 @@ impl Emulator {
         fn advance_clock(
             memory: &SoftwareAddressSpace,
             devices: &crate::mmio::DeviceSpace,
+            threads: Option<&mut ThreadManager>,
             cpu: &mut CpuState,
             tick_cell: Option<GuestVa>,
             last_tick: &mut std::time::Instant,
@@ -1616,6 +1637,11 @@ impl Emulator {
                 // debounce interval in frames before it resets a port it
                 // has just seen a device appear on.
                 devices.advance_usb_frames(&WindowMemory(memory), ticks.min(64));
+                // Timers come due in guest milliseconds, and what they
+                // queue is called like any other deferred procedure.
+                if let Some(threads) = threads {
+                    threads.advance_timers(u64::from(ticks));
+                }
                 // The picture reaches the bottom of the screen about sixty
                 // times a second, whatever the guest is doing.
                 *vblank_owed += u64::from(ticks);
@@ -1733,6 +1759,7 @@ impl Emulator {
                     advance_clock(
                         &self.memory,
                         &self.devices,
+                        self.threads.as_mut(),
                         &mut self.cpu,
                         tick_cell,
                         &mut last_tick,
@@ -1954,6 +1981,7 @@ impl Emulator {
                     advance_clock(
                         &self.memory,
                         &self.devices,
+                        self.threads.as_mut(),
                         &mut self.cpu,
                         tick_cell,
                         &mut last_tick,

@@ -505,7 +505,27 @@ Two active threads:
    switched on would be), the service routine is called and returns TRUE,
    its deferred procedure runs, and the driver writes the root port back.
 
-   **The descriptor walk is built and tested, and the title still does not
+   **Timers were the missing piece, and the port now resets.** The hub
+   handler at `0x0024E2B6` builds a frame count from the communication
+   area's frame number, subtracts the frame it last ran on, and returns
+   immediately if fewer than twenty have passed (`cmp eax, 14h`, `jb` to a
+   bare `ret`). It is a periodic poller, and one interrupt was all it was
+   ever going to get. `KeSetTimer` now arms a timer whose deferred
+   procedure the runtime calls when due, and `KeCancelTimer` disarms one.
+   With that, the driver resets and enables the root port —
+   `0x00000101` became `0x00000103`, with thirteen port writes where there
+   had been two — and runs on into its enumeration code, where it faults
+   at `0x0024E4EB` writing a status through a null pointer. That fault is
+   the next thing to chase, and it is inside the title's USB driver rather
+   than anywhere in this emulator.
+
+   Four hypotheses were tested against the running title and disproved
+   before the disassembly settled it: a frame debounce, a port that wanted
+   to come up already enabled, a missing vertical blank, and a settling
+   delay before announcing the device. Reading the driver's own code took
+   an afternoon of guessing to one measurement.
+
+   **The descriptor walk is built and tested, and the title does not yet
    enumerate.** `exbawks-usb` answers the standard control requests and
    runs the transfer descriptors a driver queues; a test drives a full
    enumeration — descriptor, address, configure, report — through lists

@@ -19,6 +19,7 @@ const NOTIFICATION_TIMER_TYPE: u32 = 8;
 pub(crate) fn register_ke_exports(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register(KeInitializeDpc)?;
     registry.register(KeInsertQueueDpc)?;
+    registry.register(KeCancelTimer)?;
     registry.register(KeInitializeTimerEx)?;
     registry.register(KeSetTimer)?;
     registry.register(KeQuerySystemTime)?;
@@ -195,13 +196,41 @@ impl KernelExport for KeInitializeTimerEx {
 
 /// Arms a guest `KTIMER` with a due time and optional DPC.
 ///
-/// `KeSetTimer(Timer, DueTime, Dpc)` normally inserts the timer into the
-/// system timer queue and returns whether it was already queued. Under the
-/// cooperative single-thread scheduler (ADR 0011) there is no timer queue
-/// yet — the full firing machinery is `KRN-007` — so this records the due
-/// time and DPC on the object and reports the timer was not already set
-/// (`FALSE`). A title that merely arms fire-and-forget timers proceeds; one
-/// that blocks waiting for a timer to signal is later work.
+/// Disarms a timer, reporting whether it was armed.
+///
+/// A driver that re-arms a polling timer each pass cancels the previous
+/// one first, and cannot proceed without this.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KeCancelTimer;
+
+impl KernelExport for KeCancelTimer {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::KE_CANCEL_TIMER
+    }
+
+    fn name(&self) -> &'static str {
+        "KeCancelTimer"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        4
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        let Some(timer) = stack_argument(context, 0).filter(|pointer| *pointer != 0) else {
+            return KernelStatus(0);
+        };
+        // BOOLEAN: TRUE when the timer was in the queue.
+        KernelStatus(u32::from(context.services.cancel_timer(timer)))
+    }
+}
+
+/// Arms a timer, whose deferred procedure the runtime calls when it is
+/// due.
+///
+/// A driver that polls its own state machine arms a repeating timer and
+/// does its work from the procedure; with nothing firing, it initialises
+/// and is never heard from again.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct KeSetTimer;
 
@@ -229,8 +258,8 @@ impl KernelExport for KeSetTimer {
         let _ = context.memory.write_u32(GuestVa(timer + TIMER_DUE_TIME), due_low);
         let _ = context.memory.write_u32(GuestVa(timer + TIMER_DUE_TIME + 4), due_high);
         let _ = context.memory.write_u32(GuestVa(timer + TIMER_DPC), dpc);
-        // BOOLEAN FALSE: the timer was not already in the (empty) queue.
-        KernelStatus(0)
+        let due = (i64::from(due_high) << 32) | i64::from(due_low);
+        KernelStatus(u32::from(context.services.set_timer(timer, due, 0, dpc)))
     }
 }
 
@@ -306,6 +335,85 @@ mod tests {
             self.queued.push(dpc);
             true
         }
+    }
+
+    #[test]
+    fn setting_a_timer_arms_it_with_its_deferred_procedure() {
+        #[derive(Default)]
+        struct Armed {
+            armed: Vec<(u32, i64, u32)>,
+            cancelled: Vec<u32>,
+        }
+
+        impl crate::KernelServices for Armed {
+            fn create_thread(
+                &mut self,
+                _request: crate::ThreadCreateRequest,
+            ) -> Result<crate::ThreadCreated, crate::KernelServiceError> {
+                Err(crate::KernelServiceError::Unsupported)
+            }
+
+            fn exit_current_thread(&mut self, _status: u32) {}
+
+            fn close_handle(&mut self, _handle: u32) -> bool {
+                false
+            }
+
+            fn allocate_virtual_memory(
+                &mut self,
+                _request: crate::VirtualAllocRequest,
+            ) -> Result<crate::VirtualAllocation, crate::KernelServiceError> {
+                Err(crate::KernelServiceError::Unsupported)
+            }
+
+            fn set_timer(&mut self, timer: u32, due: i64, _period: u32, dpc: u32) -> bool {
+                self.armed.push((timer, due, dpc));
+                false
+            }
+
+            fn cancel_timer(&mut self, timer: u32) -> bool {
+                self.cancelled.push(timer);
+                true
+            }
+        }
+
+        let memory = SoftwareAddressSpace::new(64 * 1024).expect("memory is valid");
+        let range = GuestRange::page_aligned(GuestVa(0x1000), 2 * u64::from(GUEST_PAGE_SIZE))
+            .expect("range is valid");
+        memory
+            .map_anonymous(range, MemoryPermissions::READ | MemoryPermissions::WRITE)
+            .expect("mapping succeeds");
+        let timer = 0x1100_u32;
+        // A due time of minus ten million hundred-nanosecond units is one
+        // second from now, which is how a driver asks for an interval.
+        let due: i64 = -10_000_000;
+        for (slot, value) in [timer, due as u32, (due >> 32) as u32, 0x2200].iter().enumerate() {
+            memory.write_u32(GuestVa(0x2004 + slot as u32 * 4), *value).expect("write");
+        }
+        let mut cpu = CpuState::default();
+        cpu.gpr[4] = 0x2000;
+        let mut services = Armed::default();
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut services,
+            stop_request: None,
+        };
+
+        assert_eq!(KeSetTimer.call(&mut context), KernelStatus(0), "it was not already armed");
+        assert_eq!(services.armed, vec![(timer, due, 0x2200)]);
+        // The object still carries what a title may read back from it.
+        assert_eq!(memory.read_u32(GuestVa(timer + TIMER_DPC)).unwrap(), 0x2200);
+
+        memory.write_u32(GuestVa(0x2004), timer).expect("write");
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut services,
+            stop_request: None,
+        };
+        assert_eq!(KeCancelTimer.call(&mut context), KernelStatus(1), "it was armed");
+        assert_eq!(services.cancelled, vec![timer]);
     }
 
     #[test]

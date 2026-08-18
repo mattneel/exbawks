@@ -237,6 +237,12 @@ impl DeviceSpace {
         self.usb.lock().unwrap_or_else(std::sync::PoisonError::into_inner).accesses()
     }
 
+    /// The frame the USB schedule has reached.
+    #[must_use]
+    pub fn usb_frame(&self) -> u64 {
+        self.usb.lock().unwrap_or_else(std::sync::PoisonError::into_inner).frame()
+    }
+
     /// The root port's status and how many times the driver wrote it.
     #[must_use]
     pub fn usb_port(&self) -> (u32, u64) {
