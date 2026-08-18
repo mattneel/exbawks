@@ -388,6 +388,7 @@ impl EmulatorBuilder {
             gdt_fs_base: std::cell::Cell::new(u32::MAX),
             gamepad_wanted: false,
             gamepad_ready_frame: None,
+            #[cfg(windows)]
             live_gamepad: None,
             interrupted: None,
             watch_write: None,
@@ -431,7 +432,9 @@ pub struct Emulator {
     gdt_fs_base: std::cell::Cell<u32>,
     /// A controller read from the host, which a background reader keeps
     /// up to date. A run using one is not reproducible by construction
-    /// (ADR 0019), so it may not record a golden.
+    /// (ADR 0019), so it may not record a golden. Reading a host device is
+    /// a host operation, so it exists only where there is one.
+    #[cfg(windows)]
     live_gamepad: Option<std::sync::Arc<LiveGamepad>>,
     /// The frame the driver was first seen ready on, so the attach can be
     /// held until its hub work will act on the interrupt.
@@ -1376,11 +1379,28 @@ impl Emulator {
     /// Every button a real controller was seen pressing during the run.
     #[must_use]
     pub fn gamepad_buttons_seen(&self) -> u16 {
-        self.live_gamepad.as_ref().map_or(0, |live| live.seen())
+        #[cfg(windows)]
+        {
+            self.live_gamepad.as_ref().map_or(0, |live| live.seen())
+        }
+        #[cfg(not(windows))]
+        {
+            0
+        }
+    }
+
+    /// Reads a real controller from the host for as long as the run lasts.
+    ///
+    /// Reports whether one was found; there is never one to find on a host
+    /// without the device interfaces to enumerate.
+    #[cfg(not(windows))]
+    pub fn use_live_gamepad(&mut self) -> bool {
+        false
     }
 
     /// Samples the host controller, if one is attached, into the device.
     fn sample_gamepad(&self) {
+        #[cfg(windows)]
         if let Some(live) = self.live_gamepad.as_ref() {
             self.devices.set_gamepad_state(live.state());
         }
