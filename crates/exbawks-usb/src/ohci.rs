@@ -418,6 +418,11 @@ impl OhciController {
             // it addresses the device.
             if attached {
                 *status |= port::ENABLED | port::RESET_CHANGE | port::ENABLE_CHANGE;
+                // A reset returns the device to its default state: it
+                // answers on address zero again and is unconfigured,
+                // which is what the driver assumes when it addresses it.
+                self.device = GamepadDevice::default();
+                self.pending.clear();
             } else {
                 *status |= port::RESET_CHANGE;
             }
@@ -550,6 +555,9 @@ impl OhciController {
         let end = memory.read_dword(transfer.wrapping_add(12))?;
 
         let direction = (control >> 19) & 0x3;
+        // Whether the answer filled the buffer offered for it, which the
+        // buffer pointer reports below.
+        let mut short = false;
         // The buffer runs from its current pointer to its last byte
         // inclusive, and a zero-length transfer has no pointer at all.
         let length = if buffer == 0 || end < buffer {
@@ -575,6 +583,11 @@ impl OhciController {
                     "control setup"
                 );
                 self.pending = answer.unwrap_or_default();
+                // A descriptor that moved all of its buffer reports an
+                // empty current pointer. A driver reading a non-zero one
+                // works out a partial length instead, and its accounting
+                // of how many bytes the transfer moved comes out wrong.
+                memory.write_dword(transfer.wrapping_add(4), 0);
             }
             PID_IN => {
                 let bytes = if endpoint == 0 {
@@ -591,9 +604,13 @@ impl OhciController {
                     }
                 };
                 tracing::debug!(endpoint, wanted = length, sending = bytes.len(), "transfer in");
-                if bytes.is_empty() {
-                    // Nothing to send this time: the transfer is left
-                    // alone so the driver can ask again.
+                // An interrupt endpoint with nothing to report leaves its
+                // transfer alone so the driver can ask again. The control
+                // endpoint is different: a request carrying no data still
+                // ends with a zero-length stage, and declining to complete
+                // that leaves the driver waiting on a transfer that has
+                // already happened.
+                if endpoint != 0 && bytes.is_empty() {
                     return None;
                 }
                 let landed = memory.write_bytes(buffer, &bytes);
@@ -605,9 +622,15 @@ impl OhciController {
                     landed,
                     "wrote a transfer's data"
                 );
-                // A completed transfer reports how much of its buffer is
-                // left, which is none when it filled it.
-                memory.write_dword(transfer.wrapping_add(4), 0);
+                // A transfer that filled its buffer reports an empty
+                // pointer; one that did not leaves it at the next byte it
+                // would have written, which is how the driver works out
+                // how much actually arrived. Reporting empty for a short
+                // answer tells it the whole buffer was filled.
+                let sent = u32::try_from(bytes.len()).unwrap_or(0);
+                short = sent < length;
+                let remaining = if short { buffer.wrapping_add(sent) } else { 0 };
+                memory.write_dword(transfer.wrapping_add(4), remaining);
             }
             PID_OUT => {
                 // Rumble and configuration writes are accepted and
@@ -620,7 +643,14 @@ impl OhciController {
         // A retired descriptor reports no error, no error count, and
         // carries the toggle the next one will start from: the hardware
         // marks the toggle explicit and advances it.
+        //
+        // A short answer is reported through the buffer pointer above and
+        // not as a condition: an interrupt endpoint's report is always
+        // shorter than the buffer offered for it, and calling that an
+        // underrun makes a driver treat every report it asked for as a
+        // failure and ask again without pause.
         let retired = ((control & 0x03FF_FFFF) | TD_TOGGLE_EXPLICIT) ^ TD_TOGGLE_VALUE;
+        let _ = short;
         memory.write_dword(transfer, retired);
 
         // How long the driver is willing to wait to hear about it.
@@ -666,7 +696,12 @@ impl OhciController {
             }
         };
         let done = self.registers[(register::DONE_HEAD / 4) as usize];
-        if ready && done != 0 && hcca != 0 {
+        // The driver zeroes the handover once it has taken the list, and
+        // the controller may not overwrite one it has not taken yet:
+        // doing so loses every completion on it, and asks for an
+        // interrupt per frame that the driver can never catch up with.
+        let taken = memory.read_dword(hcca.wrapping_add(0x84)).is_some_and(|head| head == 0);
+        if ready && taken && done != 0 && hcca != 0 {
             self.done_delay = None;
             memory.write_dword(hcca.wrapping_add(0x84), done);
             self.registers[(register::DONE_HEAD / 4) as usize] = 0;

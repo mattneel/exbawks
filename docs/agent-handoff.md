@@ -536,8 +536,31 @@ Two active threads:
    is answered correctly, and its interrupt routine is called nineteen
    times a run rather than once.
 
-   **Where it stops:** the driver asks that same question six times and
-   gives up, cycling the port (forty-four writes where there were two).
+   **The gamepad is enumerated.** The driver's sequence completes: device
+   descriptor, `SET_ADDRESS(1)`, configuration descriptor,
+   `SET_CONFIGURATION(1)`, a report read and a capability read, each asked
+   once, and it then polls the interrupt endpoint about sixteen hundred
+   times a run. `exbawks run --gamepad` reports `address 1, configured`.
+
+   Three defects here were in the way, all about reporting how much data a
+   transfer moved, and all found by disassembling the driver rather than by
+   experiment. The byte count it checks (`cmp dword [edx+14h], 8` at
+   `0x0024D742`) is accumulated per descriptor at `0x0024E5E4` from either
+   the descriptor's own length byte, when the buffer pointer is empty, or a
+   computed partial length when it is not. So: a short answer must leave
+   the pointer at the next unwritten byte, a setup stage must report its
+   buffer consumed, and a zero-length status stage must be completed rather
+   than skipped as "nothing to send". The last of those is why the driver
+   polled five thousand times after `SET_ADDRESS`.
+
+   **Next: the host side.** The pad reports all zeroes because nothing
+   feeds it. `exbawks-platform` is where a real controller is read
+   (`VID_054C&PID_0CE6` is a DualSense on this machine), mapped to the
+   twenty-byte report, and handed to `set_gamepad_state`. After that a
+   button press reaches the title.
+
+   **Superseded:** the driver used to ask the same question six times and
+   give up, cycling the port.
 
    The data toggle was the leading suspect and has been implemented from
    xemu's controller — a retired descriptor is marked explicit, its toggle

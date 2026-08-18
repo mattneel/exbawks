@@ -269,6 +269,30 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- **The title enumerates the gamepad.** Its own USB driver now walks the
+  whole sequence and is answered at every step: the device descriptor,
+  `SET_ADDRESS`, the configuration descriptor, `SET_CONFIGURATION`, a
+  report read and a capability read — each asked exactly once, with no
+  retries and no port cycling — and it then polls the interrupt endpoint
+  for input about sixteen hundred times a run.
+
+  Three defects in this engine were in the way, and all three were about
+  telling the driver how much data a transfer moved. A descriptor that
+  filled its buffer reports an empty buffer pointer and one that did not
+  leaves it at the next byte it would have written; this engine reported
+  empty for both, so a thirty-two byte answer to an eighty-byte request
+  claimed eighty bytes had arrived. The setup stage reported a stale
+  pointer, from which the driver computed a negative length and failed its
+  own byte-count check. And a request carrying no data still ends with a
+  zero-length stage, which this engine declined to complete at all — after
+  `SET_ADDRESS` the driver polled for that completion five thousand times
+  and never got it.
+
+  The controller also no longer overwrites a completion list the driver
+  has not taken yet, which the hardware may not do either: doing so loses
+  every completion on it and asks for an interrupt per frame that the
+  driver can never catch up with.
+
 - A retired transfer advances the data toggle and carries it back to its
   endpoint, and the done queue is handed over only once the shortest delay
   a retired descriptor asked for has run out. Both are how the hardware

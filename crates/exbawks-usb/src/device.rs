@@ -21,7 +21,8 @@ mod request {
     pub const GET_STATUS: u8 = 0;
     /// Standard `SET_INTERFACE`.
     pub const SET_INTERFACE: u8 = 11;
-    /// The vendor request that reads the controller's state directly.
+    /// The class request that reads the controller's state directly, and
+    /// the vendor request that asks which of its controls exist.
     pub const GET_REPORT: u8 = 1;
 }
 
@@ -164,8 +165,19 @@ impl GamepadDevice {
             }
             (true, request::GET_CONFIGURATION) => vec![self.configuration],
             (true, request::GET_STATUS) => vec![0, 0],
-            // The controller's state, read through the control endpoint
-            // rather than waited for on the interrupt one.
+            // A vendor request asks which controls the pad has, and a
+            // class request asks what they are doing. The first wants a
+            // mask — every field it supports set to all ones — and
+            // answering it with the pad's current state says a pad at
+            // rest has no controls at all.
+            (true, request::GET_REPORT) if setup.request_type & 0x60 == 0x40 => {
+                let mut capabilities = [0xFF_u8; REPORT_BYTES];
+                // The two leading bytes stay a report identifier and a
+                // length, as they are in a report.
+                capabilities[0] = 0x00;
+                capabilities[1] = REPORT_BYTES as u8;
+                capabilities.to_vec()
+            }
             (true, request::GET_REPORT) => report.to_vec(),
             (false, request::SET_ADDRESS) => {
                 self.address = (setup.value & 0x7F) as u8;
@@ -271,6 +283,33 @@ mod tests {
             .expect("answered");
         assert_eq!(answer.len(), REPORT_BYTES);
         assert_eq!(answer[2], 0x10, "the buttons reach the driver");
+    }
+
+    #[test]
+    fn capabilities_report_which_controls_exist_not_their_state() {
+        // A pad at rest reports zeroes. Answering the capability request
+        // with that state says the pad has no controls, so it has to be
+        // answered with a mask instead.
+        let mut device = GamepadDevice::default();
+        let resting = [0_u8; REPORT_BYTES];
+
+        let capabilities = device
+            .control(setup(0xC1, request::GET_REPORT, 0x0100, REPORT_BYTES as u16), &resting)
+            .expect("answered");
+        assert_eq!(capabilities.len(), REPORT_BYTES);
+        assert_eq!(capabilities[1], REPORT_BYTES as u8, "it still states its length");
+        assert_eq!(capabilities[2], 0xFF, "every button exists");
+        assert_eq!(
+            capabilities[4 + crate::gamepad::analogue::LEFT_TRIGGER],
+            0xFF,
+            "and every trigger"
+        );
+
+        // The class request still reports the state, resting or not.
+        let state = device
+            .control(setup(0xA1, request::GET_REPORT, 0x0100, REPORT_BYTES as u16), &resting)
+            .expect("answered");
+        assert_eq!(state[2], 0x00, "nothing is pressed");
     }
 
     #[test]
