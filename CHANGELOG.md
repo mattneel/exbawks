@@ -269,6 +269,19 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- Completed transfers are handed to the driver through the communication
+  area, as the hardware does, rather than left in the done-head register:
+  a driver reads its completions from `HccaDoneHead` and never looks at
+  the register, so it was walking nothing. The queue's link also lives in
+  each descriptor's next pointer at offset eight — the word after it is
+  the buffer's last byte, and writing the link there handed the driver a
+  list it could not follow.
+
+  With both fixed the title's driver enumerates as far as reading the
+  first eight bytes of the device descriptor, which it is answered
+  correctly, and its interrupt routine is now called nineteen times a run
+  rather than once.
+
 - Timers fire. `KeSetTimer` arms one and the runtime queues its deferred
   procedure when it comes due, calling it the same way an interrupt
   routine's is; `KeCancelTimer` disarms one. A driver that polls its own

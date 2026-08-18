@@ -161,6 +161,8 @@ pub struct OhciController {
     pending: Vec<u8>,
     /// How many times the driver has written the root port.
     port_writes: u64,
+    /// How many transfers have been retired.
+    completed: u64,
     /// Reads and writes per register offset, for finding out what a
     /// driver is waiting on when it stops making progress.
     accesses: [(u64, u64); 32],
@@ -184,6 +186,7 @@ impl Default for OhciController {
             device: GamepadDevice::default(),
             pending: Vec::new(),
             port_writes: 0,
+            completed: 0,
             accesses: [(0, 0); 32],
         }
     }
@@ -412,12 +415,14 @@ impl OhciController {
         let attached = self.attached;
         let state = self.state;
         let writes = self.port_writes;
+        let completed = self.completed;
         let accesses = self.accesses;
         *self = Self::default();
         self.accesses = accesses;
         self.attached = attached;
         self.state = state;
         self.port_writes = writes;
+        self.completed = completed;
         if attached {
             self.port_status[GAMEPAD_PORT] |= port::CONNECTED | port::CONNECT_CHANGE;
             // The change survives the reset, so it has to be announced
@@ -539,9 +544,16 @@ impl OhciController {
                     let word = memory.read_dword(buffer.wrapping_add(index as u32 & !3))?;
                     *byte = (word >> ((index as u32 & 3) * 8)) as u8;
                 }
-                self.pending = Setup::parse(&packet)
-                    .and_then(|setup| self.device.control(setup, &self.state.report()))
-                    .unwrap_or_default();
+                let parsed = Setup::parse(&packet);
+                let answer =
+                    parsed.and_then(|setup| self.device.control(setup, &self.state.report()));
+                tracing::debug!(
+                    packet = format_args!("{packet:02x?}"),
+                    answered = answer.as_ref().map_or(0, Vec::len),
+                    stalled = answer.is_none(),
+                    "control setup"
+                );
+                self.pending = answer.unwrap_or_default();
             }
             PID_IN => {
                 let bytes = if endpoint == 0 {
@@ -557,6 +569,7 @@ impl OhciController {
                         self.state.report().to_vec()
                     }
                 };
+                tracing::debug!(endpoint, wanted = length, sending = bytes.len(), "transfer in");
                 if bytes.is_empty() {
                     // Nothing to send this time: the transfer is left
                     // alone so the driver can ask again.
@@ -600,6 +613,21 @@ impl OhciController {
         }
         self.raise(INTERRUPT_START_OF_FRAME);
         self.service_lists(memory);
+
+        // The completions of this frame are handed over through the
+        // communication area, not through the register: a driver reads the
+        // list from `HccaDoneHead` and never looks at `HcDoneHead`, so
+        // leaving it in the register alone means it walks nothing.
+        let done = self.registers[(register::DONE_HEAD / 4) as usize];
+        if done != 0 && hcca != 0 {
+            memory.write_dword(hcca.wrapping_add(0x84), done);
+            self.registers[(register::DONE_HEAD / 4) as usize] = 0;
+            self.raise(INTERRUPT_WRITEBACK_DONE);
+            tracing::debug!(
+                head = format_args!("{done:#010x}"),
+                "done queue handed to the communication area"
+            );
+        }
     }
 
     /// Whether an interrupt is pending and enabled.
@@ -629,12 +657,22 @@ impl OhciController {
         (self.list_enabled(CONTROL_BULK_ENABLE) && head != 0).then_some(head)
     }
 
+    /// How many transfers have been retired onto the done queue.
+    #[must_use]
+    pub fn completed(&self) -> u64 {
+        self.completed
+    }
+
     /// Reports a completed transfer to the driver's done queue.
     pub fn complete(&mut self, memory: &dyn UsbMemory, descriptor: u32) {
+        self.completed = self.completed.saturating_add(1);
+        tracing::debug!(descriptor = format_args!("{descriptor:#010x}"), "transfer completed");
         let previous = self.registers[(register::DONE_HEAD / 4) as usize];
-        // The done queue is a list the controller pushes onto, and the
-        // next pointer lives in the descriptor's fourth word.
-        memory.write_dword(descriptor.wrapping_add(12), previous);
+        // The queue is a list the controller pushes onto, linked through
+        // the descriptor's own next pointer at offset eight — the word
+        // after it is the buffer's last byte, and writing the link there
+        // hands the driver a list it cannot walk.
+        memory.write_dword(descriptor.wrapping_add(8), previous);
         self.registers[(register::DONE_HEAD / 4) as usize] = descriptor;
         self.raise(INTERRUPT_WRITEBACK_DONE);
     }
@@ -804,9 +842,9 @@ mod tests {
         controller.complete(&memory, 0x0020_0100);
         assert_eq!(controller.read(register::DONE_HEAD), 0x0020_0100, "the newest is the head");
         assert_eq!(
-            memory.read_dword(0x0020_0100 + 12),
+            memory.read_dword(0x0020_0100 + 8),
             Some(0x0020_0000),
-            "and it points at the one before"
+            "and its next pointer names the one before"
         );
     }
 

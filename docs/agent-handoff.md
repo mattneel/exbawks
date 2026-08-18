@@ -525,8 +525,28 @@ Two active threads:
    delay before announcing the device. Reading the driver's own code took
    an afternoon of guessing to one measurement.
 
+   **Enumeration now starts.** Two defects in this engine were in the way,
+   both found by disassembling the driver's completion handler rather than
+   by guessing. Completions are handed over through `HccaDoneHead` in the
+   communication area, not through the `HcDoneHead` register a driver
+   never reads; and the queue's link belongs in each descriptor's next
+   pointer at offset eight, where this engine had been writing it into the
+   buffer-end word at twelve. With both fixed the driver resets the port,
+   submits `GET_DESCRIPTOR(device, 8)` — the standard first question — and
+   is answered correctly, and its interrupt routine is called nineteen
+   times a run rather than once.
+
+   **Where it stops:** the driver asks that same question six times and
+   gives up, cycling the port (forty-four writes where there were two).
+   Its completion handler at `0x0024E480` reads the descriptor's condition
+   code (`shr eax, 1Ch`) and special-cases 9 (`DataUnderrun`) and 15
+   (`NotAccessed`); this engine reports 0 (`NoError`), which takes the
+   ordinary path, so the rejection is something else about the answer or
+   the transfer's bookkeeping — the data toggle and the endpoint's toggle
+   carry are the obvious suspects, neither of which this engine maintains.
+
    **The descriptor walk is built and tested, and the title does not yet
-   enumerate.** `exbawks-usb` answers the standard control requests and
+   finish enumerating.** `exbawks-usb` answers the standard control requests and
    runs the transfer descriptors a driver queues; a test drives a full
    enumeration — descriptor, address, configure, report — through lists
    built the way a driver builds them. The retail title never submits one.
