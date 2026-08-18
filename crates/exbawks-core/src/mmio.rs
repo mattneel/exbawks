@@ -157,6 +157,13 @@ impl DeviceSpace {
         }
     }
 
+    /// Whether the driver has addressed and configured the gamepad.
+    #[must_use]
+    pub fn usb_device_state(&self) -> (u8, bool) {
+        let usb = self.usb.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (usb.device_address(), usb.device_configured())
+    }
+
     /// Whether the USB controller is asking for an interrupt.
     #[must_use]
     pub fn usb_interrupt_pending(&self) -> bool {

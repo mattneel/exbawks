@@ -10,6 +10,7 @@
 //! Everything here is pure logic: guest memory arrives through a trait, and
 //! no host pointer reaches it.
 
+use crate::device::{GamepadDevice, Setup};
 use crate::gamepad::{GamepadState, REPORT_BYTES};
 
 /// Guest physical memory, as the controller reaches it.
@@ -103,6 +104,21 @@ const INTERRUPT_WRITEBACK_DONE: u32 = 1 << 1;
 const INTERRUPT_START_OF_FRAME: u32 = 1 << 2;
 const INTERRUPT_ROOT_HUB_CHANGE: u32 = 1 << 6;
 
+/// The most endpoints one pass over a list will follow.
+///
+/// The lists live in guest memory and a malformed one can be circular, so
+/// every walk is bounded rather than trusted to terminate.
+const MAX_ENDPOINTS: u32 = 64;
+/// The most transfers one endpoint will complete in a pass.
+const MAX_TRANSFERS: u32 = 64;
+/// The most bytes one transfer may move.
+const MAX_TRANSFER_BYTES: u32 = 4096;
+
+/// A transfer descriptor's direction field.
+const PID_SETUP: u32 = 0;
+const PID_OUT: u32 = 1;
+const PID_IN: u32 = 2;
+
 /// One emulated host controller with a single root port.
 ///
 /// Only the first controller is modelled, because the title only programs
@@ -119,6 +135,11 @@ pub struct OhciController {
     frame: u64,
     /// The gamepad state the next interrupt transfer will report.
     state: GamepadState,
+    /// The device on the root port, and what the driver has told it.
+    device: GamepadDevice,
+    /// The bytes a control transfer's setup stage asked for, waiting for
+    /// the data stage that will carry them.
+    pending: Vec<u8>,
     /// How many times the driver has written the root port.
     port_writes: u64,
     /// Reads and writes per register offset, for finding out what a
@@ -141,6 +162,8 @@ impl Default for OhciController {
             attached: false,
             frame: 0,
             state: GamepadState::default(),
+            device: GamepadDevice::default(),
+            pending: Vec::new(),
             port_writes: 0,
             accesses: [(0, 0); 32],
         }
@@ -288,6 +311,11 @@ impl OhciController {
     /// Applies a write to the root port, whose bits are commands.
     fn write_port(&mut self, value: u32) {
         self.port_writes = self.port_writes.saturating_add(1);
+        tracing::debug!(
+            value = format_args!("{value:#010x}"),
+            before = format_args!("{:#010x}", self.port_status),
+            "guest writes the root port"
+        );
         // The change bits are write-one-to-clear.
         self.port_status &= !(value & 0x001F_0000);
 
@@ -343,6 +371,160 @@ impl OhciController {
         }
     }
 
+    /// Whether the driver has configured the device.
+    #[must_use]
+    pub fn device_configured(&self) -> bool {
+        self.device.configured()
+    }
+
+    /// The address the driver gave the device, once it has.
+    #[must_use]
+    pub fn device_address(&self) -> u8 {
+        self.device.address()
+    }
+
+    /// Runs the transfers the driver has queued.
+    ///
+    /// The driver builds endpoint descriptors, each holding a list of
+    /// transfer descriptors, and the controller walks them: this is the
+    /// half of the interface that moves data rather than answering
+    /// registers.
+    pub fn service_lists(&mut self, memory: &dyn UsbMemory) {
+        if !self.operational() || !self.attached {
+            return;
+        }
+        if let Some(head) = self.control_list() {
+            self.walk_endpoints(memory, head);
+        }
+        if let Some(head) = self.bulk_list() {
+            self.walk_endpoints(memory, head);
+        }
+        // The periodic list for this frame, which is where a driver puts
+        // the endpoint it polls for controller reports.
+        let hcca = self.hcca();
+        if hcca != 0 {
+            let slot = (self.frame % 32) as u32;
+            if let Some(head) = memory.read_dword(hcca.wrapping_add(slot * 4))
+                && head != 0
+            {
+                self.walk_endpoints(memory, head);
+            }
+        }
+    }
+
+    /// Follows a list of endpoint descriptors, running each one's queue.
+    fn walk_endpoints(&mut self, memory: &dyn UsbMemory, head: u32) {
+        let mut endpoint = head & !0xF;
+        for _ in 0..MAX_ENDPOINTS {
+            if endpoint == 0 {
+                break;
+            }
+            let (Some(control), Some(tail), Some(mut current), Some(next)) = (
+                memory.read_dword(endpoint),
+                memory.read_dword(endpoint.wrapping_add(4)),
+                memory.read_dword(endpoint.wrapping_add(8)),
+                memory.read_dword(endpoint.wrapping_add(12)),
+            ) else {
+                break;
+            };
+
+            // A skipped or halted endpoint is not the controller's to run.
+            let skip = control & (1 << 14) != 0;
+            let halted = current & 1 != 0;
+            if !skip && !halted {
+                let number = (control >> 7) & 0xF;
+                let mut moved = false;
+                for _ in 0..MAX_TRANSFERS {
+                    let transfer = current & !0xF;
+                    if transfer == 0 || transfer == tail & !0xF {
+                        break;
+                    }
+                    let Some(following) = self.run_transfer(memory, number, transfer) else {
+                        break;
+                    };
+                    // The head advances past the transfer just completed,
+                    // keeping the toggle-carry bit the driver left there.
+                    current = (following & !0xF) | (current & 0x2);
+                    moved = true;
+                }
+                if moved {
+                    memory.write_dword(endpoint.wrapping_add(8), current);
+                }
+            }
+            endpoint = next & !0xF;
+        }
+    }
+
+    /// Runs one transfer descriptor, returning the next one in its queue.
+    fn run_transfer(
+        &mut self,
+        memory: &dyn UsbMemory,
+        endpoint: u32,
+        transfer: u32,
+    ) -> Option<u32> {
+        let control = memory.read_dword(transfer)?;
+        let buffer = memory.read_dword(transfer.wrapping_add(4))?;
+        let next = memory.read_dword(transfer.wrapping_add(8))?;
+        let end = memory.read_dword(transfer.wrapping_add(12))?;
+
+        let direction = (control >> 19) & 0x3;
+        // The buffer runs from its current pointer to its last byte
+        // inclusive, and a zero-length transfer has no pointer at all.
+        let length = if buffer == 0 || end < buffer {
+            0
+        } else {
+            (end - buffer + 1).min(MAX_TRANSFER_BYTES)
+        };
+
+        match direction {
+            PID_SETUP => {
+                let mut packet = [0_u8; 8];
+                for (index, byte) in packet.iter_mut().enumerate() {
+                    let word = memory.read_dword(buffer.wrapping_add(index as u32 & !3))?;
+                    *byte = (word >> ((index as u32 & 3) * 8)) as u8;
+                }
+                self.pending = Setup::parse(&packet)
+                    .and_then(|setup| self.device.control(setup, &self.state.report()))
+                    .unwrap_or_default();
+            }
+            PID_IN => {
+                let bytes = if endpoint == 0 {
+                    // The data stage of a control transfer.
+                    let take = (length as usize).min(self.pending.len());
+                    self.pending.drain(..take).collect::<Vec<_>>()
+                } else {
+                    // The interrupt endpoint the driver polls: a report,
+                    // but only once the device has been configured.
+                    if !self.device.configured() || length < REPORT_BYTES as u32 {
+                        Vec::new()
+                    } else {
+                        self.state.report().to_vec()
+                    }
+                };
+                if bytes.is_empty() {
+                    // Nothing to send this time: the transfer is left
+                    // alone so the driver can ask again.
+                    return None;
+                }
+                memory.write_bytes(buffer, &bytes);
+                // A completed transfer reports how much of its buffer is
+                // left, which is none when it filled it.
+                memory.write_dword(transfer.wrapping_add(4), 0);
+            }
+            PID_OUT => {
+                // Rumble and configuration writes are accepted and
+                // discarded; nothing here has a motor to drive.
+                memory.write_dword(transfer.wrapping_add(4), 0);
+            }
+            _ => {}
+        }
+
+        // The condition code says the transfer succeeded.
+        memory.write_dword(transfer, control & 0x0FFF_FFFF);
+        self.complete(memory, transfer);
+        Some(next)
+    }
+
     /// Advances the schedule by one frame.
     ///
     /// The frame number is what a driver's interrupt endpoint is scheduled
@@ -361,6 +543,7 @@ impl OhciController {
             memory.write_dword(hcca.wrapping_add(0x80), frame);
         }
         self.raise(INTERRUPT_START_OF_FRAME);
+        self.service_lists(memory);
     }
 
     /// Whether an interrupt is pending and enabled.
@@ -578,6 +761,151 @@ mod tests {
 
         controller.write(register::COMMAND_STATUS, COMMAND_CONTROL_FILLED);
         assert_eq!(controller.control_list(), Some(0x0030_0000));
+    }
+
+    /// Builds one endpoint descriptor with a queue of transfers.
+    fn endpoint(memory: &FakeMemory, at: u32, number: u32, head: u32, tail: u32) {
+        memory.write_dword(at, number << 7);
+        memory.write_dword(at + 4, tail);
+        memory.write_dword(at + 8, head);
+        memory.write_dword(at + 12, 0);
+    }
+
+    /// Builds one transfer descriptor.
+    fn transfer(memory: &FakeMemory, at: u32, pid: u32, buffer: u32, length: u32, next: u32) {
+        memory.write_dword(at, pid << 19);
+        memory.write_dword(at + 4, buffer);
+        memory.write_dword(at + 8, next);
+        memory.write_dword(at + 12, if length == 0 { 0 } else { buffer + length - 1 });
+    }
+
+    /// A controller running, with a device attached and the lists filled.
+    fn running() -> (OhciController, FakeMemory) {
+        let memory = FakeMemory::default();
+        let mut controller = OhciController::default();
+        controller.set_attached(true);
+        controller.write(register::CONTROL, STATE_OPERATIONAL);
+        (controller, memory)
+    }
+
+    #[test]
+    fn a_control_transfer_answers_the_device_descriptor() {
+        // The driver's first question: what are you? It builds a setup
+        // stage and an IN stage, and the controller has to walk both.
+        let (mut controller, memory) = running();
+        let setup_packet = [0x80_u8, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00];
+        memory.write_bytes(0x3000, &setup_packet);
+        transfer(&memory, 0x2000, PID_SETUP, 0x3000, 8, 0x2010);
+        transfer(&memory, 0x2010, PID_IN, 0x4000, 18, 0x2020);
+        endpoint(&memory, 0x1000, 0, 0x2000, 0x2020);
+        controller.write(register::CONTROL_HEAD_ED, 0x1000);
+        controller.write(register::COMMAND_STATUS, COMMAND_CONTROL_FILLED);
+
+        controller.service_lists(&memory);
+
+        // Eighteen bytes of device descriptor, vendor Microsoft.
+        let first = memory.read_dword(0x4000).expect("written");
+        assert_eq!(first & 0xFF, 18, "bLength");
+        assert_eq!((first >> 8) & 0xFF, 1, "bDescriptorType: device");
+        let vendor = memory.read_dword(0x4008).expect("written");
+        assert_eq!(vendor & 0xFFFF, 0x045E, "Microsoft");
+        // Both transfers were retired onto the done queue.
+        assert_ne!(controller.read(register::DONE_HEAD), 0);
+    }
+
+    #[test]
+    fn addressing_and_configuring_walk_through_the_lists() {
+        let (mut controller, memory) = running();
+        // SET_ADDRESS(3), a transfer with no data at all.
+        memory.write_bytes(0x3000, &[0x00_u8, 0x05, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        transfer(&memory, 0x2000, PID_SETUP, 0x3000, 8, 0x2010);
+        endpoint(&memory, 0x1000, 0, 0x2000, 0x2010);
+        controller.write(register::CONTROL_HEAD_ED, 0x1000);
+        controller.write(register::COMMAND_STATUS, COMMAND_CONTROL_FILLED);
+        controller.service_lists(&memory);
+        assert_eq!(controller.device_address(), 3);
+
+        // SET_CONFIGURATION(1), after which the device is polled.
+        memory.write_bytes(0x3100, &[0x00_u8, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        transfer(&memory, 0x2100, PID_SETUP, 0x3100, 8, 0x2110);
+        endpoint(&memory, 0x1000, 0, 0x2100, 0x2110);
+        controller.service_lists(&memory);
+        assert!(controller.device_configured());
+    }
+
+    #[test]
+    fn a_configured_device_reports_its_buttons_on_the_interrupt_endpoint() {
+        let (mut controller, memory) = running();
+        // Configure it first: an unconfigured device sends nothing.
+        memory.write_bytes(0x3100, &[0x00_u8, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        transfer(&memory, 0x2100, PID_SETUP, 0x3100, 8, 0x2110);
+        endpoint(&memory, 0x1000, 0, 0x2100, 0x2110);
+        controller.write(register::CONTROL_HEAD_ED, 0x1000);
+        controller.write(register::COMMAND_STATUS, COMMAND_CONTROL_FILLED);
+        controller.service_lists(&memory);
+
+        controller.set_state(GamepadState {
+            buttons: crate::gamepad::button::START,
+            ..GamepadState::default()
+        });
+        // The driver polls endpoint one through the periodic list.
+        transfer(&memory, 0x2200, PID_IN, 0x5000, REPORT_BYTES as u32, 0x2210);
+        endpoint(&memory, 0x1100, 1, 0x2200, 0x2210);
+        controller.write(register::HCCA, 0x8000);
+        // Frame zero's periodic head.
+        memory.write_dword(0x8000, 0x1100);
+        controller.service_lists(&memory);
+
+        let word = memory.read_dword(0x5000).expect("the report was written");
+        assert_eq!((word >> 8) & 0xFF, REPORT_BYTES as u32, "the report states its length");
+        let buttons = memory.read_dword(0x5000).expect("written") >> 16;
+        assert_eq!(buttons & 0xFF, u32::from(crate::gamepad::button::START));
+    }
+
+    #[test]
+    fn an_unconfigured_device_sends_no_reports() {
+        let (mut controller, memory) = running();
+        transfer(&memory, 0x2200, PID_IN, 0x5000, REPORT_BYTES as u32, 0x2210);
+        endpoint(&memory, 0x1100, 1, 0x2200, 0x2210);
+        controller.write(register::HCCA, 0x8000);
+        memory.write_dword(0x8000, 0x1100);
+
+        controller.service_lists(&memory);
+        assert_eq!(memory.read_dword(0x5000), Some(0), "nothing was sent");
+    }
+
+    #[test]
+    fn a_circular_endpoint_list_does_not_spin() {
+        // The lists live in guest memory, so a malformed one must be
+        // walked a bounded number of times rather than trusted.
+        let (mut controller, memory) = running();
+        memory.write_dword(0x1000, 0);
+        memory.write_dword(0x1004, 0);
+        memory.write_dword(0x1008, 0);
+        // An endpoint whose next pointer is itself.
+        memory.write_dword(0x100C, 0x1000);
+        controller.write(register::CONTROL_HEAD_ED, 0x1000);
+        controller.write(register::COMMAND_STATUS, COMMAND_CONTROL_FILLED);
+
+        let start = std::time::Instant::now();
+        controller.service_lists(&memory);
+        assert!(start.elapsed().as_secs() < 5, "the walk is bounded");
+    }
+
+    #[test]
+    fn a_skipped_endpoint_is_left_alone() {
+        let (mut controller, memory) = running();
+        memory.write_bytes(0x3000, &[0x80_u8, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]);
+        transfer(&memory, 0x2000, PID_SETUP, 0x3000, 8, 0x2010);
+        transfer(&memory, 0x2010, PID_IN, 0x4000, 18, 0x2020);
+        endpoint(&memory, 0x1000, 0, 0x2000, 0x2020);
+        // The skip bit: the driver owns this endpoint for the moment.
+        memory.write_dword(0x1000, 1 << 14);
+        controller.write(register::CONTROL_HEAD_ED, 0x1000);
+        controller.write(register::COMMAND_STATUS, COMMAND_CONTROL_FILLED);
+
+        controller.service_lists(&memory);
+        assert_eq!(memory.read_dword(0x4000), Some(0), "nothing was transferred");
     }
 
     #[test]

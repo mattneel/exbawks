@@ -883,6 +883,11 @@ Graphics methods (object, method, submissions):"
             if emulator.usb_operational() { "running" } else { "stopped" },
             emulator.usb_hcca()
         );
+        let (address, configured) = emulator.usb_device_state();
+        println!(
+            "              gamepad address {address}, {}",
+            if configured { "configured" } else { "not configured" }
+        );
         let (status, writes) = emulator.usb_port();
         println!("              root port {status:#010x}, written {writes} times by the guest");
         for (index, (reads, writes)) in emulator.usb_accesses().iter().enumerate() {

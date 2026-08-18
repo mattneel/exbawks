@@ -1246,6 +1246,13 @@ impl Emulator {
         self.devices.usb_hcca()
     }
 
+    /// The address the guest gave the gamepad, and whether it configured
+    /// it — which is how far enumeration got.
+    #[must_use]
+    pub fn usb_device_state(&self) -> (u8, bool) {
+        self.devices.usb_device_state()
+    }
+
     /// Reads and writes per USB register offset.
     #[must_use]
     pub fn usb_accesses(&self) -> [(u64, u64); 32] {

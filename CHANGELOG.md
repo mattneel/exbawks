@@ -269,6 +269,17 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- The gamepad as a USB device, and the controller's descriptor walk: the
+  device descriptor, configuration, and the controller's own descriptor
+  that names its report size, plus `SET_ADDRESS`, `SET_CONFIGURATION`, and
+  a state read; and an endpoint and transfer descriptor walker that runs
+  the transfers a driver queues in guest memory, answering control
+  transfers and returning reports on the interrupt endpoint. Every list
+  walk is bounded, because the lists are guest data and a malformed one can
+  be circular. Tested by driving a full enumeration — descriptor, address,
+  configure, report — through descriptors built the way a driver builds
+  them.
+
 - Interrupt delivery. `KeInitializeInterrupt` records the guest's service
   routine and `KeConnectInterrupt` marks it live; when a modelled device
   raises an interrupt the runtime calls that routine on the guest processor

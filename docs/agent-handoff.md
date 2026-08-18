@@ -505,12 +505,30 @@ Two active threads:
    switched on would be), the service routine is called and returns TRUE,
    its deferred procedure runs, and the driver writes the root port back.
 
-   **Enumeration is the next step**: the driver acknowledges the port and
-   stops, because nothing yet walks the endpoint and transfer descriptors
-   it builds to answer `GET_DESCRIPTOR`, `SET_ADDRESS`, and
-   `SET_CONFIGURATION`. `OhciController` has the done queue and list heads
-   ready for it. Timers still do not fire (`KeSetTimer` records and does
-   nothing); that is the same shape of gap and probably the same fix.
+   **The descriptor walk is built and tested, and the title still does not
+   enumerate.** `exbawks-usb` answers the standard control requests and
+   runs the transfer descriptors a driver queues; a test drives a full
+   enumeration — descriptor, address, configure, report — through lists
+   built the way a driver builds them. The retail title never submits one.
+
+   What it does, exactly: the port write trace shows the driver writing
+   `0x00000000` during its initialisation sweep, then — after the interrupt
+   and its deferred procedure — writing `0x00010000`, which clears the
+   connect-change bit and nothing else. It never reads the port again
+   (one read, from the sweep), never sets the reset bit, and never sets
+   `ControlListFilled` a second time, so no control transfer is ever
+   submitted. Two hypotheses were tested against the running title and both
+   are wrong: it is not waiting out a debounce in frames (the frame counter
+   advances), and it does not want the port already enabled (bringing it up
+   enabled changes nothing).
+
+   So enumeration is driven by something further up the stack that has not
+   been identified — most likely a worker thread inside XAPI's USB stack
+   that is not being woken or not being scheduled. `NtSetEvent` is called
+   585 times and `NtWaitForSingleObjectEx` 815 in a run, so there are
+   threads waiting on events; which of them owns the hub is the thing to
+   find. Timers still do not fire (`KeSetTimer` records and does nothing)
+   and remain a candidate, though the driver arms none after the connect.
 
 2. **Kernel HLE burndown** (substrate-independent, needed under either
    engine). Done this session, in order the retail image demanded them:
