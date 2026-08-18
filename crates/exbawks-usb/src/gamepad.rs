@@ -64,8 +64,9 @@ impl GamepadState {
         let mut bytes = [0_u8; REPORT_BYTES];
         bytes[0] = 0x00;
         bytes[1] = REPORT_BYTES as u8;
-        bytes[2] = (self.buttons & 0xFF) as u8;
-        bytes[3] = 0x00;
+        // The digital buttons are one sixteen-bit field, not a byte and
+        // a pad: the report's own layout puts them at two and three.
+        bytes[2..4].copy_from_slice(&self.buttons.to_le_bytes());
         bytes[4..12].copy_from_slice(&self.analogue);
         bytes[12..14].copy_from_slice(&self.left_stick.0.to_le_bytes());
         bytes[14..16].copy_from_slice(&self.left_stick.1.to_le_bytes());

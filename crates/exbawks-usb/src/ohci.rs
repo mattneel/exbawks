@@ -58,6 +58,8 @@ mod register {
     pub const RH_DESCRIPTOR_B: u32 = 0x4C;
     pub const RH_STATUS: u32 = 0x50;
     pub const RH_PORT_STATUS: u32 = 0x54;
+    /// One past the last port's status register.
+    pub const RH_PORT_STATUS_END: u32 = RH_PORT_STATUS + 4 * super::ROOT_PORTS as u32;
 }
 
 /// Root-hub port status bits, which are also its change bits shifted up.
@@ -90,14 +92,30 @@ mod port {
     pub const CLEAR_POWER: u32 = 1 << 9;
 }
 
+/// Downstream ports the root hub reports.
+///
+/// The console's controller has four, and its driver writes all four port
+/// registers during initialisation; a hub claiming fewer leaves the rest
+/// of them landing in the general register file as though they were
+/// ordinary storage.
+pub const ROOT_PORTS: usize = 4;
+
+/// The port the gamepad is attached to, counting from zero.
+const GAMEPAD_PORT: usize = 0;
+
 /// The functional states `HcControl` selects.
 const STATE_MASK: u32 = 0xC0;
 const STATE_OPERATIONAL: u32 = 0x80;
 
 /// `HcCommandStatus` bits.
 const COMMAND_RESET: u32 = 1 << 0;
-const COMMAND_CONTROL_FILLED: u32 = 1 << 1;
-const COMMAND_BULK_FILLED: u32 = 1 << 2;
+
+/// `HcControl` list-enable bits. These are what say a list may be walked;
+/// the `HcCommandStatus` filled bits are a hint that one has something new
+/// on it, which a driver need not set again for a list it is reusing.
+const CONTROL_PERIODIC_ENABLE: u32 = 1 << 2;
+const CONTROL_LIST_ENABLE: u32 = 1 << 4;
+const CONTROL_BULK_ENABLE: u32 = 1 << 5;
 
 /// `HcInterruptStatus` bits this controller raises.
 const INTERRUPT_WRITEBACK_DONE: u32 = 1 << 1;
@@ -127,9 +145,10 @@ const PID_IN: u32 = 2;
 pub struct OhciController {
     /// The operational register file, indexed by offset over four.
     registers: [u32; 32],
-    /// The root port's status, kept apart because its writes are commands.
-    port_status: u32,
-    /// Whether a device is attached to the root port.
+    /// Each root port's status, kept apart because their writes are
+    /// commands rather than stored values.
+    port_status: [u32; ROOT_PORTS],
+    /// Whether a device is attached to the gamepad's port.
     attached: bool,
     /// The frame counter the driver reads and the schedule advances.
     frame: u64,
@@ -152,13 +171,13 @@ impl Default for OhciController {
         let mut registers = [0_u32; 32];
         // Revision 1.0, as every OHCI reports.
         registers[(register::REVISION / 4) as usize] = 0x10;
-        // One downstream port, always powered, not power-switched.
-        registers[(register::RH_DESCRIPTOR_A / 4) as usize] = 0x0000_1201;
+        // Four downstream ports, always powered, not power-switched.
+        registers[(register::RH_DESCRIPTOR_A / 4) as usize] = 0x0000_1200 | ROOT_PORTS as u32;
         // The default frame interval a driver expects to find.
         registers[(register::FM_INTERVAL / 4) as usize] = 0x2EDF;
         Self {
             registers,
-            port_status: port::POWERED,
+            port_status: [port::POWERED; ROOT_PORTS],
             attached: false,
             frame: 0,
             state: GamepadState::default(),
@@ -182,13 +201,17 @@ impl OhciController {
         }
         self.attached = attached;
         if attached {
-            self.port_status |= port::CONNECTED | port::CONNECT_CHANGE;
+            self.port_status[GAMEPAD_PORT] |= port::CONNECTED | port::CONNECT_CHANGE;
         } else {
-            self.port_status &= !(port::CONNECTED | port::ENABLED);
-            self.port_status |= port::CONNECT_CHANGE;
+            self.port_status[GAMEPAD_PORT] &= !(port::CONNECTED | port::ENABLED);
+            self.port_status[GAMEPAD_PORT] |= port::CONNECT_CHANGE;
         }
         self.raise(INTERRUPT_ROOT_HUB_CHANGE);
-        tracing::debug!(attached, port = format_args!("{:#010x}", self.port_status), "usb port");
+        tracing::debug!(
+            attached,
+            port = format_args!("{:#010x}", self.port_status[GAMEPAD_PORT]),
+            "usb port"
+        );
     }
 
     /// Records the controller state the next report will carry.
@@ -208,10 +231,10 @@ impl OhciController {
         self.registers[(register::HCCA / 4) as usize] & !0xFF
     }
 
-    /// The root port's status word, as the driver would read it.
+    /// The gamepad port's status word, as the driver would read it.
     #[must_use]
     pub fn port_status(&self) -> u32 {
-        self.port_status
+        self.port_status[GAMEPAD_PORT]
     }
 
     /// How many times the driver has written the root port. A driver that
@@ -251,7 +274,10 @@ impl OhciController {
             counts.0 = counts.0.saturating_add(1);
         }
         match offset {
-            register::RH_PORT_STATUS => self.port_status,
+            register::RH_PORT_STATUS..register::RH_PORT_STATUS_END => {
+                let index = ((offset - register::RH_PORT_STATUS) / 4) as usize;
+                self.port_status.get(index).copied().unwrap_or(0)
+            }
             register::FM_NUMBER => (self.frame & 0xFFFF) as u32,
             // The remaining count runs down within a frame; a driver that
             // polls it wants to see it move.
@@ -270,7 +296,10 @@ impl OhciController {
             counts.1 = counts.1.saturating_add(1);
         }
         match offset {
-            register::RH_PORT_STATUS => self.write_port(value),
+            register::RH_PORT_STATUS..register::RH_PORT_STATUS_END => {
+                let index = ((offset - register::RH_PORT_STATUS) / 4) as usize;
+                self.write_port(index, value);
+            }
             register::INTERRUPT_STATUS => {
                 // Write one to clear, as every status register here is.
                 let index = (register::INTERRUPT_STATUS / 4) as usize;
@@ -300,6 +329,16 @@ impl OhciController {
             }
             // The read-only registers a driver may still write to.
             register::REVISION | register::FM_REMAINING | register::FM_NUMBER => {}
+            register::RH_DESCRIPTOR_A => {
+                // The port count describes the hardware and is not the
+                // driver's to set; only the power-switching and
+                // over-current fields above it are writable. Latching the
+                // whole word would let an initialisation sweep tell the
+                // hub it has no ports.
+                let index = (register::RH_DESCRIPTOR_A / 4) as usize;
+                let ports = self.registers[index] & 0xFF;
+                self.registers[index] = (value & !0xFF) | ports;
+            }
             _ => {
                 if let Some(slot) = self.registers.get_mut((offset / 4) as usize) {
                     *slot = value;
@@ -309,42 +348,48 @@ impl OhciController {
     }
 
     /// Applies a write to the root port, whose bits are commands.
-    fn write_port(&mut self, value: u32) {
+    fn write_port(&mut self, index: usize, value: u32) {
+        if index >= ROOT_PORTS {
+            return;
+        }
         self.port_writes = self.port_writes.saturating_add(1);
         tracing::debug!(
+            port = index,
             value = format_args!("{value:#010x}"),
-            before = format_args!("{:#010x}", self.port_status),
-            "guest writes the root port"
+            before = format_args!("{:#010x}", self.port_status[index]),
+            "guest writes a root port"
         );
+        let attached = self.attached && index == GAMEPAD_PORT;
+        let status = &mut self.port_status[index];
         // The change bits are write-one-to-clear.
-        self.port_status &= !(value & 0x001F_0000);
+        *status &= !(value & 0x001F_0000);
 
         if value & port::CLEAR_ENABLE != 0 {
-            self.port_status &= !port::ENABLED;
+            *status &= !port::ENABLED;
         }
-        if value & port::SET_ENABLE != 0 && self.attached {
-            self.port_status |= port::ENABLED;
+        if value & port::SET_ENABLE != 0 && attached {
+            *status |= port::ENABLED;
         }
         if value & port::SET_SUSPEND != 0 {
-            self.port_status |= port::SUSPENDED;
+            *status |= port::SUSPENDED;
         }
         if value & port::CLEAR_SUSPEND != 0 {
-            self.port_status &= !port::SUSPENDED;
+            *status &= !port::SUSPENDED;
         }
         if value & port::SET_POWER != 0 {
-            self.port_status |= port::POWERED;
+            *status |= port::POWERED;
         }
         if value & port::CLEAR_POWER != 0 {
-            self.port_status &= !port::POWERED;
+            *status &= !port::POWERED;
         }
         if value & port::SET_RESET != 0 {
             // A reset on an occupied port completes immediately and leaves
             // the port enabled, which is what the driver waits for before
             // it addresses the device.
-            if self.attached {
-                self.port_status |= port::ENABLED | port::RESET_CHANGE | port::ENABLE_CHANGE;
+            if attached {
+                *status |= port::ENABLED | port::RESET_CHANGE | port::ENABLE_CHANGE;
             } else {
-                self.port_status |= port::RESET_CHANGE;
+                *status |= port::RESET_CHANGE;
             }
             self.raise(INTERRUPT_ROOT_HUB_CHANGE);
         }
@@ -363,7 +408,7 @@ impl OhciController {
         self.state = state;
         self.port_writes = writes;
         if attached {
-            self.port_status |= port::CONNECTED | port::CONNECT_CHANGE;
+            self.port_status[GAMEPAD_PORT] |= port::CONNECTED | port::CONNECT_CHANGE;
             // The change survives the reset, so it has to be announced
             // again: a driver that resets the controller after a device
             // appeared would otherwise never hear about it.
@@ -402,7 +447,7 @@ impl OhciController {
         // The periodic list for this frame, which is where a driver puts
         // the endpoint it polls for controller reports.
         let hcca = self.hcca();
-        if hcca != 0 {
+        if hcca != 0 && self.list_enabled(CONTROL_PERIODIC_ENABLE) {
             let slot = (self.frame % 32) as u32;
             if let Some(head) = memory.read_dword(hcca.wrapping_add(slot * 4))
                 && head != 0
@@ -554,22 +599,23 @@ impl OhciController {
         status & enabled != 0
     }
 
-    /// The head of the control list the driver built, if it filled one.
-    #[must_use]
-    pub fn control_list(&self) -> Option<u32> {
-        let filled =
-            self.registers[(register::COMMAND_STATUS / 4) as usize] & COMMAND_CONTROL_FILLED != 0;
-        let head = self.registers[(register::CONTROL_HEAD_ED / 4) as usize];
-        (filled && head != 0).then_some(head)
+    /// Whether one of the `HcControl` list-enable bits is set.
+    fn list_enabled(&self, bit: u32) -> bool {
+        self.registers[(register::CONTROL / 4) as usize] & bit != 0
     }
 
-    /// The head of the bulk list, if the driver filled one.
+    /// The head of the control list, when the driver has enabled it.
+    #[must_use]
+    pub fn control_list(&self) -> Option<u32> {
+        let head = self.registers[(register::CONTROL_HEAD_ED / 4) as usize];
+        (self.list_enabled(CONTROL_LIST_ENABLE) && head != 0).then_some(head)
+    }
+
+    /// The head of the bulk list, when the driver has enabled it.
     #[must_use]
     pub fn bulk_list(&self) -> Option<u32> {
-        let filled =
-            self.registers[(register::COMMAND_STATUS / 4) as usize] & COMMAND_BULK_FILLED != 0;
         let head = self.registers[(register::BULK_HEAD_ED / 4) as usize];
-        (filled && head != 0).then_some(head)
+        (self.list_enabled(CONTROL_BULK_ENABLE) && head != 0).then_some(head)
     }
 
     /// Reports a completed transfer to the driver's done queue.
@@ -754,12 +800,15 @@ mod tests {
     }
 
     #[test]
-    fn the_control_list_is_only_offered_once_the_driver_fills_it() {
+    fn the_control_list_is_only_offered_once_the_driver_enables_it() {
         let mut controller = OhciController::default();
         controller.write(register::CONTROL_HEAD_ED, 0x0030_0000);
-        assert_eq!(controller.control_list(), None, "a head with no filled bit is not a list");
+        assert_eq!(controller.control_list(), None, "a head on a disabled list is not one");
 
-        controller.write(register::COMMAND_STATUS, COMMAND_CONTROL_FILLED);
+        controller.write(
+            register::CONTROL,
+            STATE_OPERATIONAL | CONTROL_LIST_ENABLE | CONTROL_PERIODIC_ENABLE,
+        );
         assert_eq!(controller.control_list(), Some(0x0030_0000));
     }
 
@@ -784,7 +833,10 @@ mod tests {
         let memory = FakeMemory::default();
         let mut controller = OhciController::default();
         controller.set_attached(true);
-        controller.write(register::CONTROL, STATE_OPERATIONAL);
+        controller.write(
+            register::CONTROL,
+            STATE_OPERATIONAL | CONTROL_LIST_ENABLE | CONTROL_PERIODIC_ENABLE,
+        );
         (controller, memory)
     }
 
@@ -799,7 +851,10 @@ mod tests {
         transfer(&memory, 0x2010, PID_IN, 0x4000, 18, 0x2020);
         endpoint(&memory, 0x1000, 0, 0x2000, 0x2020);
         controller.write(register::CONTROL_HEAD_ED, 0x1000);
-        controller.write(register::COMMAND_STATUS, COMMAND_CONTROL_FILLED);
+        controller.write(
+            register::CONTROL,
+            STATE_OPERATIONAL | CONTROL_LIST_ENABLE | CONTROL_PERIODIC_ENABLE,
+        );
 
         controller.service_lists(&memory);
 
@@ -821,7 +876,10 @@ mod tests {
         transfer(&memory, 0x2000, PID_SETUP, 0x3000, 8, 0x2010);
         endpoint(&memory, 0x1000, 0, 0x2000, 0x2010);
         controller.write(register::CONTROL_HEAD_ED, 0x1000);
-        controller.write(register::COMMAND_STATUS, COMMAND_CONTROL_FILLED);
+        controller.write(
+            register::CONTROL,
+            STATE_OPERATIONAL | CONTROL_LIST_ENABLE | CONTROL_PERIODIC_ENABLE,
+        );
         controller.service_lists(&memory);
         assert_eq!(controller.device_address(), 3);
 
@@ -841,7 +899,10 @@ mod tests {
         transfer(&memory, 0x2100, PID_SETUP, 0x3100, 8, 0x2110);
         endpoint(&memory, 0x1000, 0, 0x2100, 0x2110);
         controller.write(register::CONTROL_HEAD_ED, 0x1000);
-        controller.write(register::COMMAND_STATUS, COMMAND_CONTROL_FILLED);
+        controller.write(
+            register::CONTROL,
+            STATE_OPERATIONAL | CONTROL_LIST_ENABLE | CONTROL_PERIODIC_ENABLE,
+        );
         controller.service_lists(&memory);
 
         controller.set_state(GamepadState {
@@ -885,7 +946,10 @@ mod tests {
         // An endpoint whose next pointer is itself.
         memory.write_dword(0x100C, 0x1000);
         controller.write(register::CONTROL_HEAD_ED, 0x1000);
-        controller.write(register::COMMAND_STATUS, COMMAND_CONTROL_FILLED);
+        controller.write(
+            register::CONTROL,
+            STATE_OPERATIONAL | CONTROL_LIST_ENABLE | CONTROL_PERIODIC_ENABLE,
+        );
 
         let start = std::time::Instant::now();
         controller.service_lists(&memory);
@@ -902,7 +966,10 @@ mod tests {
         // The skip bit: the driver owns this endpoint for the moment.
         memory.write_dword(0x1000, 1 << 14);
         controller.write(register::CONTROL_HEAD_ED, 0x1000);
-        controller.write(register::COMMAND_STATUS, COMMAND_CONTROL_FILLED);
+        controller.write(
+            register::CONTROL,
+            STATE_OPERATIONAL | CONTROL_LIST_ENABLE | CONTROL_PERIODIC_ENABLE,
+        );
 
         controller.service_lists(&memory);
         assert_eq!(memory.read_dword(0x4000), Some(0), "nothing was transferred");

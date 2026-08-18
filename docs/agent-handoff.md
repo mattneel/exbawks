@@ -522,13 +522,24 @@ Two active threads:
    advances), and it does not want the port already enabled (bringing it up
    enabled changes nothing).
 
-   So enumeration is driven by something further up the stack that has not
-   been identified — most likely a worker thread inside XAPI's USB stack
-   that is not being woken or not being scheduled. `NtSetEvent` is called
-   585 times and `NtWaitForSingleObjectEx` 815 in a run, so there are
-   threads waiting on events; which of them owns the hub is the thing to
-   find. Timers still do not fire (`KeSetTimer` records and does nothing)
-   and remain a candidate, though the driver arms none after the connect.
+   Reading xemu corrected two things here. Each Xbox OHCI has **four**
+   downstream ports, not one, and its port count is read-only hardware
+   description — this model reported one and let the driver's
+   initialisation sweep overwrite it, so three ports did not exist and the
+   fourth could be told it did not either. A transfer list is also walked
+   on its `HcControl` enable bit, not the `HcCommandStatus` filled bit,
+   which is only a hint that something new arrived. With both fixed the
+   driver went from writing one port register to working all four.
+
+   **The title is not blocked on USB — it is blocked on the GPU.** RIP
+   sampling over a full run puts **84.5% of samples at `0x001CB97B`**, deep
+   in Direct3D, with GPU device reads climbing from 123 to 18,897 between
+   two heartbeats. It is spinning on a graphics register, and its frame
+   loop is not advancing; the hub work behind it never gets its turn. The
+   title connects vector **51**, which is IRQ 3 — the GPU — so a vertical
+   blank interrupt that this emulator never raises is the most likely
+   thing it is waiting for, and is the next thing to try now that
+   delivering an interrupt is possible at all.
 
 2. **Kernel HLE burndown** (substrate-independent, needed under either
    engine). Done this session, in order the retail image demanded them:

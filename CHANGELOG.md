@@ -269,6 +269,22 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- The root hub reports the four downstream ports the console's controller
+  has, rather than one, and its port count is read-only as the hardware's
+  is — an initialisation sweep could previously tell the hub it had no
+  ports. Checked against xemu, which gives each Xbox OHCI four. The title's
+  driver went from touching one port register to working all four.
+
+- A transfer list is walked when its `HcControl` enable bit is set, not
+  when the `HcCommandStatus` filled bit is: the filled bit is a hint that
+  something new is on a list, which a driver reusing one need not set
+  again, and requiring it meant never walking a list the driver had
+  enabled.
+
+- The gamepad's digital buttons are the sixteen-bit field the report
+  layout defines, not a byte and a pad. The layout is confirmed against
+  xemu's `XIDGamepadReport`, which matches this one field for field.
+
 - The gamepad as a USB device, and the controller's descriptor walk: the
   device descriptor, configuration, and the controller's own descriptor
   that names its report size, plus `SET_ADDRESS`, `SET_CONFIGURATION`, and
