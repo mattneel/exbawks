@@ -305,6 +305,15 @@ pub trait KernelServices {
     }
 
     /// Begins a wait on one handle (event or thread).
+    /// Gives up the rest of the calling thread's turn.
+    ///
+    /// Reports whether another thread was ready to take it, which is what
+    /// a caller uses to tell a yield that did something from one that did
+    /// not and may need to wait instead.
+    fn yield_thread(&mut self) -> bool {
+        false
+    }
+
     fn wait_for_object(&mut self, _handle: u32) -> Result<WaitOutcome, KernelServiceError> {
         Err(KernelServiceError::Unsupported)
     }

@@ -562,11 +562,23 @@ Two active threads:
    attached). The run prints which buttons it saw, which is how to tell
    whether a press reached the guest.
 
-   What has not been confirmed is a press actually moving the title, since
-   that needs someone at the controller. The chain either side of that is
-   verified: the host device opens and reads, the translation is tested,
-   and the guest polls the interrupt endpoint about sixteen hundred times
-   a run.
+   **A press moves the title, confirmed on hardware.** With a real
+   controller attached, pressing start takes it past the title screen and
+   into its difficulty menu — `EASY NORMAL HARD`, captured in
+   `fixtures/private/frames/after-start.png`. The run reports which
+   buttons it saw, so a press that reaches the guest is visible even when
+   the title does not visibly react.
+
+   Each press opened a new wall, and each was a missing export on a path
+   the title had never taken: `NtYieldExecution`, then
+   `ObReferenceObjectByHandle`, then `ObfDereferenceObject` — the last a
+   fastcall, so it takes its object in a register and clears no stack.
+   Expect more of the same shape further in; the run reports the ordinal
+   and the name, and most are small.
+
+   Without a press the run still ends at the pre-existing
+   `GuestFault { address: 0 }` at `0x001AE56C`, which is unrelated to
+   input and has outlived the whole session.
 
    **Superseded:** the driver used to ask the same question six times and
    give up, cycling the port.

@@ -43,6 +43,9 @@ pub mod ordinal {
     pub const KE_DELAY_EXECUTION_THREAD: u16 = 99;
     /// `KeInitializeDpc`.
     pub const KE_CANCEL_TIMER: u16 = 97;
+    pub const NT_YIELD_EXECUTION: u16 = 238;
+    pub const OB_REFERENCE_OBJECT_BY_HANDLE: u16 = 246;
+    pub const OBF_DEREFERENCE_OBJECT: u16 = 250;
     pub const KE_INITIALIZE_DPC: u16 = 107;
     pub const KE_INSERT_QUEUE_DPC: u16 = 119;
     /// `KeInitializeTimerEx`.
@@ -180,6 +183,9 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     registry.register(NtSetEvent)?;
     registry.register(NtResumeThread)?;
     registry.register(NtSuspendThread)?;
+    registry.register(NtYieldExecution)?;
+    registry.register(ObReferenceObjectByHandle)?;
+    registry.register(ObfDereferenceObject)?;
     registry.register(NtWaitForSingleObject)?;
     registry.register(NtWaitForSingleObjectEx)?;
     registry.register(NtWaitForMultipleObjectsEx)?;
@@ -396,6 +402,99 @@ impl KernelExport for NtResumeThread {
                 KernelStatus::SUCCESS
             }
             Err(_) => KernelStatus::INVALID_HANDLE,
+        }
+    }
+}
+
+/// Resolves a handle to the object it names.
+///
+/// The object manager is high-level emulated and keeps no object bodies,
+/// so a handle stands for itself: what a caller receives back is the
+/// handle, which is the only token this runtime has and the only one it
+/// will be handed back later.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ObReferenceObjectByHandle;
+
+impl KernelExport for ObReferenceObjectByHandle {
+    fn ordinal(&self) -> u16 {
+        ordinal::OB_REFERENCE_OBJECT_BY_HANDLE
+    }
+
+    fn name(&self) -> &'static str {
+        "ObReferenceObjectByHandle"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        12
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // ObReferenceObjectByHandle(Handle, ObjectType, ReturnedObject).
+        let Some(handle) = stack_argument(context, 0).filter(|handle| *handle != 0) else {
+            return KernelStatus::INVALID_HANDLE;
+        };
+        let object_out = stack_argument(context, 2).unwrap_or(0);
+        if object_out != 0 && context.memory.write_u32(GuestVa(object_out), handle).is_err() {
+            return KernelStatus::INVALID_PARAMETER;
+        }
+        KernelStatus::SUCCESS
+    }
+}
+
+/// Releases a reference taken on an object.
+///
+/// Nothing is counted, because nothing was allocated to count: the
+/// reference above hands back the handle itself. It takes its object in a
+/// register rather than on the stack, so it clears no stack of its own.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ObfDereferenceObject;
+
+impl KernelExport for ObfDereferenceObject {
+    fn ordinal(&self) -> u16 {
+        ordinal::OBF_DEREFERENCE_OBJECT
+    }
+
+    fn name(&self) -> &'static str {
+        "ObfDereferenceObject"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        0
+    }
+
+    fn call(&self, _context: &mut KernelCallContext<'_>) -> KernelStatus {
+        KernelStatus::SUCCESS
+    }
+}
+
+/// Gives up the rest of the calling thread's turn.
+///
+/// A title calls this while it waits for work another thread is doing, so
+/// a caller that is told nothing else was ready will call it again
+/// immediately; under the cooperative scheduler (ADR 0011) that is a
+/// yield that costs a turn rather than one that spins the processor.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NtYieldExecution;
+
+impl KernelExport for NtYieldExecution {
+    fn ordinal(&self) -> u16 {
+        ordinal::NT_YIELD_EXECUTION
+    }
+
+    fn name(&self) -> &'static str {
+        "NtYieldExecution"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        0
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        if context.services.yield_thread() {
+            KernelStatus::SUCCESS
+        } else {
+            // `STATUS_NO_YIELD_PERFORMED`: nothing else was ready to run.
+            KernelStatus(0x4000_0024)
         }
     }
 }
@@ -724,7 +823,7 @@ mod tests {
         // four Av video exports, one Nt virtual-memory export, seven Nt
         // file exports, six Mm exports, four symbolic-link exports, two Xe
         // section exports, one benign success export, and two startup stubs.
-        assert_eq!(registry.len(), 74);
+        assert_eq!(registry.len(), 77);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,

@@ -945,6 +945,16 @@ impl KernelServices for ThreadManager {
         }
     }
 
+    fn yield_thread(&mut self) -> bool {
+        // Whether any thread other than the caller is ready to be given
+        // the turn. The rotation itself happens on the run loop's own
+        // slice boundary, where the processor state is the loop's to move.
+        let count = self.threads.len();
+        (1..count)
+            .map(|offset| (self.current + offset) % count)
+            .any(|index| self.threads[index].state == ThreadState::Ready)
+    }
+
     fn wait_for_object(&mut self, handle: u32) -> Result<WaitOutcome, KernelServiceError> {
         tracing::debug!(
             handle = format_args!("{handle:#x}"),
