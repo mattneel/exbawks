@@ -271,6 +271,18 @@ The project follows Keep a Changelog structure before its first release.
 
 ### Changed
 
+- `exbawks run --unfiltered` takes the nearest texel instead of blending
+  four, which draws about a third faster and looks coarser. Blending is
+  what this title asks for and costs 24 of the 79 seconds a run spends;
+  trading it is a choice for someone who wants to play rather than
+  something decided for them. It changes the frame, so a run using it may
+  not record a golden.
+
+  Where a run's time goes, measured by removing one stage at a time:
+  8 seconds of guest and geometry, 24 in the combiner, 24 in filtering,
+  about 13 in the rest of sampling, and about 9 in the remaining
+  per-pixel work. Ninety percent of a run is pixels.
+
 - Drawing is about twice as fast: a full run of this title went from 186
   seconds to 85. The graphics engine now takes guest RAM once for a whole
   batch of submissions and addresses it physically, rather than going

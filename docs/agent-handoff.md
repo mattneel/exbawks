@@ -674,7 +674,11 @@ Two active threads:
    difference, and accumulated rounding error that moved pixels at a
    triangle's edge — the frame digest changed. Decoding a whole compressed
    block and caching it made a run **slower** (84 to 113 seconds), because
-   a sample wants one texel to four of the sixteen.
+   a sample wants one texel to four of the sixteen. Compiling the combiner
+   program once per draw — decoding its control words into a struct rather
+   than extracting bits per pixel — was **also slower** (78 to 108
+   seconds), which is worth knowing before anyone tries it again: the bit
+   extraction is not what the combiner spends its time on.
 
    The shape of the remaining cost: 22.1 million triangles for 388 million
    shaded pixels is **17.5 pixels per triangle**, so per-triangle setup is

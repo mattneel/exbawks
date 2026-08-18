@@ -158,6 +158,11 @@ struct RunArgs {
     /// Shows what the title is drawing in a window. Closing it ends the run.
     #[arg(long)]
     display: bool,
+    /// Takes the nearest texel instead of blending four, which draws about
+    /// a third faster and looks coarser. Changes the frame, so a run using
+    /// it may not record a golden.
+    #[arg(long)]
+    unfiltered: bool,
     /// Reports every guest write to this address, with its writer.
     #[arg(long, value_parser = parse_u32)]
     watch_write: Option<u32>,
@@ -283,6 +288,7 @@ fn main() -> Result<()> {
                 gamepad,
                 gamepad_live,
                 display,
+                unfiltered,
                 watch_write,
                 frame_digest,
                 expect_frame,
@@ -312,6 +318,7 @@ fn main() -> Result<()> {
                     gamepad,
                     gamepad_live,
                     display,
+                    unfiltered,
                     watch_write,
                     frame_digest,
                     expect_frame: expect_frame.as_deref(),
@@ -640,6 +647,8 @@ struct RunOptions<'a> {
     gamepad_live: bool,
     /// Whether to show what the title draws in a window.
     display: bool,
+    /// Whether samples take the nearest texel rather than blending four.
+    unfiltered: bool,
     /// A guest address whose writers should be reported.
     watch_write: Option<u32>,
     /// Whether to print the captured frame's digest.
@@ -667,6 +676,7 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
         gamepad,
         gamepad_live,
         display,
+        unfiltered,
         watch_write,
         frame_digest,
         expect_frame,
@@ -702,6 +712,7 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
         Ok(hdd) => emulator.set_hdd_root(hdd),
         Err(error) => eprintln!("warning: no writable hard-disk mount: {error:#}"),
     }
+    emulator.set_unfiltered(unfiltered);
     if display {
         let name = path.file_name().map_or_else(
             || "Exbawks".to_owned(),

@@ -141,68 +141,95 @@ fn mip_level(
     (level.round() as u32).min(levels - 1)
 }
 
-/// The texel a coordinate lands on, with no blending.
-fn sample_nearest(texture: &dyn TextureSource, level: u32, u: f32, v: f32) -> u32 {
-    // The floor, not a truncation: a negative coordinate must land in the
-    // tile below zero, not back in the first one.
-    let [mode_u, mode_v] = texture.addressing();
-    texture.texel_in(
-        level,
-        address_texel(mode_u, u.floor() as i64, texture.width_in(level)),
-        address_texel(mode_v, v.floor() as i64, texture.height_in(level)),
-    )
-}
-
-/// The four texels around a coordinate, blended by how near it is to each.
+/// What a bound texture unit contributes, gathered once per triangle.
 ///
-/// A title that asks for a filtered sample and gets the nearest texel sees
-/// its art in blocks, which is most of the difference between a rendered
-/// surface and a rendered mosaic. Minification still reads the base level:
-/// the mip chain a title supplies is not selected between.
-fn sample_filtered(texture: &dyn TextureSource, level: u32, u: f32, v: f32) -> u32 {
-    // Texel centres sit at the half, so the blend is between the texels
-    // either side of the sample rather than biased to one of them.
-    let (u, v) = (u - 0.5, v - 0.5);
-    let (left, top) = (u.floor(), v.floor());
-    let (fraction_u, fraction_v) = (u - left, v - top);
-    let [mode_u, mode_v] = texture.addressing();
-    let (width, height) = (texture.width_in(level), texture.height_in(level));
-
-    // A guest hands over its texture coordinates as raw float bits, so the
-    // scaled value can saturate the cast; reaching for the neighbouring
-    // texel must not then overflow.
-    let column = |offset: i64| address_texel(mode_u, (left as i64).saturating_add(offset), width);
-    let row = |offset: i64| address_texel(mode_v, (top as i64).saturating_add(offset), height);
-    let (x0, x1, y0, y1) = (column(0), column(1), row(0), row(1));
-    let corners = [
-        texture.texel_in(level, x0, y0),
-        texture.texel_in(level, x1, y0),
-        texture.texel_in(level, x0, y1),
-        texture.texel_in(level, x1, y1),
-    ];
-    let weights = [
-        (1.0 - fraction_u) * (1.0 - fraction_v),
-        fraction_u * (1.0 - fraction_v),
-        (1.0 - fraction_u) * fraction_v,
-        fraction_u * fraction_v,
-    ];
-
-    let mut blended = 0_u32;
-    for shift in [0, 8, 16, 24] {
-        let channel: f32 =
-            (0..4).map(|corner| ((corners[corner] >> shift) & 0xFF) as f32 * weights[corner]).sum();
-        blended |= ((channel + 0.5).clamp(0.0, 255.0) as u32) << shift;
-    }
-    blended
+/// A sample otherwise asks the texture its extent, its addressing, and
+/// whether it filters, through a trait object, for every corner of every
+/// pixel — seven such calls a sample, none of which change while a
+/// triangle is being drawn.
+struct Sampler<'a> {
+    texture: &'a dyn TextureSource,
+    level: u32,
+    width: u32,
+    height: u32,
+    mode_u: u32,
+    mode_v: u32,
+    filtered: bool,
 }
+
+impl Sampler<'_> {
+    /// The colour at one coordinate, in texels.
+    fn sample(&self, u: f32, v: f32) -> u32 {
+        if self.filtered { self.filtered_at(u, v) } else { self.nearest_at(u, v) }
+    }
+
+    /// The texel a coordinate lands on, with no blending.
+    fn nearest_at(&self, u: f32, v: f32) -> u32 {
+        // The floor, not a truncation: a negative coordinate must land in
+        // the tile below zero, not back in the first one.
+        self.texture.texel_in(
+            self.level,
+            address_texel(self.mode_u, u.floor() as i64, self.width),
+            address_texel(self.mode_v, v.floor() as i64, self.height),
+        )
+    }
+
+    /// The four texels around a coordinate, blended by how near it is to
+    /// each.
+    fn filtered_at(&self, u: f32, v: f32) -> u32 {
+        // Texel centres sit at the half, so the blend is between the
+        // texels either side rather than biased to one of them.
+        let (u, v) = (u - 0.5, v - 0.5);
+        let (left, top) = (u.floor(), v.floor());
+        let (fraction_u, fraction_v) = (u - left, v - top);
+
+        // A guest hands over its coordinates as raw float bits, so the
+        // scaled value can saturate the cast; reaching for the
+        // neighbouring texel must not then overflow.
+        let column = |offset: i64| {
+            address_texel(self.mode_u, (left as i64).saturating_add(offset), self.width)
+        };
+        let row = |offset: i64| {
+            address_texel(self.mode_v, (top as i64).saturating_add(offset), self.height)
+        };
+        let (x0, x1, y0, y1) = (column(0), column(1), row(0), row(1));
+        let corners = [
+            self.texture.texel_in(self.level, x0, y0),
+            self.texture.texel_in(self.level, x1, y0),
+            self.texture.texel_in(self.level, x0, y1),
+            self.texture.texel_in(self.level, x1, y1),
+        ];
+        let weights = [
+            (1.0 - fraction_u) * (1.0 - fraction_v),
+            fraction_u * (1.0 - fraction_v),
+            (1.0 - fraction_u) * fraction_v,
+            fraction_u * fraction_v,
+        ];
+
+        let mut blended = 0_u32;
+        for shift in [0, 8, 16, 24] {
+            let channel: f32 = (0..4)
+                .map(|corner| ((corners[corner] >> shift) & 0xFF) as f32 * weights[corner])
+                .sum();
+            blended |= ((channel + 0.5).clamp(0.0, 255.0) as u32) << shift;
+        }
+        blended
+    }
+}
+
+/// What an unbound texture unit reads, which is white.
+const WHITE_CHANNELS: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+/// One over the largest channel value, so unpacking multiplies.
+const CHANNEL_SCALE: f32 = 1.0 / 255.0;
 
 /// Splits an 8-bit ARGB color into the combiner's float channels.
 fn unpack_channels(color: u32) -> [f32; 4] {
     [
-        ((color >> 16) & 0xFF) as f32 / 255.0,
-        ((color >> 8) & 0xFF) as f32 / 255.0,
-        (color & 0xFF) as f32 / 255.0,
-        ((color >> 24) & 0xFF) as f32 / 255.0,
+        ((color >> 16) & 0xFF) as f32 * CHANNEL_SCALE,
+        ((color >> 8) & 0xFF) as f32 * CHANNEL_SCALE,
+        (color & 0xFF) as f32 * CHANNEL_SCALE,
+        ((color >> 24) & 0xFF) as f32 * CHANNEL_SCALE,
     ]
 }
 
@@ -369,6 +396,13 @@ fn combine(state: BlendState, source: u32, destination: u32) -> u32 {
     out
 }
 
+/// Whether to take the nearest texel rather than blending four.
+///
+/// Blending is what a title asks for and costs about a third of the time
+/// a run spends drawing. Turning it off trades that fidelity for a frame
+/// rate someone can play at, so it is a choice a person makes rather than
+/// something decided for them.
+///
 /// Which faces are discarded before they are drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CullState {
@@ -413,6 +447,10 @@ impl AlphaTest {
 /// Everything a primitive is drawn under besides its geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PipelineState {
+    /// Whether texture samples take the nearest texel rather than blending
+    /// four of them, trading the filtering a title asked for against the
+    /// time it costs.
+    pub unfiltered: bool,
     /// How a drawn pixel combines with the surface.
     pub blend: BlendState,
     /// How a fragment is compared against the depth surface.
@@ -498,10 +536,26 @@ pub fn fill_triangle(
         return 0;
     }
 
-    // One level per unit for the whole triangle, chosen before the loop.
-    let levels: [u32; 4] = std::array::from_fn(|unit| {
-        textures[unit].map_or(0, |texture| mip_level(texture, [a, b, c], unit, area))
+    // Everything about each bound unit that holds for the whole triangle:
+    // its level, that level's extent, how it addresses, and whether it
+    // blends. Asking the texture per pixel is asking it per corner.
+    let samplers: [Option<Sampler<'_>>; 4] = std::array::from_fn(|unit| {
+        let texture = textures[unit]?;
+        let level = mip_level(texture, [a, b, c], unit, area);
+        let [mode_u, mode_v] = texture.addressing();
+        Some(Sampler {
+            texture,
+            level,
+            width: texture.width_in(level),
+            height: texture.height_in(level),
+            mode_u,
+            mode_v,
+            filtered: texture.filtered() && !state.unfiltered,
+        })
     });
+    // Whether the combiner has a program at all, decided once rather than
+    // per pixel: an unprogrammed one would build its registers, run
+    // nothing, and report nothing, for every pixel of every triangle.
     // Whether the combiner has a program at all, decided once rather than
     // per pixel: an unprogrammed one would build its registers, run
     // nothing, and report nothing, for every pixel of every triangle.
@@ -560,7 +614,7 @@ pub fn fill_triangle(
             let scale = if inverse_w == 0.0 { 1.0 } else { 1.0 / inverse_w };
             let mut texels = [None; 4];
             for (unit, sampled) in texels.iter_mut().enumerate() {
-                let Some(texture) = textures[unit] else {
+                let Some(sampler) = samplers[unit].as_ref() else {
                     continue;
                 };
                 let coordinate = |axis: usize| {
@@ -569,14 +623,10 @@ pub fn fill_triangle(
                         + weights[2] * c.texcoords[unit][axis] * c.inverse_w)
                         * scale
                 };
-                let level = levels[unit];
-                let scaled_u = coordinate(0) * texture.width_in(level) as f32;
-                let scaled_v = coordinate(1) * texture.height_in(level) as f32;
-                *sampled = Some(if texture.filtered() {
-                    sample_filtered(texture, level, scaled_u, scaled_v)
-                } else {
-                    sample_nearest(texture, level, scaled_u, scaled_v)
-                });
+                *sampled = Some(sampler.sample(
+                    coordinate(0) * sampler.width as f32,
+                    coordinate(1) * sampler.height as f32,
+                ));
             }
             // Without a combiner program the first unit modulates the
             // vertex color, which is what an unprogrammed stage does.
@@ -587,15 +637,20 @@ pub fn fill_triangle(
             // pipeline's real color stage: they replace the fixed modulate
             // above, which is only what an unprogrammed stage would do.
             if let Some(combiner) = programmed {
-                let registers = crate::CombinerRegisters {
+                // An unbound unit reads white, so a stage that modulates
+                // by one leaves its other input alone. Unpacking that
+                // white for every unit a title never bound is four
+                // conversions a pixel spent on a constant.
+                let mut registers = crate::CombinerRegisters {
                     diffuse: unpack_channels(diffuse),
-                    // An unbound unit reads white, so a stage that
-                    // modulates by one leaves its other input alone.
-                    textures: std::array::from_fn(|unit| {
-                        unpack_channels(texels[unit].unwrap_or(0xFFFF_FFFF))
-                    }),
+                    textures: [WHITE_CHANNELS; 4],
                     ..crate::CombinerRegisters::default()
                 };
+                for (unit, sampled) in texels.iter().enumerate() {
+                    if let Some(texel) = sampled {
+                        registers.textures[unit] = unpack_channels(*texel);
+                    }
+                }
                 if let Some(computed) = crate::evaluate_combiner(combiner, &registers) {
                     color = computed;
                 }
@@ -631,6 +686,35 @@ pub fn fill_triangle(
 
 #[cfg(test)]
 mod tests {
+    /// A sampler over a whole texture, for the tests below.
+    fn sampler_over(texture: &dyn TextureSource, level: u32, filtered: bool) -> Sampler<'_> {
+        let [mode_u, mode_v] = texture.addressing();
+        Sampler {
+            texture,
+            level,
+            width: texture.width_in(level),
+            height: texture.height_in(level),
+            mode_u,
+            mode_v,
+            filtered,
+        }
+    }
+
+    /// A filtered sample at the base level.
+    fn filtered_sample(texture: &dyn TextureSource, u: f32, v: f32) -> u32 {
+        sampler_over(texture, 0, true).filtered_at(u, v)
+    }
+
+    /// A filtered sample at one level.
+    fn filtered_sample_at(texture: &dyn TextureSource, level: u32, u: f32, v: f32) -> u32 {
+        sampler_over(texture, level, true).filtered_at(u, v)
+    }
+
+    /// The nearest texel at one level.
+    fn nearest_sample(texture: &dyn TextureSource, level: u32, u: f32, v: f32) -> u32 {
+        sampler_over(texture, level, false).nearest_at(u, v)
+    }
+
     use std::sync::Mutex;
 
     use super::*;
@@ -935,9 +1019,9 @@ mod tests {
     #[test]
     fn a_sample_reads_the_level_it_was_given() {
         let texture = Chain(std::cell::Cell::new(0));
-        sample_nearest(&texture, 3, 0.5, 0.5);
+        nearest_sample(&texture, 3, 0.5, 0.5);
         assert_eq!(texture.0.get(), 3, "the nearest sample reads its level");
-        sample_filtered(&texture, 5, 0.5, 0.5);
+        filtered_sample_at(&texture, 5, 0.5, 0.5);
         assert_eq!(texture.0.get(), 5, "and so does the filtered one");
     }
 
@@ -948,31 +1032,31 @@ mod tests {
         // saturates the cast. Reaching for the neighbouring texel then
         // overflows, which panics wherever overflow checks are on.
         for coordinate in [1e20_f32, f32::INFINITY, -f32::INFINITY, f32::MAX, f32::NAN] {
-            let _ = sample_filtered(&Corners, 0, coordinate, 0.5);
-            let _ = sample_filtered(&Corners, 0, 0.5, coordinate);
-            let _ = sample_nearest(&Corners, 0, coordinate, coordinate);
+            let _ = filtered_sample(&Corners, coordinate, 0.5);
+            let _ = filtered_sample(&Corners, 0.5, coordinate);
+            let _ = nearest_sample(&Corners, 0, coordinate, coordinate);
         }
     }
 
     #[test]
     fn a_filtered_sample_blends_the_texels_around_it() {
         // Dead on a texel centre the blend returns that texel alone.
-        assert_eq!(sample_filtered(&Corners, 0, 0.5, 0.5), 0xFF00_0000, "the first texel");
-        assert_eq!(sample_filtered(&Corners, 0, 1.5, 0.5), 0xFFFF_FFFF, "and its neighbour");
+        assert_eq!(filtered_sample(&Corners, 0.5, 0.5), 0xFF00_0000, "the first texel");
+        assert_eq!(filtered_sample(&Corners, 1.5, 0.5), 0xFFFF_FFFF, "and its neighbour");
 
         // Halfway between them it is the average of the two, which is
         // what turns a mosaic back into a gradient.
-        let midpoint = sample_filtered(&Corners, 0, 1.0, 0.5);
+        let midpoint = filtered_sample(&Corners, 1.0, 0.5);
         let channel = midpoint & 0xFF;
         assert!((127..=128).contains(&channel), "halfway is halfway: {channel}");
 
         // The centre of the texture touches all four corners equally, and
         // two of them are white.
-        let centre = sample_filtered(&Corners, 0, 1.0, 1.0) & 0xFF;
+        let centre = filtered_sample(&Corners, 1.0, 1.0) & 0xFF;
         assert!((127..=128).contains(&centre), "the middle averages four: {centre}");
 
         // Alpha is blended like any other channel, not dropped.
-        assert_eq!(sample_filtered(&Corners, 0, 0.5, 0.5) >> 24, 0xFF);
+        assert_eq!(filtered_sample(&Corners, 0.5, 0.5) >> 24, 0xFF);
     }
 
     #[test]

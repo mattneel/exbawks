@@ -763,6 +763,8 @@ pub struct PushbufferEngine {
     busiest_layout: (bool, Vec<(u32, u32, u32, u32)>),
     /// That draw's texgen modes and matrix enables.
     busiest_texgen: ([[u32; 4]; TEXTURE_UNITS], [bool; TEXTURE_UNITS]),
+    /// Whether samples take the nearest texel rather than blending four.
+    unfiltered: bool,
     /// The combiner configuration the last draw ran under. Printing it is
     /// how a decode of the title's own program gets checked against what
     /// the color on screen looks like.
@@ -1781,6 +1783,7 @@ impl PushbufferEngine {
                 state.texture_dma[selector]
             });
             let pipeline = crate::PipelineState {
+                unfiltered: self.unfiltered,
                 blend: crate::BlendState {
                     enabled: state.blend,
                     source: state.blend_source,
@@ -2536,6 +2539,11 @@ impl PushbufferEngine {
     #[must_use]
     pub fn busiest_textures(&self) -> [Option<BoundTexture>; TEXTURE_UNITS] {
         self.busiest_textures
+    }
+
+    /// Takes the nearest texel rather than blending four of them.
+    pub fn set_unfiltered(&mut self, unfiltered: bool) {
+        self.unfiltered = unfiltered;
     }
 
     /// The combiner programs that shaded the most pixels, with the pixels

@@ -1429,6 +1429,12 @@ impl Emulator {
         }
     }
 
+    /// Takes the nearest texel rather than blending four of them, which
+    /// trades the filtering a title asked for against the time it costs.
+    pub fn set_unfiltered(&mut self, unfiltered: bool) {
+        self.gpu_pusher.set_unfiltered(unfiltered);
+    }
+
     /// Opens a window showing what the title draws, and reports whether
     /// one could be opened.
     ///
