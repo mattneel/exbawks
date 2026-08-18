@@ -95,6 +95,23 @@ pub struct FileInfo {
     pub directory: bool,
 }
 
+/// One interrupt object's service routine, as the guest described it.
+///
+/// A title connects an interrupt and then waits: without the routine
+/// recorded here there is nothing for a device to call, which is why its
+/// USB stack initialises once and stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterruptRoutine {
+    /// The guest `KINTERRUPT` object the routine belongs to.
+    pub object: u32,
+    /// The service routine's guest address.
+    pub routine: u32,
+    /// The context pointer the routine is called with.
+    pub context: u32,
+    /// The interrupt vector it is connected to.
+    pub vector: u32,
+}
+
 /// The scanned-out display mode a title programmed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisplayMode {
@@ -294,6 +311,20 @@ pub trait KernelServices {
 
     /// Records the display mode a title programmed on the video encoder.
     fn set_display_mode(&mut self, _mode: DisplayMode) {}
+
+    /// Records an interrupt object's service routine, so the runtime can
+    /// call it when a modelled device raises that vector.
+    fn set_interrupt_routine(&mut self, _interrupt: InterruptRoutine) {}
+
+    /// Marks an interrupt object connected or disconnected. A routine is
+    /// only called while it is connected.
+    fn connect_interrupt(&mut self, _object: u32, _connected: bool) {}
+
+    /// Queues a deferred procedure call, reporting whether it was not
+    /// already queued.
+    fn queue_dpc(&mut self, _dpc: u32) -> bool {
+        false
+    }
 
     /// Resumes a suspended thread, returning its previous suspend count.
     fn resume_thread(&mut self, _handle: u32) -> Result<u32, KernelServiceError> {

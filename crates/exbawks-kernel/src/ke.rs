@@ -18,6 +18,7 @@ const NOTIFICATION_TIMER_TYPE: u32 = 8;
 /// Registers the Ke dispatcher-object exports.
 pub(crate) fn register_ke_exports(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register(KeInitializeDpc)?;
+    registry.register(KeInsertQueueDpc)?;
     registry.register(KeInitializeTimerEx)?;
     registry.register(KeSetTimer)?;
     registry.register(KeQuerySystemTime)?;
@@ -69,6 +70,46 @@ impl KernelExport for KeQuerySystemTime {
 /// `KTIMER.DueTime` (a `LARGE_INTEGER`) and `KTIMER.Dpc` field offsets.
 const TIMER_DUE_TIME: u32 = 0x10;
 const TIMER_DPC: u32 = 0x20;
+
+/// Queues a guest `KDPC` for the runtime to call.
+///
+/// An interrupt service routine does almost nothing itself: it
+/// acknowledges the device and queues this, and the deferred routine does
+/// the work at a lower interrupt level. A driver whose deferred routine
+/// never runs has serviced the interrupt and thrown the result away.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KeInsertQueueDpc;
+
+impl KernelExport for KeInsertQueueDpc {
+    fn ordinal(&self) -> u16 {
+        crate::ordinal::KE_INSERT_QUEUE_DPC
+    }
+
+    fn name(&self) -> &'static str {
+        "KeInsertQueueDpc"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        12
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        let (Some(dpc), Some(first), Some(second)) =
+            (stack_argument(context, 0), stack_argument(context, 1), stack_argument(context, 2))
+        else {
+            return KernelStatus(0);
+        };
+        if dpc == 0 {
+            return KernelStatus(0);
+        }
+        // The caller's two arguments are held in the object until the
+        // deferred routine is called with them.
+        let _ = context.memory.write_u32(GuestVa(dpc + 0x14), first);
+        let _ = context.memory.write_u32(GuestVa(dpc + 0x18), second);
+        // BOOLEAN: TRUE when the object was not already queued.
+        KernelStatus(u32::from(context.services.queue_dpc(dpc)))
+    }
+}
 
 /// Initializes a guest `KDPC` with its deferred routine and context.
 #[derive(Debug, Default, Clone, Copy)]
@@ -229,6 +270,109 @@ mod tests {
         assert_eq!(memory.read_u32(GuestVa(dpc)).unwrap(), DPC_OBJECT_TYPE);
         assert_eq!(memory.read_u32(GuestVa(dpc + 0x0C)).unwrap(), 0xAABB_CCDD);
         assert_eq!(memory.read_u32(GuestVa(dpc + 0x10)).unwrap(), 0x1234_5678);
+    }
+
+    /// A services object that records what was queued.
+    #[derive(Default)]
+    struct RecordingServices {
+        queued: Vec<u32>,
+    }
+
+    impl crate::KernelServices for RecordingServices {
+        fn create_thread(
+            &mut self,
+            _request: crate::ThreadCreateRequest,
+        ) -> Result<crate::ThreadCreated, crate::KernelServiceError> {
+            Err(crate::KernelServiceError::Unsupported)
+        }
+
+        fn exit_current_thread(&mut self, _status: u32) {}
+
+        fn close_handle(&mut self, _handle: u32) -> bool {
+            false
+        }
+
+        fn allocate_virtual_memory(
+            &mut self,
+            _request: crate::VirtualAllocRequest,
+        ) -> Result<crate::VirtualAllocation, crate::KernelServiceError> {
+            Err(crate::KernelServiceError::Unsupported)
+        }
+
+        fn queue_dpc(&mut self, dpc: u32) -> bool {
+            if self.queued.contains(&dpc) {
+                return false;
+            }
+            self.queued.push(dpc);
+            true
+        }
+    }
+
+    #[test]
+    fn insert_queue_dpc_stores_its_arguments_and_queues_once() {
+        let memory = SoftwareAddressSpace::new(64 * 1024).expect("memory is valid");
+        let range = GuestRange::page_aligned(GuestVa(0x1000), 2 * u64::from(GUEST_PAGE_SIZE))
+            .expect("range is valid");
+        memory
+            .map_anonymous(range, MemoryPermissions::READ | MemoryPermissions::WRITE)
+            .expect("mapping succeeds");
+        let dpc = 0x1100_u32;
+        // [esp]=return, then Dpc, SystemArgument1, SystemArgument2.
+        for (slot, value) in [dpc, 0x1111_2222, 0x3333_4444].iter().enumerate() {
+            memory.write_u32(GuestVa(0x2004 + slot as u32 * 4), *value).expect("write");
+        }
+        let mut cpu = CpuState::default();
+        cpu.gpr[4] = 0x2000;
+        let mut services = RecordingServices::default();
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut services,
+            stop_request: None,
+        };
+
+        // The deferred routine is called with these later, so they have to
+        // reach the object rather than being dropped.
+        assert_eq!(KeInsertQueueDpc.call(&mut context), KernelStatus(1));
+        assert_eq!(memory.read_u32(GuestVa(dpc + 0x14)).unwrap(), 0x1111_2222);
+        assert_eq!(memory.read_u32(GuestVa(dpc + 0x18)).unwrap(), 0x3333_4444);
+        assert_eq!(services.queued, vec![dpc]);
+
+        // Queueing the same object again reports false, as the kernel does
+        // for one already on the queue.
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut services,
+            stop_request: None,
+        };
+        assert_eq!(KeInsertQueueDpc.call(&mut context), KernelStatus(0));
+        assert_eq!(services.queued, vec![dpc], "and it is not queued twice");
+    }
+
+    #[test]
+    fn insert_queue_dpc_refuses_a_null_object() {
+        let memory = SoftwareAddressSpace::new(64 * 1024).expect("memory is valid");
+        let range = GuestRange::page_aligned(GuestVa(0x1000), 2 * u64::from(GUEST_PAGE_SIZE))
+            .expect("range is valid");
+        memory
+            .map_anonymous(range, MemoryPermissions::READ | MemoryPermissions::WRITE)
+            .expect("mapping succeeds");
+        for slot in 0..3 {
+            memory.write_u32(GuestVa(0x2004 + slot * 4), 0).expect("write");
+        }
+        let mut cpu = CpuState::default();
+        cpu.gpr[4] = 0x2000;
+        let mut services = RecordingServices::default();
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut services,
+            stop_request: None,
+        };
+
+        assert_eq!(KeInsertQueueDpc.call(&mut context), KernelStatus(0));
+        assert!(services.queued.is_empty(), "a null object queues nothing");
     }
 
     #[test]

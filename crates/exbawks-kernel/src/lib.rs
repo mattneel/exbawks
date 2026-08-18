@@ -57,8 +57,8 @@ pub use rtl::{
     RtlLeaveCriticalSection, RtlNtStatusToDosError,
 };
 pub use services::{
-    DisplayMode, FileInfo, FileOpenRequest, FileOpened, KernelServiceError, KernelServices,
-    ThreadCreateRequest, ThreadCreated, UnsupportedServices, VirtualAllocRequest,
+    DisplayMode, FileInfo, FileOpenRequest, FileOpened, InterruptRoutine, KernelServiceError,
+    KernelServices, ThreadCreateRequest, ThreadCreated, UnsupportedServices, VirtualAllocRequest,
     VirtualAllocation, WaitOutcome,
 };
 pub use startup::{

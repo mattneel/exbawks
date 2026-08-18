@@ -488,14 +488,29 @@ Two active threads:
    interrupts at all, so no ISR runs, no DPC is queued, and nothing
    enumerates.
 
-   **Interrupt delivery is therefore the next piece**, and it need not be a
-   programmable interrupt controller. The kernel is high-level emulated, so
-   `KeConnectInterrupt` can record the guest's ISR address and the runtime
-   can call it on the guest processor when a modelled device raises one,
-   then drain the DPC queue — which fits the cooperative scheduler of
-   ADR 0011 and avoids emulating a PIC, an IDT, and hypervisor interrupt
-   injection. Timers not firing (`KeSetTimer` records and does nothing) is
-   the same shape of gap and probably the same fix.
+   **Interrupt delivery now exists**, and it needed no programmable
+   interrupt controller: `KeInitializeInterrupt` records the guest's
+   service routine, `KeConnectInterrupt` marks it live, and the runtime
+   calls it on the guest processor between instructions when a device
+   raises one, restoring the displaced state when it returns.
+   `KeInsertQueueDpc` queues the deferred procedure and the runtime calls
+   that too. The vectors this title connects are **49 (USB), 51, 53, and
+   55** — `HalGetInterruptVector` maps IRQ *n* to vector `0x30 + n`, so
+   USB is IRQ 1.
+
+   The chain runs end to end: the gamepad is attached once the driver has
+   its controller running and an interrupt connected (a device present
+   before that is announced and then swept away by the driver's own
+   initialisation, exactly as a controller plugged in before the console is
+   switched on would be), the service routine is called and returns TRUE,
+   its deferred procedure runs, and the driver writes the root port back.
+
+   **Enumeration is the next step**: the driver acknowledges the port and
+   stops, because nothing yet walks the endpoint and transfer descriptors
+   it builds to answer `GET_DESCRIPTOR`, `SET_ADDRESS`, and
+   `SET_CONFIGURATION`. `OhciController` has the done queue and list heads
+   ready for it. Timers still do not fire (`KeSetTimer` records and does
+   nothing); that is the same shape of gap and probably the same fix.
 
 2. **Kernel HLE burndown** (substrate-independent, needed under either
    engine). Done this session, in order the retail image demanded them:

@@ -7,6 +7,7 @@
 
 use exbawks_types::GuestVa;
 
+use crate::startup::stack_argument;
 use crate::{KernelCallContext, KernelError, KernelExport, KernelRegistry, KernelStatus};
 
 /// `KPCR.Irql` (Xbox layout).
@@ -93,9 +94,9 @@ impl KernelExport for HalReadWritePCISpace {
 
 /// Fills a guest `KINTERRUPT` object.
 ///
-/// Devices are HLE and no interrupt is ever delivered, so recording the
-/// caller's routine is unnecessary; the object just has to exist for the
-/// later connect call.
+/// The caller's service routine is recorded here, because a modelled
+/// device that raises an interrupt has to call it: a title's USB stack
+/// connects an interrupt and then does nothing until one arrives.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct KeInitializeInterrupt;
 
@@ -112,7 +113,22 @@ impl KernelExport for KeInitializeInterrupt {
         28
     }
 
-    fn call(&self, _context: &mut KernelCallContext<'_>) -> KernelStatus {
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // KeInitializeInterrupt(Interrupt, ServiceRoutine, ServiceContext,
+        //                       Vector, Irql, InterruptMode, ShareVector)
+        // Argument zero is the first: `[esp]` holds the return address.
+        let object = stack_argument(context, 0).unwrap_or(0);
+        let routine = stack_argument(context, 1).unwrap_or(0);
+        let service_context = stack_argument(context, 2).unwrap_or(0);
+        let vector = stack_argument(context, 3).unwrap_or(0);
+        if object != 0 && routine != 0 {
+            context.services.set_interrupt_routine(crate::InterruptRoutine {
+                object,
+                routine,
+                context: service_context,
+                vector,
+            });
+        }
         KernelStatus::SUCCESS
     }
 }
@@ -134,8 +150,12 @@ impl KernelExport for KeConnectInterrupt {
         4
     }
 
-    fn call(&self, _context: &mut KernelCallContext<'_>) -> KernelStatus {
-        // BOOLEAN TRUE in AL: the interrupt is "connected" (never fired).
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        let object = stack_argument(context, 0).unwrap_or(0);
+        if object != 0 {
+            context.services.connect_interrupt(object, true);
+        }
+        // BOOLEAN TRUE in AL: the interrupt is connected.
         KernelStatus(1)
     }
 }

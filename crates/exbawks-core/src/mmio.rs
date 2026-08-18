@@ -157,6 +157,12 @@ impl DeviceSpace {
         }
     }
 
+    /// Whether the USB controller is asking for an interrupt.
+    #[must_use]
+    pub fn usb_interrupt_pending(&self) -> bool {
+        self.usb.lock().unwrap_or_else(std::sync::PoisonError::into_inner).interrupt_pending()
+    }
+
     /// Reads and writes per USB register offset.
     #[must_use]
     pub fn usb_accesses(&self) -> [(u64, u64); 32] {

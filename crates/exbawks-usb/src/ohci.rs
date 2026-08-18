@@ -336,6 +336,10 @@ impl OhciController {
         self.port_writes = writes;
         if attached {
             self.port_status |= port::CONNECTED | port::CONNECT_CHANGE;
+            // The change survives the reset, so it has to be announced
+            // again: a driver that resets the controller after a device
+            // appeared would otherwise never hear about it.
+            self.raise(INTERRUPT_ROOT_HUB_CHANGE);
         }
     }
 

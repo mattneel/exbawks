@@ -190,6 +190,19 @@ const MAX_CAPTURE_BYTES: u64 = 64 * 1024 * 1024;
 /// clock, which is what a title's `rdtsc`-based pacing expects.
 const XBOX_TSC_PER_MILLISECOND: u64 = 733_333;
 
+/// The address a called interrupt routine returns to.
+///
+/// It sits beside the thread exit sentinel and is equally unmapped, so the
+/// routine's own `ret` faults on the fetch and the run loop recognises the
+/// address as the end of the call rather than as a guest error.
+const INTERRUPT_RETURN_SENTINEL: GuestVa = GuestVa(0xFFBF_FFE8);
+
+/// The interrupt vector the first USB host controller is wired to.
+///
+/// A title asks the abstraction layer for it and connects a routine there;
+/// this one lands on vector forty-nine, which is the first bus interrupt.
+const USB_INTERRUPT_VECTOR: u32 = 49;
+
 /// The guest address of the global descriptor table.
 ///
 /// It sits on the second physical page, inside the low range the loader
@@ -275,6 +288,8 @@ impl EmulatorBuilder {
             devices: crate::mmio::DeviceSpace::default(),
             gpu_pusher: exbawks_gpu::PushbufferEngine::default(),
             gdt_fs_base: std::cell::Cell::new(u32::MAX),
+            gamepad_wanted: false,
+            interrupted: None,
             watch_write: None,
             brightest_frame: None,
             pending_persist_reservations: Vec::new(),
@@ -314,6 +329,17 @@ pub struct Emulator {
     /// The `fs` base the descriptor table currently carries, so the table
     /// is rewritten on a thread switch rather than on every exit.
     gdt_fs_base: std::cell::Cell<u32>,
+    /// Whether a gamepad should be attached once the guest's own driver
+    /// is ready for one. A device present before the driver initialises is
+    /// announced and then swept away by its initialisation, exactly as a
+    /// controller plugged in before the console is switched on would be;
+    /// waiting models plugging one in afterwards.
+    gamepad_wanted: bool,
+    /// The processor state a delivered interrupt displaced, restored when
+    /// the routine returns. An interrupt arrives between instructions and
+    /// the routine is an ordinary function, so everything it may clobber
+    /// has to be put back — hardware would have saved it in the stub.
+    interrupted: Option<Box<CpuState>>,
     /// A guest address whose writers should be reported.
     ///
     /// The page holding it is mapped read-only, so every write to it leaves
@@ -1038,6 +1064,129 @@ impl Emulator {
         Some(CapturedFrame { width, height, pixels, frame_buffer: 0 })
     }
 
+    /// Attaches the gamepad once the guest's driver has its controller
+    /// running and an interrupt connected to hear about it with.
+    fn attach_gamepad_when_ready(&mut self) {
+        if !self.gamepad_wanted || !self.devices.usb_operational() {
+            return;
+        }
+        let ready = self
+            .threads
+            .as_ref()
+            .is_some_and(|threads| threads.interrupt_routine(USB_INTERRUPT_VECTOR).is_some());
+        if ready {
+            self.gamepad_wanted = false;
+            self.devices.set_gamepad_attached(true);
+            tracing::debug!("gamepad attached to a driver that can hear about it");
+        }
+    }
+
+    /// Calls a connected interrupt routine on the guest processor.
+    ///
+    /// The routine is `BOOLEAN (*)(PKINTERRUPT, PVOID)` and is called like
+    /// any other function: its two arguments and a return address that
+    /// cannot be executed go on the current stack, and the run loop
+    /// recognises a fetch from that address as the end of the call.
+    fn deliver_interrupt(&mut self, vector: u32) -> bool {
+        if self.interrupted.is_some() {
+            // Already inside one. Hardware would nest by priority; this
+            // waits, which costs latency and never loses the request
+            // because the device keeps its status bit raised.
+            return false;
+        }
+        let Some(routine) =
+            self.threads.as_ref().and_then(|threads| threads.interrupt_routine(vector))
+        else {
+            return false;
+        };
+
+        let saved = self.cpu.clone();
+        // Right to left, as a stdcall caller pushes: context, object, and
+        // then the address the routine will return to.
+        let mut esp = self.cpu.gpr[4];
+        for value in [routine.context, routine.object, INTERRUPT_RETURN_SENTINEL.0] {
+            esp = esp.wrapping_sub(4);
+            if self.memory.write_u32(GuestVa(esp), value).is_err() {
+                // The interrupted thread's stack is not writable here, so
+                // the routine cannot be called; the device keeps asking.
+                return false;
+            }
+        }
+        self.cpu.gpr[4] = esp;
+        self.cpu.eip = routine.routine;
+        self.interrupted = Some(Box::new(saved));
+        tracing::debug!(
+            vector,
+            routine = format_args!("{:#010x}", routine.routine),
+            "calling a guest interrupt routine"
+        );
+        true
+    }
+
+    /// Calls the next queued deferred procedure on the guest processor.
+    ///
+    /// Its routine is `void (*)(PKDPC, PVOID, PVOID, PVOID)`, called with
+    /// the context it was initialised with and the two arguments the
+    /// interrupt routine queued it with.
+    fn deliver_dpc(&mut self) -> bool {
+        if self.interrupted.is_some() {
+            return false;
+        }
+        let Some(dpc) = self.threads.as_mut().and_then(ThreadManager::take_dpc) else {
+            return false;
+        };
+        // KDPC: DeferredRoutine@0x0C, DeferredContext@0x10, and the two
+        // arguments the queueing call stored at 0x14 and 0x18.
+        let read = |offset: u32| self.memory.read_u32(GuestVa(dpc.wrapping_add(offset))).ok();
+        let (Some(routine), Some(context), Some(first), Some(second)) =
+            (read(0x0C), read(0x10), read(0x14), read(0x18))
+        else {
+            return false;
+        };
+        if routine == 0 {
+            return false;
+        }
+
+        let saved = self.cpu.clone();
+        let mut esp = self.cpu.gpr[4];
+        for value in [second, first, context, dpc, INTERRUPT_RETURN_SENTINEL.0] {
+            esp = esp.wrapping_sub(4);
+            if self.memory.write_u32(GuestVa(esp), value).is_err() {
+                return false;
+            }
+        }
+        self.cpu.gpr[4] = esp;
+        self.cpu.eip = routine;
+        self.interrupted = Some(Box::new(saved));
+        tracing::debug!(
+            dpc = format_args!("{dpc:#010x}"),
+            routine = format_args!("{routine:#010x}"),
+            "calling a queued deferred procedure"
+        );
+        true
+    }
+
+    /// Restores the state a delivered interrupt displaced.
+    fn finish_interrupt(&mut self) {
+        if let Some(saved) = self.interrupted.take() {
+            tracing::debug!(
+                returned = format_args!("{:#010x}", self.cpu.gpr[0]),
+                "a guest interrupt routine returned"
+            );
+            self.cpu = *saved;
+        }
+    }
+
+    /// Whether a modelled device is asking for an interrupt right now.
+    fn interrupt_requested(&self) -> Option<u32> {
+        (self.devices.usb_interrupt_pending()
+            && self
+                .threads
+                .as_ref()
+                .is_some_and(|threads| threads.interrupt_routine(USB_INTERRUPT_VECTOR).is_some()))
+        .then_some(USB_INTERRUPT_VECTOR)
+    }
+
     /// Reports every write to `address` at trace level, with the guest
     /// instruction that made it.
     pub fn watch_writes(&mut self, address: GuestVa) {
@@ -1072,8 +1221,12 @@ impl Emulator {
     ///
     /// The default is no controller at all, which keeps a run a pure
     /// function of the image (ADR 0019).
-    pub fn attach_gamepad(&self, attached: bool) {
-        self.devices.set_gamepad_attached(attached);
+    pub fn attach_gamepad(&mut self, attached: bool) {
+        // Held until the guest's driver is ready to be told (ADR 0019).
+        self.gamepad_wanted = attached;
+        if !attached {
+            self.devices.set_gamepad_attached(false);
+        }
     }
 
     /// Records the controller state the guest's next read will report.
@@ -1543,6 +1696,31 @@ impl Emulator {
                         tick_cell,
                         &mut last_tick,
                     );
+                    self.attach_gamepad_when_ready();
+                    // A deferred procedure an interrupt routine queued runs
+                    // before the next interrupt is taken, as it would at
+                    // its own lower interrupt level.
+                    if self.interrupted.is_none()
+                        && self.threads.as_ref().is_some_and(ThreadManager::has_queued_dpc)
+                    {
+                        self.whp_read_cpu(&mut machine)?;
+                        if self.deliver_dpc() {
+                            self.whp_write_cpu(&mut machine)?;
+                            continue;
+                        }
+                    }
+                    // A device asking for an interrupt is serviced here,
+                    // between instructions, which is where hardware would
+                    // take one.
+                    if self.interrupted.is_none()
+                        && let Some(vector) = self.interrupt_requested()
+                    {
+                        self.whp_read_cpu(&mut machine)?;
+                        if self.deliver_interrupt(vector) {
+                            self.whp_write_cpu(&mut machine)?;
+                            continue;
+                        }
+                    }
                     // Every few cancellations is a time slice (ADR 0017):
                     // rotate ready threads so a compute-only loop cannot
                     // starve the rest of the guest.
@@ -1581,6 +1759,14 @@ impl Emulator {
                     // A thread's start routine returned (ADR 0011): created
                     // threads return to the exit sentinel; the boot thread
                     // returns to null. Either exits the thread and switches.
+                    // A called interrupt routine returned.
+                    if access.access_type == 2 && fault_va == INTERRUPT_RETURN_SENTINEL.0 {
+                        self.whp_read_cpu(&mut machine)?;
+                        self.finish_interrupt();
+                        self.whp_write_cpu(&mut machine)?;
+                        serviced += 1;
+                        continue;
+                    }
                     if access.access_type == 2 {
                         let null_exit = fault_va == 0
                             && self

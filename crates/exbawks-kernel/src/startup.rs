@@ -43,6 +43,7 @@ pub mod ordinal {
     pub const KE_DELAY_EXECUTION_THREAD: u16 = 99;
     /// `KeInitializeDpc`.
     pub const KE_INITIALIZE_DPC: u16 = 107;
+    pub const KE_INSERT_QUEUE_DPC: u16 = 119;
     /// `KeInitializeTimerEx`.
     pub const KE_INITIALIZE_TIMER_EX: u16 = 113;
     /// `KeConnectInterrupt`.
@@ -722,7 +723,7 @@ mod tests {
         // four Av video exports, one Nt virtual-memory export, seven Nt
         // file exports, six Mm exports, four symbolic-link exports, two Xe
         // section exports, one benign success export, and two startup stubs.
-        assert_eq!(registry.len(), 72);
+        assert_eq!(registry.len(), 73);
         for ordinal in [
             ordinal::DBG_PRINT,
             ordinal::HAL_RETURN_TO_FIRMWARE,

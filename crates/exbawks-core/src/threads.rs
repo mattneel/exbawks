@@ -142,6 +142,13 @@ pub(crate) struct ThreadManager {
     handles: HashSet<u32>,
     /// The host-backed file device (ADR 0014).
     files: HostFileSystem,
+    /// Deferred procedure calls an interrupt routine has queued, in the
+    /// order they were queued.
+    dpc_queue: Vec<u32>,
+    /// The interrupt service routines the title has registered, and
+    /// whether each is currently connected. A device that raises an
+    /// interrupt calls the connected routine for its vector.
+    interrupts: Vec<(exbawks_kernel::InterruptRoutine, bool)>,
     /// Regions the guest marked to survive a soft reboot (ADR 0015):
     /// `(base, size)` pairs from `MmPersistContiguousMemory`.
     persisted: Vec<(u32, u32)>,
@@ -195,6 +202,8 @@ impl ThreadManager {
             user_cursor: USER_ALLOC_BASE,
             handles: HashSet::new(),
             files: HostFileSystem::new(disc_root, hdd_root),
+            interrupts: Vec::new(),
+            dpc_queue: Vec::new(),
             persisted: Vec::new(),
             launch_data_page_cell: None,
             tick_count_cell: None,
@@ -593,6 +602,32 @@ impl ThreadManager {
     }
 }
 
+impl ThreadManager {
+    /// The connected service routine for one interrupt vector.
+    pub(crate) fn interrupt_routine(
+        &self,
+        vector: u32,
+    ) -> Option<exbawks_kernel::InterruptRoutine> {
+        self.interrupts
+            .iter()
+            .find(|(known, connected)| *connected && known.vector == vector)
+            .map(|(known, _)| *known)
+    }
+
+    /// Takes the next queued deferred procedure call.
+    pub(crate) fn take_dpc(&mut self) -> Option<u32> {
+        if self.dpc_queue.is_empty() {
+            return None;
+        }
+        Some(self.dpc_queue.remove(0))
+    }
+
+    /// Whether any deferred procedure is waiting to run.
+    pub(crate) fn has_queued_dpc(&self) -> bool {
+        !self.dpc_queue.is_empty()
+    }
+}
+
 impl KernelServices for ThreadManager {
     fn create_thread(
         &mut self,
@@ -700,6 +735,45 @@ impl KernelServices for ThreadManager {
             *signaled = false;
         }
         Ok(previous)
+    }
+
+    fn set_interrupt_routine(&mut self, interrupt: exbawks_kernel::InterruptRoutine) {
+        // A title re-initialises the same object rather than allocating a
+        // new one, so the newest description of an object replaces the
+        // older one instead of accumulating beside it.
+        if let Some(existing) =
+            self.interrupts.iter_mut().find(|(known, _)| known.object == interrupt.object)
+        {
+            existing.0 = interrupt;
+            return;
+        }
+        tracing::debug!(
+            object = format_args!("{:#010x}", interrupt.object),
+            routine = format_args!("{:#010x}", interrupt.routine),
+            vector = interrupt.vector,
+            "guest registered an interrupt routine"
+        );
+        self.interrupts.push((interrupt, false));
+    }
+
+    fn queue_dpc(&mut self, dpc: u32) -> bool {
+        if self.dpc_queue.contains(&dpc) {
+            return false;
+        }
+        self.dpc_queue.push(dpc);
+        true
+    }
+
+    fn connect_interrupt(&mut self, object: u32, connected: bool) {
+        if let Some(entry) = self.interrupts.iter_mut().find(|(known, _)| known.object == object) {
+            entry.1 = connected;
+            tracing::debug!(
+                object = format_args!("{object:#010x}"),
+                vector = entry.0.vector,
+                connected,
+                "guest connected an interrupt"
+            );
+        }
     }
 
     fn set_display_mode(&mut self, mode: DisplayMode) {

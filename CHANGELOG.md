@@ -269,6 +269,21 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+- Interrupt delivery. `KeInitializeInterrupt` records the guest's service
+  routine and `KeConnectInterrupt` marks it live; when a modelled device
+  raises an interrupt the runtime calls that routine on the guest processor
+  between instructions, and restores everything it displaced when the
+  routine returns. `KeInsertQueueDpc` queues the deferred procedure such a
+  routine ends with, and the runtime calls that too. No programmable
+  interrupt controller, interrupt descriptor table, or hypervisor injection
+  is involved: the kernel is high-level emulated, so the routine is called
+  like the ordinary function it is.
+
+  This is the first interrupt this emulator has ever delivered. The title's
+  USB driver now takes one, its service routine returns TRUE, its deferred
+  procedure runs, and it writes the root port back — where before it
+  initialised once and waited forever.
+
 - An OHCI host controller and a synthetic Xbox gamepad (ADR 0019), in a new
   `exbawks-usb` crate: the register file, the root hub with its connect and
   reset handshake, the frame counter a driver times its debounce against,
