@@ -286,6 +286,12 @@ The project follows Keep a Changelog structure before its first release.
 
 ### Added
 
+- The pseudo-handle a thread passes to mean itself resolves to whichever
+  thread is running, rather than being looked up in the handle table and
+  refused. Cxbx-Reloaded special-cases the same constant for the same
+  reason: it is never in the table, because it is what a caller passes
+  instead of its own handle.
+
 - `ObReferenceObjectByHandle` hands back the object a handle names rather
   than the handle itself. A caller reads fields off what it is given, and
   a thread handle is a small number, so dereferencing one faulted on a low

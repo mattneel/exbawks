@@ -338,6 +338,84 @@ mod tests {
     }
 
     #[test]
+    fn a_reference_hands_back_an_object_and_refuses_a_handle_it_has_none_for() {
+        // A caller reads fields off what it is given, so a handle it
+        // cannot resolve must be refused rather than answered with the
+        // handle over again — a small number that faults when read.
+        #[derive(Default)]
+        struct OneObject;
+
+        impl crate::KernelServices for OneObject {
+            fn create_thread(
+                &mut self,
+                _request: crate::ThreadCreateRequest,
+            ) -> Result<crate::ThreadCreated, crate::KernelServiceError> {
+                Err(crate::KernelServiceError::Unsupported)
+            }
+
+            fn exit_current_thread(&mut self, _status: u32) {}
+
+            fn close_handle(&mut self, _handle: u32) -> bool {
+                false
+            }
+
+            fn allocate_virtual_memory(
+                &mut self,
+                _request: crate::VirtualAllocRequest,
+            ) -> Result<crate::VirtualAllocation, crate::KernelServiceError> {
+                Err(crate::KernelServiceError::Unsupported)
+            }
+
+            fn object_for_handle(&self, handle: u32) -> Option<u32> {
+                (handle == 0xE000).then_some(0x8003_0200)
+            }
+        }
+
+        let memory = SoftwareAddressSpace::new(64 * 1024).expect("memory is valid");
+        let range = GuestRange::page_aligned(GuestVa(0x1000), 2 * u64::from(GUEST_PAGE_SIZE))
+            .expect("range is valid");
+        memory
+            .map_anonymous(range, MemoryPermissions::READ | MemoryPermissions::WRITE)
+            .expect("mapping succeeds");
+        let out = 0x1100_u32;
+        for (slot, value) in [0xE000_u32, 0, out].iter().enumerate() {
+            memory.write_u32(GuestVa(0x2004 + slot as u32 * 4), *value).expect("write");
+        }
+        let mut cpu = CpuState::default();
+        cpu.gpr[4] = 0x2000;
+        let mut services = OneObject;
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut services,
+            stop_request: None,
+        };
+
+        assert_eq!(
+            crate::startup::ObReferenceObjectByHandle.call(&mut context),
+            KernelStatus::SUCCESS
+        );
+        assert_eq!(
+            memory.read_u32(GuestVa(out)).unwrap(),
+            0x8003_0200,
+            "the object, not the handle"
+        );
+
+        // A handle with nothing behind it is refused.
+        memory.write_u32(GuestVa(0x2004), 0xE004).expect("write");
+        let mut context = KernelCallContext {
+            cpu: &mut cpu,
+            memory: &memory,
+            services: &mut services,
+            stop_request: None,
+        };
+        assert_eq!(
+            crate::startup::ObReferenceObjectByHandle.call(&mut context),
+            KernelStatus::INVALID_HANDLE
+        );
+    }
+
+    #[test]
     fn setting_a_timer_arms_it_with_its_deferred_procedure() {
         #[derive(Default)]
         struct Armed {

@@ -583,6 +583,15 @@ Two active threads:
    **That fix has not been exercised against a press yet**; the run that
    followed it had no controller input and took the old path.
 
+   Reading Cxbx-Reloaded's own `ObReferenceObjectByHandle` confirmed the
+   shape — a caller is handed the object body, with a header before it
+   carrying the reference counts and type — and showed one thing missing:
+   it special-cases the pseudo-handle a thread passes to mean itself,
+   which is never in the handle table. That constant now resolves to
+   whichever thread is running. Their object header sitting *before* the
+   body is not modelled; a title that walks back to it would read whatever
+   precedes the control block, which is worth knowing if one ever does.
+
    Each press opened a new wall, and each was a missing export on a path
    the title had never taken: `NtYieldExecution`, then
    `ObReferenceObjectByHandle`, then `ObfDereferenceObject` — the last a

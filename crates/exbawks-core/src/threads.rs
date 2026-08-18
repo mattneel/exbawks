@@ -200,6 +200,9 @@ pub(crate) struct ThreadManager {
 const EVENT_HANDLE_BASE: u32 = 0x0000_A000;
 /// The first guest handle the mutant table hands out.
 const MUTANT_HANDLE_BASE: u32 = 0x0000_B000;
+/// The handle a thread passes to mean itself, rather than looking its own
+/// up. It is never in the handle table.
+const CURRENT_THREAD_PSEUDO_HANDLE: u32 = 0xFFFF_FFFE;
 /// The first thread handle; each thread's is four apart.
 const THREAD_HANDLE_BASE: u32 = 0x0000_E000;
 
@@ -952,8 +955,16 @@ impl KernelServices for ThreadManager {
         // a caller expects to be handed and to read fields from. Handles
         // this runtime keeps no body for report nothing, so a caller is
         // told the handle is not one it can reference.
-        let index = handle.checked_sub(THREAD_HANDLE_BASE)? / 4;
-        let thread = self.threads.get(index as usize)?;
+        //
+        // The pseudo-handle for "the thread asking" never appears in the
+        // table: it is a constant a caller passes instead of its own
+        // handle, and it names whichever thread is running.
+        let thread = if handle == CURRENT_THREAD_PSEUDO_HANDLE {
+            self.threads.get(self.current)?
+        } else {
+            let index = handle.checked_sub(THREAD_HANDLE_BASE)? / 4;
+            self.threads.get(index as usize)?
+        };
         Some(thread.kpcr.0 + KTHREAD_OFFSET)
     }
 
