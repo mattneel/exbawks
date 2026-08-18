@@ -502,6 +502,10 @@ pub fn fill_triangle(
     let levels: [u32; 4] = std::array::from_fn(|unit| {
         textures[unit].map_or(0, |texture| mip_level(texture, [a, b, c], unit, area))
     });
+    // Whether the combiner has a program at all, decided once rather than
+    // per pixel: an unprogrammed one would build its registers, run
+    // nothing, and report nothing, for every pixel of every triangle.
+    let programmed = combiner.filter(|state| state.active > 0 || state.final_first != 0);
 
     let mut written = 0;
     let mut y = top as u32;
@@ -512,6 +516,10 @@ pub fn fill_triangle(
         let center_y = y as f32 + 0.5;
         for x in first_x..last_x {
             let center_x = x as f32 + 0.5;
+            // Each edge is evaluated rather than stepped along the row.
+            // Stepping is cheaper in arithmetic and measurably no faster
+            // here — the cost is elsewhere — and it accumulates rounding
+            // error along a row, which moves pixels at a triangle's edge.
             let weight_a = edge(b.x, b.y, c.x, c.y, center_x, center_y);
             let weight_b = edge(c.x, c.y, a.x, a.y, center_x, center_y);
             let weight_c = edge(a.x, a.y, b.x, b.y, center_x, center_y);
@@ -578,7 +586,7 @@ pub fn fill_triangle(
             // The combiners, once a title has programmed them, are the
             // pipeline's real color stage: they replace the fixed modulate
             // above, which is only what an unprogrammed stage would do.
-            if let Some(combiner) = combiner {
+            if let Some(combiner) = programmed {
                 let registers = crate::CombinerRegisters {
                     diffuse: unpack_channels(diffuse),
                     // An unbound unit reads white, so a stage that

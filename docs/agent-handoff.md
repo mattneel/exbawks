@@ -636,6 +636,28 @@ Two active threads:
    blank and masks the master enable around its critical sections, which
    is why both had to be real.
 
+   **Drawing costs half what it did.** A full run went from 186 seconds to
+   85 by taking guest RAM once for a batch of submissions and addressing it
+   physically, instead of going through the address space for every four
+   bytes: each of those validated a range, took a lock, and walked the page
+   table twice, and a rasterizer does it eight times per pixel across 388
+   million pixels. `SoftwareAddressSpace::with_physical_memory` hands the
+   slice over and the caller bumps the written generations of what it
+   changed, since the borrow cannot see what was touched.
+
+   Two further attempts were measured and rejected, both worth not
+   repeating. Stepping the edge functions along a row instead of
+   re-evaluating them is cheaper in arithmetic, made no measurable
+   difference, and accumulated rounding error that moved pixels at a
+   triangle's edge — the frame digest changed. Decoding a whole compressed
+   block and caching it made a run **slower** (84 to 113 seconds), because
+   a sample wants one texel to four of the sixteen.
+
+   The shape of the remaining cost: 22.1 million triangles for 388 million
+   shaded pixels is **17.5 pixels per triangle**, so per-triangle setup is
+   amortised over almost nothing. Removing texture sampling entirely takes
+   a run to 46 seconds, so sampling is about half of what is left.
+
    **A correction worth carrying:** RIP sampling puts about 82% of a run at
    `0x001CB97B`, which was read here as a spin. Disassembling it says
    otherwise. The bytes from `0x001CB960` are `test dword [eax+0x100410],

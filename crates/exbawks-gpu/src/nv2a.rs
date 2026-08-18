@@ -521,6 +521,12 @@ struct MemoryTexture<'a> {
     filtered: bool,
     /// How many mip levels the title supplied, at least one.
     levels: u32,
+    /// Where each level begins, worked out when the texture is bound.
+    ///
+    /// A level's address is every earlier level's size added up, and
+    /// computing that per texel — four times over for a filtered sample,
+    /// for every pixel — was costing more than reading the texel.
+    level_bases: [u32; MAX_MIP_LEVELS],
     /// Whether the format's alpha channel is meaningful.
     has_alpha: bool,
     /// One past the last byte the texture's own object covers. A sample
@@ -581,6 +587,9 @@ impl MemoryTexture<'_> {
         [self.read(address), self.read(address.wrapping_add(4))]
     }
 
+    /// The most mip levels a texture can have, which is one per halving of
+    /// the largest dimension the hardware allows.
+    ///
     /// One mip level's extent, which halves per level but never vanishes.
     fn level_extent(&self, level: u32) -> (u32, u32) {
         ((self.width >> level).max(1), (self.height >> level).max(1))
@@ -605,13 +614,19 @@ impl MemoryTexture<'_> {
         }
     }
 
-    /// Where one mip level begins: every earlier level, end to end.
+    /// Where one mip level begins, from the table built at bind time.
     fn level_base(&self, level: u32) -> u32 {
+        self.level_bases.get(level as usize).copied().unwrap_or(self.base)
+    }
+
+    /// Works out where every level begins: each is every earlier level's
+    /// size added onto the base.
+    fn measure_levels(&mut self) {
         let mut base = self.base;
-        for earlier in 0..level {
-            base = base.wrapping_add(self.level_bytes(earlier));
+        for level in 0..MAX_MIP_LEVELS {
+            self.level_bases[level] = base;
+            base = base.wrapping_add(self.level_bytes(level as u32));
         }
-        base
     }
 
     /// Reads one dword of the texture, refusing to leave its object.
@@ -655,6 +670,9 @@ impl crate::TextureSource for MemoryTexture<'_> {
                 return crate::dxt1_texel(block, x, y);
             }
             // The color half of an alpha-carrying block follows its alpha.
+            // Both halves are decoded per texel rather than per block: a
+            // whole-block decode was measured and is slower, because a
+            // sample wants one texel to four of the sixteen.
             TextureLayout::Dxt3 => {
                 let alpha = crate::dxt3_alpha(
                     self.block(base, width, x, y, DXT_ALPHA_BLOCK_BYTES, 0),
@@ -1085,6 +1103,10 @@ const METHOD_SET_VERTEX_DATA4F_END: u16 = METHOD_SET_VERTEX_DATA4F + 16 * 16;
 /// What one bound texture unit reports for diagnostics: its format word,
 /// its explicit rectangle, its pitch, and the texel at its origin.
 pub type BoundTexture = (u32, (u32, u32), u32, u32);
+
+/// The most mip levels one texture can carry, one per halving of the
+/// largest dimension the hardware addresses.
+const MAX_MIP_LEVELS: usize = 13;
 
 /// Texture units the hardware provides.
 const TEXTURE_UNITS: usize = 4;
@@ -2004,7 +2026,7 @@ impl PushbufferEngine {
         }
         let object = dma?;
         let base = object.base.wrapping_add(texture.offset);
-        Some(MemoryTexture {
+        let mut bound = MemoryTexture {
             memory,
             base,
             pitch: texture.pitch,
@@ -2042,7 +2064,10 @@ impl PushbufferEngine {
             // high offset would otherwise be allowed to read beyond the
             // object it was bound to, and a mip chain walks forward.
             end: object.base.saturating_add(object.limit).saturating_add(1),
-        })
+            level_bases: [0; MAX_MIP_LEVELS],
+        };
+        bound.measure_levels();
+        Some(bound)
     }
 
     /// The rasterizer's view of the current color surface.
@@ -3214,7 +3239,7 @@ mod tests {
         // eight bytes, and each level after it a quarter of the one
         // before, down to a single block that cannot shrink further.
         let memory = FakeMemory::new(0x2_0000);
-        let texture = MemoryTexture {
+        let mut texture = MemoryTexture {
             memory: &memory,
             base: 0x1000,
             pitch: 0,
@@ -3226,7 +3251,9 @@ mod tests {
             levels: 8,
             has_alpha: true,
             end: 0x1_0000,
+            level_bases: [0; MAX_MIP_LEVELS],
         };
+        texture.measure_levels();
 
         assert_eq!(texture.level_extent(0), (128, 128));
         assert_eq!(texture.level_extent(3), (16, 16));

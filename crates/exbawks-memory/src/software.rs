@@ -32,6 +32,9 @@ pub trait GuestMemory: Send + Sync {
     }
 }
 
+/// The virtual window physical RAM is aliased through (ADR 0010).
+const CACHED_WINDOW: u32 = 0x8000_0000;
+
 /// A deterministic software implementation of the guest address space.
 #[derive(Debug)]
 pub struct SoftwareAddressSpace {
@@ -214,6 +217,32 @@ impl SoftwareAddressSpace {
     #[must_use]
     pub fn physical_len(&self) -> usize {
         self.physical.read().len()
+    }
+
+    /// Runs `action` over physical RAM, holding it for the whole call.
+    ///
+    /// Every ordinary access validates a range, takes a lock, and walks the
+    /// page table. That is the right cost for a guest instruction touching
+    /// four bytes and the wrong one for a rasterizer touching millions: the
+    /// graphics engine addresses memory physically and in bulk, so it takes
+    /// RAM once and indexes it.
+    ///
+    /// The caller is responsible for bumping the written generations of
+    /// anything it changes, because this cannot see what it touched.
+    pub fn with_physical_memory<R>(&self, action: impl FnOnce(&mut [u8]) -> R) -> R {
+        let mut physical = self.physical.write();
+        action(&mut physical)
+    }
+
+    /// Bumps the written generation of every page in a range, as an
+    /// ordinary write would, so cached translations of code in it are
+    /// discarded (ADR 0005).
+    pub fn bump_physical_generations(&self, physical: u32, length: usize) {
+        crate::access::bump_written_generations(
+            &self.table,
+            GuestVa(CACHED_WINDOW | physical),
+            length,
+        );
     }
 
     fn access(

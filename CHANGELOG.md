@@ -269,6 +269,23 @@ The project follows Keep a Changelog structure before its first release.
   modulate multiplied by a diffuse color its own program never applies. Its
   frame now comes out lit, and the recorded golden digest moves with it.
 
+### Changed
+
+- Drawing is about twice as fast: a full run of this title went from 186
+  seconds to 85. The graphics engine now takes guest RAM once for a whole
+  batch of submissions and addresses it physically, rather than going
+  through the address space for every four bytes. Each of those accesses
+  validated a range, took a lock, and walked the page table twice — the
+  right cost for a guest instruction touching a word and the wrong one for
+  a rasterizer reading eight texels and writing a pixel, 388 million times
+  a run. The frame is identical, digest and all.
+
+- A mip level's address is worked out when a texture is bound rather than
+  on every texel fetch, where it had been adding up every earlier level's
+  size each time.
+
+### Added
+
 - `NtYieldExecution`, `ObReferenceObjectByHandle`, and
   `ObfDereferenceObject`. These are the exports the title asks for once a
   button is pressed, and each was a wall in turn: pressing start took it

@@ -110,6 +110,54 @@ impl exbawks_usb::UsbMemory for WindowMemory<'_> {
     }
 }
 
+/// Guest physical memory as a borrowed slice, addressed physically.
+///
+/// The graphics engine reads texels and writes pixels by the million; going
+/// through the address space for each of them spends a range validation, a
+/// lock, and two page-table walks on four bytes. This holds RAM for the
+/// whole submission and indexes it.
+struct PhysicalMemory<'a>(std::cell::RefCell<&'a mut [u8]>);
+
+impl PhysicalMemory<'_> {
+    /// The four bytes at a physical address, when they are all in RAM.
+    fn dword_at(ram: &[u8], physical: u32) -> Option<u32> {
+        let start = physical as usize;
+        let bytes = ram.get(start..start.checked_add(4)?)?;
+        Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+}
+
+impl exbawks_gpu::Nv2aMemory for PhysicalMemory<'_> {
+    fn read_dword(&self, physical: u32) -> Option<u32> {
+        Self::dword_at(&self.0.borrow(), physical)
+    }
+
+    fn write_dword(&self, physical: u32, value: u32) -> bool {
+        let mut ram = self.0.borrow_mut();
+        let start = physical as usize;
+        let Some(slot) = start.checked_add(4).and_then(|end| ram.get_mut(start..end)) else {
+            return false;
+        };
+        slot.copy_from_slice(&value.to_le_bytes());
+        true
+    }
+
+    fn fill_dwords(&self, physical: u32, value: u32, count: u32) -> u32 {
+        let mut ram = self.0.borrow_mut();
+        let start = physical as usize;
+        let Some(bytes) = (count as usize).checked_mul(4) else {
+            return 0;
+        };
+        let Some(slot) = start.checked_add(bytes).and_then(|end| ram.get_mut(start..end)) else {
+            return 0;
+        };
+        for cell in slot.chunks_exact_mut(4) {
+            cell.copy_from_slice(&value.to_le_bytes());
+        }
+        count
+    }
+}
+
 /// Guest physical memory through the cached window (ADR 0010).
 impl exbawks_gpu::Nv2aMemory for WindowMemory<'_> {
     fn read_dword(&self, physical: u32) -> Option<u32> {
@@ -2527,9 +2575,27 @@ impl Emulator {
         let pramin =
             self.devices.pramin_region().map(|(base_va, _)| base_va & 0x1FFF_FFFF).unwrap_or(0);
         let memory = self.memory.clone();
-        let view = WindowMemory(&memory);
-        for (channel, get, put) in submissions {
-            let end = self.gpu_pusher.submit(&view, channel, pramin, ramht_raw, get, put);
+        // RAM is held for the whole batch and indexed physically, which is
+        // what makes drawing cost what the pixels cost rather than what the
+        // address space charges per four bytes.
+        let pusher = &mut self.gpu_pusher;
+        let ends: Vec<(u32, u32)> = memory.with_physical_memory(|ram| {
+            let view = PhysicalMemory(std::cell::RefCell::new(ram));
+            submissions
+                .iter()
+                .map(|(channel, get, put)| {
+                    (*channel, pusher.submit(&view, *channel, pramin, ramht_raw, *get, *put))
+                })
+                .collect()
+        });
+        // Anything drawn may be code somewhere else, so the pages it
+        // touched give up their cached translations (ADR 0005).
+        for (base, pixels) in self.gpu_pusher.busiest_targets(8) {
+            if pixels > 0 {
+                memory.bump_physical_generations(base, 0x40_0000);
+            }
+        }
+        for (channel, end) in ends {
             self.record_completed_frame();
             let stats = self.gpu_pusher.stats();
             tracing::debug!(
