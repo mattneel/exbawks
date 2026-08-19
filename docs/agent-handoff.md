@@ -580,8 +580,22 @@ Two active threads:
    as its object, and thread handles start at `0xE000`. A handle now
    resolves to a real structure — a thread's to its control block at
    `KTHREAD_OFFSET` inside its KPCR page — and one with no body is refused.
-   **That fix has not been exercised against a press yet**; the run that
-   followed it had no controller input and took the old path.
+   **That fix now holds against a real press.** A run with a controller
+   attached reported `buttons pressed during the run: start`, reached the
+   difficulty menu, and ended on `BudgetExhausted` — no fault at all.
+
+   **What it waits on instead.** Past the menu the title spins: the last
+   heartbeats cycle the instruction pointer between exactly three gates
+   while graphics traffic all but stops — sixty register reads in the time
+   it had been doing thousands. The three are ordinals 238
+   `NtYieldExecution`, 246 `ObReferenceObjectByHandle`, and 250
+   `ObfDereferenceObject`, and the final `ecx` is `0xE00C`, a thread
+   handle. So it resolves a thread, drops it, yields, and asks again —
+   waiting on a worker that never progresses. That is a scheduling
+   question rather than a graphics one, and it is the next wall.
+
+   Reading a gate from a heartbeat is worth knowing:
+   `ordinal = (eip - 0xFF800000) / 4`.
 
    Reading Cxbx-Reloaded's own `ObReferenceObjectByHandle` confirmed the
    shape — a caller is handed the object body, with a header before it
@@ -602,6 +616,54 @@ Two active threads:
    Without a press the run still ends at the pre-existing
    `GuestFault { address: 0 }` at `0x001AE56C`, which is unrelated to
    input and has outlived the whole session.
+
+   **Drawing runs on every processor now, and the frame did not change.**
+   A run of the retail title went from 79 seconds to 26, and its
+   unfiltered form from 57 to 22, with the digest identical — a row's
+   pixels depend only on the triangles covering them and on what is
+   already beneath them, so dividing a draw by rows keeps every pair of
+   triangles that meet on one thread and in submission order. Two tests
+   pin that: banded drawing must equal a single pass, blending included.
+
+   Two things had to be true first, and the second cost a whole attempt.
+   Guest RAM is held as dwords the threads share rather than as a slice
+   one of them owns (`AlignedBuffer::as_atomic_dwords`,
+   `SoftwareAddressSpace::with_physical_dwords`, `Nv2aMemory: Sync`),
+   which is what says the rows are disjoint; a relaxed aligned dword
+   access is an ordinary move here, so nothing is paid for it. And the
+   bands must run on a pool that outlives the draw: this title submits
+   **111,000 draws**, and creating threads for each of them — about 1.8
+   million — left the whole thing barely faster than one thread, 79
+   seconds down to 63. Rayon's pool took it to 36, and sizing each draw's
+   bands by its triangles' own **areas** rather than the box around them
+   took it to 26: a draw of narrow slivers spans as many rows as one of
+   full-width bars and is a fraction of the work.
+
+   Where the 26 seconds go: 6 in guest and geometry, 5 in per-triangle
+   setup, 16 in pixels — down from about 71. Finer bands buy nothing,
+   which says the remainder is memory-bound on random texture reads.
+   That is the wall a software rasterizer reaches, and the reason ADR 0020
+   proposes a hardware backend: **neither xemu nor Cxbx-Reloaded
+   rasterizes in software.** xemu registers a `PGRAPHRenderer` over
+   OpenGL or Vulkan, and its `psh.c` and `vsh-ff.c` generate GLSL from
+   the register combiners and the fixed pipeline rather than evaluating
+   them per pixel. The pushbuffer decode this project already has is
+   exactly what such a backend consumes.
+
+   **A measurement trap worth naming, because it has now been walked into
+   twice.** A switch read with `env::var_os` inside a per-pixel or
+   per-triangle path dominates the measurement it exists to take: once it
+   made a stage look *slower* when removed, and once it put the
+   no-pixels floor at 18 seconds when the true figure is 11. Hoist such a
+   switch into a `OnceLock` before believing a number from it. In the same
+   spirit, piping a run through `Select-Object -Last N` buffers the stream
+   and clips the *top*, which silently loses the stop-reason line —
+   redirect with `*> file` instead.
+
+   Two smaller traps: `cargo build --release` at the workspace root does
+   not refresh `target/release/exbawks.exe` — use
+   `cargo build --release -p exbawks-cli` — and the engine flag is
+   `--engine interpreter|whp`, where the retail title needs `whp`.
 
    **Superseded:** the driver used to ask the same question six times and
    give up, cycling the port.
