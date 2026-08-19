@@ -155,6 +155,15 @@ struct RunArgs {
     /// A run using one is not reproducible and may not record a golden.
     #[arg(long)]
     gamepad_live: bool,
+    /// Presses a button on the emulated gamepad, as `name@frame` — for
+    /// example `start@40000`. Repeatable, and reproducible, so a run
+    /// driven by these may record a golden. Names: up, down, left, right,
+    /// start, back, left-stick, right-stick.
+    #[arg(long, value_name = "BUTTON@FRAME")]
+    press: Vec<String>,
+    /// How many controller frames each scripted press is held for.
+    #[arg(long, default_value_t = 600)]
+    press_frames: u64,
     /// Shows what the title is drawing in a window. Closing it ends the run.
     #[arg(long)]
     display: bool,
@@ -287,12 +296,15 @@ fn main() -> Result<()> {
                 gpu_method_value,
                 gamepad,
                 gamepad_live,
+                press,
+                press_frames,
                 display,
                 unfiltered,
                 watch_write,
                 frame_digest,
                 expect_frame,
             } = *arguments;
+            let presses = parse_presses(&press)?;
 
             let tracing = TraceOptions {
                 path: trace.as_deref(),
@@ -317,6 +329,8 @@ fn main() -> Result<()> {
                     gpu_method_value: &gpu_method_value,
                     gamepad,
                     gamepad_live,
+                    presses: &presses,
+                    press_frames,
                     display,
                     unfiltered,
                     watch_write,
@@ -645,6 +659,10 @@ struct RunOptions<'a> {
     gamepad: bool,
     /// Whether that gamepad is fed by a real controller.
     gamepad_live: bool,
+    /// Scripted presses, as controller frame and button mask.
+    presses: &'a [(u64, u16)],
+    /// How long each scripted press is held.
+    press_frames: u64,
     /// Whether to show what the title draws in a window.
     display: bool,
     /// Whether samples take the nearest texel rather than blending four.
@@ -675,6 +693,8 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
         gpu_method_value,
         gamepad,
         gamepad_live,
+        presses,
+        press_frames,
         display,
         unfiltered,
         watch_write,
@@ -724,8 +744,12 @@ fn run(path: &Path, tracing: &TraceOptions<'_>, options: &RunOptions<'_>) -> Res
             eprintln!("warning: no window could be opened");
         }
     }
-    if gamepad || gamepad_live {
+    if gamepad || gamepad_live || !presses.is_empty() {
         emulator.attach_gamepad(true);
+    }
+    if !presses.is_empty() {
+        emulator.set_scripted_input(presses, press_frames);
+        println!("Gamepad:      {} scripted press(es)", presses.len());
     }
     if gamepad_live {
         if emulator.use_live_gamepad() {
@@ -927,13 +951,15 @@ Graphics methods (object, method, submissions):"
         println!();
     }
 
-    if gamepad || gamepad_live {
+    if gamepad || gamepad_live || !presses.is_empty() {
         println!(
             "USB:          controller {}, communication area {:#010x}",
             if emulator.usb_operational() { "running" } else { "stopped" },
             emulator.usb_hcca()
         );
-        if gamepad_live {
+        // The frame the run reached, which is the clock `--press` counts in.
+        println!("              controller frame {}", emulator.usb_frame());
+        if gamepad_live || !presses.is_empty() {
             let seen = emulator.gamepad_buttons_seen();
             let names = [
                 (exbawks_usb::button::UP, "up"),
@@ -1386,6 +1412,39 @@ impl CoverageJson {
 
 fn read_file(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).with_context(|| format!("failed to read {}", path.display()))
+}
+
+/// Parses `--press` arguments of the form `name@frame`.
+fn parse_presses(arguments: &[String]) -> Result<Vec<(u64, u16)>> {
+    use exbawks_usb::button;
+
+    arguments
+        .iter()
+        .map(|argument| {
+            let (name, frame) = argument.split_once('@').with_context(|| {
+                format!("expected a press as name@frame, for example start@40000: {argument}")
+            })?;
+            let buttons = match name.trim().to_ascii_lowercase().as_str() {
+                "up" => button::UP,
+                "down" => button::DOWN,
+                "left" => button::LEFT,
+                "right" => button::RIGHT,
+                "start" => button::START,
+                "back" => button::BACK,
+                "left-stick" => button::LEFT_STICK,
+                "right-stick" => button::RIGHT_STICK,
+                other => anyhow::bail!(
+                    "unknown button {other}: expected up, down, left, right, start, back, \
+                     left-stick, or right-stick"
+                ),
+            };
+            let frame = frame
+                .trim()
+                .parse::<u64>()
+                .with_context(|| format!("a press frame must be a number: {frame}"))?;
+            Ok((frame, buttons))
+        })
+        .collect()
 }
 
 fn parse_u32(value: &str) -> std::result::Result<u32, String> {

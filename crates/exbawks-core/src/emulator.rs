@@ -471,6 +471,7 @@ impl EmulatorBuilder {
             display: None,
             #[cfg(windows)]
             live_gamepad: None,
+            scripted_input: None,
             interrupted: None,
             watch_write: None,
             brightest_frame: None,
@@ -517,6 +518,12 @@ pub struct Emulator {
     /// a host operation, so it exists only where there is one.
     #[cfg(windows)]
     live_gamepad: Option<std::sync::Arc<LiveGamepad>>,
+    /// Presses the run makes on its own, by controller frame.
+    ///
+    /// A run driven by one of these is reproducible, which a run driven by
+    /// a person's hands is not: the same script pressed at the same frames
+    /// produces the same frame, so an input path can be a golden.
+    scripted_input: Option<exbawks_usb::ScriptedInput>,
     /// A window showing what the title is drawing, when one was asked for.
     #[cfg(windows)]
     display: Option<exbawks_platform::window::Display>,
@@ -1213,7 +1220,8 @@ impl Emulator {
     /// stops with a guest exit when none remain.
     fn exit_current_thread(&mut self, status: u32) -> Option<StopReason> {
         let cpu = &mut self.cpu;
-        let switched = self.threads.as_mut().is_some_and(|threads| threads.exit_active(cpu));
+        let switched =
+            self.threads.as_mut().is_some_and(|threads| threads.exit_active(cpu, status));
         if switched { None } else { Some(StopReason::GuestExit { code: status }) }
     }
 
@@ -1514,6 +1522,15 @@ impl Emulator {
         }
     }
 
+    /// The controller frame the run has reached.
+    ///
+    /// This is the clock a scripted press is timed in, so a run reports it
+    /// to make the next script's frames choosable rather than guessed.
+    #[must_use]
+    pub fn usb_frame(&self) -> u64 {
+        self.devices.usb_frame()
+    }
+
     /// Every button a real controller was seen pressing during the run.
     #[must_use]
     pub fn gamepad_buttons_seen(&self) -> u16 {
@@ -1541,7 +1558,22 @@ impl Emulator {
         #[cfg(windows)]
         if let Some(live) = self.live_gamepad.as_ref() {
             self.devices.set_gamepad_state(live.state());
+            return;
         }
+        if let Some(script) = self.scripted_input.as_ref() {
+            use exbawks_usb::InputSource;
+            if let Some(state) = script.sample(self.devices.usb_frame()) {
+                self.devices.set_gamepad_state(state);
+            }
+        }
+    }
+
+    /// Presses buttons on the emulated controller on a schedule.
+    ///
+    /// Each entry is a controller frame and the buttons pressed then, held
+    /// briefly and released, as a person's press is.
+    pub fn set_scripted_input(&mut self, presses: &[(u64, u16)], hold: u64) {
+        self.scripted_input = Some(exbawks_usb::ScriptedInput::taps(presses, hold));
     }
 
     /// Records the controller state the guest's next read will report.

@@ -8,6 +8,15 @@ The project follows Keep a Changelog structure before its first release.
 
 ### Added
 
+- `exbawks run --press <button>@<frame>` presses a button on the emulated
+  gamepad by controller frame, repeatably and in order — `--press
+  start@20000 --press down@40000`. Each press is held briefly and released,
+  because a title watches for the moment a button goes down rather than for
+  it being down. Unlike a real controller this is reproducible, so a run
+  driven by a script may record a golden; a run reports the controller
+  frame it reached, which is how the next script's frames are chosen rather
+  than guessed.
+
 - ADR 0020 proposes a hardware graphics backend. Neither xemu nor
   Cxbx-Reloaded rasterizes in software: xemu registers a renderer over
   OpenGL or Vulkan and generates shaders from the console's vertex programs
@@ -508,6 +517,25 @@ The project follows Keep a Changelog structure before its first release.
   construction may not record a golden.
 
 ### Fixed
+
+- A thread that finished said so only in the emulator's own table, where no
+  guest can see it. `GetExitCodeThread` asks the kernel to resolve the
+  handle and nothing more: it then reads the thread's own control block —
+  the dispatcher header's signal state, and the status at `+0x120` beside
+  it — so a title polling a worker was told `STILL_ACTIVE` forever however
+  long ago that worker stopped. A finished thread now records both, status
+  first so a reader that sees the signal already finds the status there,
+  and its header names it a thread object, which keeps a wait by pointer
+  from consuming the signal the way an auto-reset event's is consumed. A
+  finished thread stays finished for every joiner.
+
+  This was found by disassembling the three-gate loop a run was spinning
+  in, and it is a real defect on that path — but **the spin it was chased
+  from has not been reproduced**, so it is not established that this is
+  what ends it. A scripted press does not reach that state, and the
+  evidence from the run that did — graphics traffic stopped entirely
+  rather than merely slowed — fits an awaited thread that is blocked just
+  as well as one that finished unheard.
 
 - A guest texture coordinate large enough to saturate the cast made the
   filtered sampler reach for a neighbouring texel at `i64::MAX`, panicking

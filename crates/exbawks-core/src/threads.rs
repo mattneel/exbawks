@@ -45,6 +45,18 @@ const MEM_COMMIT: u32 = 0x0000_1000;
 
 /// The KTHREAD block offset inside each thread's KPCR page.
 const KTHREAD_OFFSET: u32 = 0x200;
+/// `DISPATCHER_HEADER.SignalState`, which a finished thread sets.
+const DISPATCHER_SIGNAL_STATE: u32 = 0x04;
+/// `DISPATCHER_HEADER.Type` naming a thread object.
+const THREAD_OBJECT_TYPE: u8 = 6;
+/// Where a thread's exit status sits in its control block.
+///
+/// The title's `GetExitCodeThread` reads exactly this: it references the
+/// thread by handle, and where the signal state is set it returns
+/// `[thread + 0x120]` and otherwise reports the thread still running.
+const KTHREAD_EXIT_STATUS: u32 = 0x120;
+/// What `GetExitCodeThread` reports for a thread that has not finished.
+const STILL_ACTIVE: u32 = 0x103;
 /// The largest TLS template or zero-fill the loader honors; the sizes are
 /// guest-controlled header fields, so they are bounded.
 const MAX_TLS_BYTES: u32 = 1024 * 1024;
@@ -455,6 +467,16 @@ impl ThreadManager {
         self.memory.write_u32(GuestVa(kpcr.0 + 0x20), kpcr.0 + PRCB_OFFSET)?; // KPCR.Prcb
         self.memory.write_u32(GuestVa(kpcr.0 + PRCB_OFFSET), kthread.0)?; // Prcb.CurrentThread
 
+        // A thread is a dispatcher object, and a title reads its header
+        // directly rather than asking the kernel: `GetExitCodeThread` takes
+        // the signal state as "has it finished", and a wait by pointer
+        // reads the same two fields. The type marks it a thread so a wait
+        // does not consume the signal the way an auto-reset event's is
+        // consumed — a finished thread stays finished for every joiner.
+        self.memory.write_u32(kthread, u32::from(THREAD_OBJECT_TYPE))?;
+        self.memory.write_u32(GuestVa(kthread.0 + DISPATCHER_SIGNAL_STATE), 0)?;
+        self.memory.write_u32(GuestVa(kthread.0 + KTHREAD_EXIT_STATUS), STILL_ACTIVE)?;
+
         // Synthetic KTHREAD fields XAPI consumes; TlsData points at the
         // thread's TLS area below StackBase when the image has TLS.
         self.memory.write_u32(GuestVa(kthread.0 + 0x1C), stack_top)?;
@@ -505,6 +527,32 @@ impl ThreadManager {
         self.pending.take()
     }
 
+    /// Records a finished thread's result in its own control block.
+    ///
+    /// `GetExitCodeThread` is the reason this exists. XAPI implements it
+    /// without a kernel call beyond resolving the handle: it reads the
+    /// dispatcher header's signal state and, where that is set, the status
+    /// beside it — so marking a thread terminated in the emulator's own
+    /// table is invisible to the guest. A title polling a worker sees
+    /// `STILL_ACTIVE` for as long as these two fields say nothing, which is
+    /// a wait no amount of scheduling can end.
+    fn publish_thread_exit(&mut self, index: usize, status: u32) {
+        let Some(thread) = self.threads.get(index) else {
+            return;
+        };
+        let kthread = GuestVa(thread.kpcr.0 + KTHREAD_OFFSET);
+        // A failure here is not fatal: the thread has already stopped
+        // running, and reporting it is what is lost.
+        if self.memory.write_u32(GuestVa(kthread.0 + KTHREAD_EXIT_STATUS), status).is_err()
+            || self.memory.write_u32(GuestVa(kthread.0 + DISPATCHER_SIGNAL_STATE), 1).is_err()
+        {
+            tracing::warn!(
+                kthread = format_args!("{:#010x}", kthread.0),
+                "could not record a thread's exit where the title reads it"
+            );
+        }
+    }
+
     /// True when the active thread's return to null is an intended exit
     /// rather than a fault (only the boot thread, ADR 0011).
     pub(crate) fn active_exits_on_null_return(&self) -> bool {
@@ -515,10 +563,15 @@ impl ThreadManager {
     ///
     /// Returns `true` when a thread was resumed (execution continues) and
     /// `false` when no runnable thread remains (the caller stops).
-    pub(crate) fn exit_active(&mut self, active_cpu: &mut CpuState) -> bool {
+    pub(crate) fn exit_active(&mut self, active_cpu: &mut CpuState, status: u32) -> bool {
         if let Some(thread) = self.threads.get_mut(self.current) {
             thread.state = ThreadState::Terminated;
         }
+        // A joiner does not have to ask the kernel whether this thread
+        // finished — the title reads the answer out of the thread's own
+        // control block, so a thread that dies without writing it there is
+        // one the title waits on forever.
+        self.publish_thread_exit(self.current, status);
         // Joiners of this thread's handle wake (ADR 0017).
         let exited_handle = 0x0000_E000 + (self.current as u32) * 4;
         for thread in &mut self.threads {
@@ -1336,10 +1389,39 @@ mod tests {
 
         // It exits: the guest has not finished, the waits have — the parked
         // threads resume instead of the run reporting an exit.
-        assert!(threads.exit_active(&mut cpu), "a released waiter resumes");
+        assert!(threads.exit_active(&mut cpu, 0), "a released waiter resumes");
         assert_eq!(threads.threads[2].state, ThreadState::Terminated);
         assert_eq!(threads.threads[0].state, ThreadState::Running);
         assert_eq!(threads.threads[1].state, ThreadState::Ready);
+    }
+
+    #[test]
+    fn a_finished_thread_says_so_where_the_title_reads_it() {
+        // `GetExitCodeThread` asks the kernel only to resolve the handle;
+        // it then reads the thread's own control block — the dispatcher
+        // header's signal state, and the status beside it. A thread that
+        // stops running without writing those is one a title polls
+        // forever, so this pins both fields and the order they are
+        // written in: a reader that sees the signal must already find the
+        // status there.
+        let mut threads = manager();
+        threads.create_thread(thread_request(0x1000)).expect("thread 0 creates");
+        threads.create_thread(thread_request(0x2000)).expect("thread 1 creates");
+        let mut cpu = CpuState::default();
+        threads.rotate_active(&mut cpu);
+        assert_eq!(threads.current, 1);
+
+        let kthread = threads.threads[1].kpcr.0 + KTHREAD_OFFSET;
+        let read = |threads: &ThreadManager, offset: u32| {
+            threads.memory.read_u32(GuestVa(kthread + offset)).expect("the block is mapped")
+        };
+        assert_eq!(read(&threads, DISPATCHER_SIGNAL_STATE), 0, "it has not finished");
+        assert_eq!(read(&threads, KTHREAD_EXIT_STATUS), STILL_ACTIVE, "and says so");
+        assert_eq!(read(&threads, 0) & 0xFF, u32::from(THREAD_OBJECT_TYPE), "a thread object");
+
+        assert!(threads.exit_active(&mut cpu, 0x2A), "the other thread runs on");
+        assert_eq!(read(&threads, DISPATCHER_SIGNAL_STATE), 1, "now it is signaled");
+        assert_eq!(read(&threads, KTHREAD_EXIT_STATUS), 0x2A, "carrying its status");
     }
 
     #[test]
@@ -1347,7 +1429,7 @@ mod tests {
         let mut threads = manager();
         threads.create_thread(thread_request(0x2000)).expect("the sole thread creates");
         let mut cpu = CpuState::default();
-        assert!(!threads.exit_active(&mut cpu), "nothing remains to run");
+        assert!(!threads.exit_active(&mut cpu, 0), "nothing remains to run");
     }
 
     #[test]

@@ -131,6 +131,23 @@ impl ScriptedInput {
             (frame, GamepadState { buttons, ..GamepadState::default() }),
         ])
     }
+
+    /// A script of presses, each held for `hold` frames and then released.
+    ///
+    /// A title watches for the moment a button goes down rather than for it
+    /// being down, so a press that is never released is one press; holding
+    /// each briefly and letting go is what a person does and what a menu
+    /// expects. Presses are taken in frame order and a later one replaces
+    /// whatever the previous release left.
+    #[must_use]
+    pub fn taps(presses: &[(u64, u16)], hold: u64) -> Self {
+        let mut steps = vec![(0, GamepadState::default())];
+        for (frame, buttons) in presses {
+            steps.push((*frame, GamepadState { buttons: *buttons, ..GamepadState::default() }));
+            steps.push((frame.saturating_add(hold.max(1)), GamepadState::default()));
+        }
+        Self::new(steps)
+    }
 }
 
 impl InputSource for ScriptedInput {
@@ -151,6 +168,23 @@ impl InputSource for ScriptedInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tap_is_pressed_and_then_let_go() {
+        // A title watches for the moment a button goes down, so a press
+        // that is never released is one press however long it is held.
+        let script = ScriptedInput::taps(&[(100, button::START), (300, button::UP)], 50);
+
+        assert_eq!(script.sample(0).expect("a state").buttons, 0, "nothing at the start");
+        assert_eq!(script.sample(99).expect("a state").buttons, 0);
+        assert_eq!(script.sample(100).expect("a state").buttons, button::START, "pressed");
+        assert_eq!(script.sample(149).expect("a state").buttons, button::START, "still held");
+        assert_eq!(script.sample(150).expect("a state").buttons, 0, "let go");
+        assert_eq!(script.sample(299).expect("a state").buttons, 0);
+        assert_eq!(script.sample(300).expect("a state").buttons, button::UP);
+        assert_eq!(script.sample(400).expect("a state").buttons, 0, "and let go again");
+        assert!(script.deterministic(), "a script is what makes a run repeatable");
+    }
 
     #[test]
     fn a_report_carries_its_buttons_and_sticks() {
