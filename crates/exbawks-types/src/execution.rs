@@ -80,6 +80,10 @@ pub enum StopReason {
     /// memory access or a divide error; guest exception delivery arrives
     /// with the SEH work).
     GuestFault { address: GuestVa },
+    /// Every guest thread is parked and no timer, deadline, or interrupt
+    /// can wake one (ADR 0021). The guest has genuinely deadlocked; the
+    /// run reports it rather than fabricating a wait's completion.
+    GuestDeadlock,
     /// The configured execution budget expired.
     BudgetExhausted,
     /// A person watching the run asked it to stop, by closing its window.

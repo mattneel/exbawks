@@ -77,6 +77,28 @@ pub enum Register {
     Cr4 = 0x0000_001F,
     Cr8 = 0x0000_0020,
     Efer = 0x0000_2001,
+    Xmm0 = 0x0000_1000,
+    Xmm1 = 0x0000_1001,
+    Xmm2 = 0x0000_1002,
+    Xmm3 = 0x0000_1003,
+    Xmm4 = 0x0000_1004,
+    Xmm5 = 0x0000_1005,
+    Xmm6 = 0x0000_1006,
+    Xmm7 = 0x0000_1007,
+    FpMmx0 = 0x0000_1010,
+    FpMmx1 = 0x0000_1011,
+    FpMmx2 = 0x0000_1012,
+    FpMmx3 = 0x0000_1013,
+    FpMmx4 = 0x0000_1014,
+    FpMmx5 = 0x0000_1015,
+    FpMmx6 = 0x0000_1016,
+    FpMmx7 = 0x0000_1017,
+    /// The packed x87 control/status/tag/opcode register
+    /// (`WHV_X64_FP_CONTROL_STATUS_REGISTER`).
+    FpControlStatus = 0x0000_1018,
+    /// The packed `MXCSR` and its mask
+    /// (`WHV_X64_XMM_CONTROL_STATUS_REGISTER`).
+    XmmControlStatus = 0x0000_1019,
 }
 
 /// One 16-byte `WHV_REGISTER_VALUE`.

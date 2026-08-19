@@ -180,17 +180,16 @@ impl KernelExport for RtlEnterCriticalSection {
         // The section is waited on by its own address, as the structure
         // intends: its first sixteen bytes are the event the releasing
         // thread signals.
-        match context.services.wait_for_dispatcher_object(base) {
-            // Parked. The caller resumes after this call returns, so the
-            // section is still the other thread's until it releases it —
-            // claiming it here would overwrite a live owner with a thread
-            // that is not running yet, and the release would then find the
-            // wrong one recorded.
+        match context.services.wait_for_dispatcher_object(base, None) {
+            // Parked. The caller resumes only after the releasing thread
+            // hands it the section: the release stamps this thread's
+            // control block into the owner field before the wake, so the
+            // woken thread resumes already holding it (ADR 0021). Claiming
+            // it here would overwrite the live owner.
             Ok(crate::WaitOutcome::Pending) => KernelStatus::SUCCESS,
-            // Free by the time the wait was asked for, or nothing else can
-            // run and so nothing can release it. Either way no other thread
-            // is inside, and taking it is both what lets the guest continue
-            // and what is true.
+            // An infinite wait cannot time out; a service that reports
+            // otherwise recorded no waiter, so taking the section is the
+            // consistent reading.
             Ok(crate::WaitOutcome::Signaled | crate::WaitOutcome::TimedOut) => {
                 set_field(context, base, OWNING_THREAD, owner.unwrap_or(0));
                 set_field(context, base, RECURSION_COUNT, 1);
@@ -228,11 +227,22 @@ impl KernelExport for RtlLeaveCriticalSection {
         set_field(context, base, LOCK_COUNT, lock);
         if recursion == 0 {
             set_field(context, base, OWNING_THREAD, 0);
-            // A lock count still at or above zero means someone is waiting
-            // on it, and releasing without waking them is a thread parked
-            // for the rest of the run.
+            // A lock count still at or above zero means someone is
+            // waiting. Ownership is handed to exactly one waiter before it
+            // wakes (ADR 0021): the release stamps that thread's control
+            // block as the owner, so no third thread can slip in between
+            // the release and the wake - two threads inside one section is
+            // the heap corruption this structure exists to prevent.
             if lock != UNOWNED_LOCK_COUNT {
-                context.services.signal_dispatcher_object(base);
+                match context.services.transfer_section_wake(base) {
+                    Some(kthread) => {
+                        set_field(context, base, OWNING_THREAD, kthread);
+                        set_field(context, base, RECURSION_COUNT, 1);
+                    }
+                    // Nobody parked yet; leave the event signaled so the
+                    // section's state is at least visible.
+                    None => context.services.signal_dispatcher_object(base),
+                }
             }
         }
         KernelStatus::SUCCESS
@@ -421,6 +431,7 @@ mod tests {
         fn wait_for_dispatcher_object(
             &mut self,
             address: u32,
+            _timeout_ms: Option<u64>,
         ) -> Result<WaitOutcome, KernelServiceError> {
             self.waited = Some(address);
             Ok(self.outcome.unwrap_or(WaitOutcome::Pending))

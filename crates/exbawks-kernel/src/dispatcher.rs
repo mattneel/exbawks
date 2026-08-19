@@ -5,11 +5,13 @@
 //! its signal state directly, so these exports work on guest memory first
 //! and only fall back to the scheduler when a wait would actually block.
 //!
-//! Nothing in the emulator raises an interrupt, so a wait no runnable
-//! thread can ever satisfy completes instead of deadlocking: the device
-//! model finishes submitted work synchronously (a graphics fence is
-//! already retired by the time the title waits on it), which makes
-//! "signaled" the truthful answer rather than an optimistic one.
+//! The hypervisor tier delivers vblank and USB interrupts, and interrupt
+//! routines are guest code that signals dispatcher objects - so a wait no
+//! runnable thread can satisfy is not a wait nothing can satisfy. An
+//! unsatisfied wait parks (ADR 0021); what wakes it is a signal, a
+//! deadline, or the run loop's idle machinery, and a wait nothing at all
+//! could wake stops the run as a diagnosed deadlock rather than being
+//! papered over.
 
 use exbawks_types::GuestVa;
 
@@ -20,6 +22,8 @@ use crate::{
 
 /// `DISPATCHER_HEADER.SignalState`.
 const SIGNAL_STATE_OFFSET: u32 = 4;
+/// `STATUS_TIMEOUT`.
+const STATUS_TIMEOUT: u32 = 0x0000_0102;
 /// `DISPATCHER_HEADER.Type` for an auto-reset (synchronization) event.
 const SYNCHRONIZATION_EVENT: u32 = 1;
 
@@ -69,17 +73,15 @@ impl KernelExport for KeWaitForSingleObject {
             }
             return KernelStatus::SUCCESS;
         }
-        match context.services.wait_for_dispatcher_object(object) {
-            // A pending wait parks this thread once the export returns; the
-            // saved status must already read success for the wake.
+        let Some(timeout_ms) = crate::startup::read_timeout_ms(context, 4) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        match context.services.wait_for_dispatcher_object(object, timeout_ms) {
+            // A pending wait parks this thread once the export returns;
+            // the saved status reads success now, and a deadline wake
+            // overwrites it with `STATUS_TIMEOUT`.
             Ok(WaitOutcome::Signaled | WaitOutcome::Pending) => KernelStatus::SUCCESS,
-            Ok(WaitOutcome::TimedOut) => {
-                tracing::debug!(
-                    object = format_args!("{object:#010x}"),
-                    "KeWaitForSingleObject: no thread can signal; completing the wait"
-                );
-                KernelStatus::SUCCESS
-            }
+            Ok(WaitOutcome::TimedOut) => KernelStatus(STATUS_TIMEOUT),
             Err(_) => KernelStatus::INVALID_PARAMETER,
         }
     }
@@ -159,6 +161,7 @@ mod tests {
         fn wait_for_dispatcher_object(
             &mut self,
             address: u32,
+            _timeout_ms: Option<u64>,
         ) -> Result<WaitOutcome, KernelServiceError> {
             self.waited = Some(address);
             self.outcome.ok_or(KernelServiceError::Unsupported)
@@ -239,7 +242,10 @@ mod tests {
     }
 
     #[test]
-    fn an_unsatisfiable_wait_completes_instead_of_deadlocking() {
+    fn a_timed_out_wait_reports_the_timeout() {
+        // The old model fabricated success here; a timeout is a timeout
+        // (ADR 0021), and what to do about an unwakeable wait is the run
+        // loop's decision, not this export's.
         let memory = mapped_memory();
         memory.write_u32(GuestVa(0x3000), SYNCHRONIZATION_EVENT).expect("type");
         memory.write_u32(GuestVa(0x3004), 0).expect("state");
@@ -247,7 +253,7 @@ mod tests {
             WaitServices { outcome: Some(WaitOutcome::TimedOut), ..Default::default() };
         assert_eq!(
             call(&KeWaitForSingleObject, &[0x3000, 0, 0, 0, 0], &mut services, &memory),
-            KernelStatus::SUCCESS
+            KernelStatus(STATUS_TIMEOUT)
         );
     }
 

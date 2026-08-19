@@ -58,8 +58,8 @@ pub use rtl::{
 };
 pub use services::{
     DisplayMode, FileInfo, FileOpenRequest, FileOpened, InterruptRoutine, KernelServiceError,
-    KernelServices, ThreadCreateRequest, ThreadCreated, UnsupportedServices, VirtualAllocRequest,
-    VirtualAllocation, WaitOutcome,
+    KernelServices, MultiWaitOutcome, ThreadCreateRequest, ThreadCreated, UnsupportedServices,
+    VirtualAllocRequest, VirtualAllocation, WaitOutcome,
 };
 pub use startup::{
     DbgPrint, HalReturnToFirmware, NtClose, NtCreateEvent, NtResumeThread, NtSetEvent,

@@ -1,8 +1,8 @@
 use exbawks_types::{GuestVa, StopReason};
 
 use crate::{
-    KernelCallContext, KernelError, KernelExport, KernelRegistry, KernelStatus, StubExport,
-    SuccessExport, ThreadCreateRequest,
+    KernelCallContext, KernelError, KernelExport, KernelRegistry, KernelStatus, SuccessExport,
+    ThreadCreateRequest,
 };
 
 /// Xbox kernel export ordinals from the public XboxDev export table.
@@ -158,10 +158,6 @@ pub mod ordinal {
     pub const XE_UNLOAD_SECTION: u16 = 328;
 }
 
-/// The startup stubs for timers and reclamation.
-const STARTUP_STUBS: [(u16, &str); 1] =
-    [(ordinal::KE_DELAY_EXECUTION_THREAD, "KeDelayExecutionThread")];
-
 /// Benign exports that succeed as no-ops on the boot path:
 /// (ordinal, name, stdcall argument bytes).
 const BENIGN_SUCCESS: [(u16, &str, u16); 3] = [
@@ -204,10 +200,47 @@ pub fn register_startup_exports(registry: &KernelRegistry) -> Result<(), KernelE
     for (ordinal, name, stack_bytes) in BENIGN_SUCCESS {
         registry.register(SuccessExport::new(ordinal, name, stack_bytes))?;
     }
-    for (ordinal, name) in STARTUP_STUBS {
-        registry.register(StubExport::new(ordinal, name))?;
-    }
+    registry.register(KeDelayExecutionThread)?;
     Ok(())
+}
+
+/// Parks the calling thread for an interval — a sleep (ADR 0021).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KeDelayExecutionThread;
+
+impl KernelExport for KeDelayExecutionThread {
+    fn ordinal(&self) -> u16 {
+        ordinal::KE_DELAY_EXECUTION_THREAD
+    }
+
+    fn name(&self) -> &'static str {
+        "KeDelayExecutionThread"
+    }
+
+    fn stack_bytes(&self) -> u16 {
+        12
+    }
+
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // KeDelayExecutionThread(WaitMode, Alertable, Interval). A null
+        // interval pointer is an error; an absolute or zero interval has
+        // already arrived and returns at once.
+        let Some(pointer) = stack_argument(context, 2).filter(|pointer| *pointer != 0) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        let (Ok(low), Ok(high)) = (
+            context.memory.read_u32(GuestVa(pointer)),
+            context.memory.read_u32(GuestVa(pointer.wrapping_add(4))),
+        ) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        let value = i64::from(high) << 32 | i64::from(low);
+        let milliseconds = if value < 0 { (value.unsigned_abs() / 10_000).max(1) } else { 0 };
+        match context.services.sleep_thread(milliseconds) {
+            Ok(_) => KernelStatus::SUCCESS,
+            Err(_) => KernelStatus::INVALID_PARAMETER,
+        }
+    }
 }
 
 /// Prints one guest ANSI string through host tracing.
@@ -645,14 +678,21 @@ impl KernelExport for NtSetEvent {
 /// `STATUS_TIMEOUT`.
 const STATUS_TIMEOUT: u32 = 0x0000_0102;
 
-/// Waits on one handle (event or thread), shared by both forms.
-fn wait_for_single(context: &mut KernelCallContext<'_>) -> KernelStatus {
+/// Waits on one handle (event, mutant, or thread), shared by both forms.
+///
+/// `timeout_index` names where the form keeps its `Timeout` argument,
+/// which is honored: null waits forever, zero polls (ADR 0021).
+fn wait_for_single(context: &mut KernelCallContext<'_>, timeout_index: u32) -> KernelStatus {
     let Some(handle) = stack_argument(context, 0) else {
         return KernelStatus::INVALID_PARAMETER;
     };
-    match context.services.wait_for_object(handle) {
+    let Some(timeout_ms) = read_timeout_ms(context, timeout_index) else {
+        return KernelStatus::INVALID_PARAMETER;
+    };
+    match context.services.wait_for_object(handle, timeout_ms) {
         // A pending wait parks this thread after the export returns; the
-        // saved EAX must already read success for when it wakes.
+        // saved EAX reads success now and the wake overwrites it with the
+        // real outcome — the winning index or `STATUS_TIMEOUT`.
         Ok(crate::WaitOutcome::Signaled | crate::WaitOutcome::Pending) => KernelStatus::SUCCESS,
         Ok(crate::WaitOutcome::TimedOut) => KernelStatus(STATUS_TIMEOUT),
         Err(_) => KernelStatus::INVALID_HANDLE,
@@ -677,7 +717,8 @@ impl KernelExport for NtWaitForSingleObject {
     }
 
     fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
-        wait_for_single(context)
+        // NtWaitForSingleObject(Handle, Alertable, Timeout).
+        wait_for_single(context, 2)
     }
 }
 
@@ -699,17 +740,17 @@ impl KernelExport for NtWaitForSingleObjectEx {
     }
 
     fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
-        wait_for_single(context)
+        // NtWaitForSingleObjectEx(Handle, WaitMode, Alertable, Timeout).
+        wait_for_single(context, 3)
     }
 }
 
 /// Waits for one of several objects named by handle.
 ///
-/// Only the wait-any form has a faithful cheap implementation: the handles
-/// are tried in order and the first satisfied one is consumed, exactly as
-/// the kernel's own scan does. A wait-all whose objects are not all ready,
-/// and a wait-any with none ready, park the thread on the first unsatisfied
-/// handle; ADR 0017's tri-state resolves the rest.
+/// The whole set is one wait block (ADR 0021): a wait-any is satisfied by
+/// the first signaled handle — checked now, or reported by the wake with
+/// `STATUS_WAIT_0` plus the winner's index — and a wait-all completes only
+/// when every object reads signaled at once.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NtWaitForMultipleObjectsEx;
 
@@ -741,36 +782,52 @@ impl KernelExport for NtWaitForMultipleObjectsEx {
         }
 
         let wait_all = wait_type == 0;
-        let mut pending = None;
+        let mut keys = Vec::with_capacity(count as usize);
         for index in 0..count {
             let Ok(handle) = context.memory.read_u32(GuestVa(handles + index * 4)) else {
                 return KernelStatus::ACCESS_VIOLATION;
             };
-            match context.services.wait_for_object(handle) {
-                Ok(crate::WaitOutcome::Signaled) if !wait_all => {
-                    // STATUS_WAIT_0 + index names the satisfied object.
-                    return KernelStatus(index);
-                }
-                Ok(crate::WaitOutcome::Signaled) => {}
-                // Nothing can signal this one; treat it as satisfied rather
-                // than deadlocking (the single-object waits do the same).
-                Ok(crate::WaitOutcome::TimedOut) => {
-                    if !wait_all {
-                        return KernelStatus(index);
-                    }
-                }
-                Ok(crate::WaitOutcome::Pending) => {
-                    pending = Some(index);
-                    if wait_all {
-                        break;
-                    }
-                }
-                Err(_) => return KernelStatus::INVALID_HANDLE,
-            }
+            keys.push(handle);
         }
-        // A parked wait resumes with success already in EAX.
-        KernelStatus(pending.unwrap_or(0))
+        let Some(timeout_ms) = read_timeout_ms(context, 5) else {
+            return KernelStatus::INVALID_PARAMETER;
+        };
+        match context.services.wait_for_objects(&keys, wait_all, timeout_ms) {
+            // STATUS_WAIT_0 + index names the satisfied object.
+            Ok(crate::MultiWaitOutcome::Satisfied(index)) => KernelStatus(index),
+            Ok(crate::MultiWaitOutcome::TimedOut) => KernelStatus(STATUS_TIMEOUT),
+            // The wake writes the real winner into the saved EAX.
+            Ok(crate::MultiWaitOutcome::Pending) => KernelStatus::SUCCESS,
+            Err(_) => KernelStatus::INVALID_HANDLE,
+        }
     }
+}
+
+/// Reads a wait's `Timeout` argument: a guest pointer to a
+/// `LARGE_INTEGER`, at `index` on the stack.
+///
+/// `None` means wait forever (a null pointer). `Some(0)` is a poll. A
+/// negative value is a relative interval in hundred-nanosecond units,
+/// converted to virtual milliseconds. A positive value is an absolute
+/// time this runtime has no calendar clock to compare against; it is
+/// treated as infinite with a trace note rather than converted by a
+/// fabricated clock (ADR 0021).
+pub(crate) fn read_timeout_ms(context: &KernelCallContext<'_>, index: u32) -> Option<Option<u64>> {
+    let pointer = stack_argument(context, index)?;
+    if pointer == 0 {
+        return Some(None);
+    }
+    let low = context.memory.read_u32(GuestVa(pointer)).ok()?;
+    let high = context.memory.read_u32(GuestVa(pointer.wrapping_add(4))).ok()?;
+    let value = i64::from(high) << 32 | i64::from(low);
+    if value == 0 {
+        return Some(Some(0));
+    }
+    if value > 0 {
+        tracing::trace!(value, "an absolute wait timeout is treated as infinite");
+        return Some(None);
+    }
+    Some(Some((value.unsigned_abs() / 10_000).max(1)))
 }
 
 /// Reads one 32-bit stack argument above the return-address slot.

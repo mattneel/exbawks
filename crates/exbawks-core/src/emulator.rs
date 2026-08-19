@@ -374,6 +374,11 @@ const GAMEPAD_SETTLE_FRAMES: u64 = 64;
 /// Milliseconds between vertical blanks, near enough sixty a second.
 const VBLANK_INTERVAL_MS: u64 = 16;
 
+/// `KPCR.Irql`'s offset inside the processor control region.
+const KPCR_IRQL_OFFSET: u32 = 0x24;
+/// The interrupt level at and above which a thread must not be preempted.
+const DISPATCH_LEVEL: u32 = 2;
+
 /// The interrupt vector the first USB host controller is wired to.
 ///
 /// A title asks the abstraction layer for it and connects a routine there;
@@ -1053,6 +1058,16 @@ impl Emulator {
                     );
                 }
             }
+            // Every thread parked means no guest code may run: virtual
+            // time jumps to the next wake instead (ADR 0021).
+            if self.threads.as_ref().is_some_and(|threads| !threads.active_runnable())
+                && self.interrupted.is_none()
+            {
+                if let Some(stop) = self.idle_step_deterministic() {
+                    return Ok(stop);
+                }
+                continue;
+            }
             let start = GuestVa(self.cpu.eip);
             // A thread's start routine returned (ADR 0011): a created thread
             // returns to the exit sentinel; the boot thread, whose stack has
@@ -1201,28 +1216,81 @@ impl Emulator {
         let action = self.threads.as_mut().and_then(ThreadManager::take_pending)?;
         match action {
             PendingAction::Exit { status } => self.exit_current_thread(status),
-            PendingAction::Wait { handle } => {
+            PendingAction::Wait { block } => {
+                // An interrupt or deferred procedure runs as a borrowed
+                // frame on whichever thread it displaced; parking that
+                // thread would park an unrelated wait. The real kernel
+                // forbids waiting at raised IRQL for the same reason.
+                if self.interrupted.is_some() {
+                    tracing::warn!("a wait inside an interrupt routine was dropped");
+                    return None;
+                }
                 let cpu = &mut self.cpu;
                 let parked =
-                    self.threads.as_mut().is_some_and(|threads| threads.park_active(handle, cpu));
-                // The wait service only reports Pending when another thread
-                // is runnable, so a failed park cannot strand the guest;
-                // continuing on the caller is the safe fallback.
+                    self.threads.as_mut().is_some_and(|threads| threads.park_active(block, cpu));
+                // With no ready thread the caller stays parked and the run
+                // loop idles (ADR 0021): the clocks advance, interrupts
+                // and timers fire, and the first wake resumes execution.
                 if !parked {
-                    tracing::warn!(handle, "a pending wait found no runnable thread");
+                    tracing::debug!("all threads parked; the run loop idles until a wake");
                 }
                 None
             }
         }
     }
 
-    /// Terminates the active thread and switches to the next ready one, or
-    /// stops with a guest exit when none remain.
+    /// Terminates the active thread and switches to the next ready one.
+    ///
+    /// No ready thread is not the end of the run while others are parked:
+    /// a timer, deadline, or interrupt may still wake one, which the run
+    /// loop's idle state waits for (ADR 0021). Only a table with nothing
+    /// left to wake is a guest exit.
     fn exit_current_thread(&mut self, status: u32) -> Option<StopReason> {
         let cpu = &mut self.cpu;
         let switched =
             self.threads.as_mut().is_some_and(|threads| threads.exit_active(cpu, status));
-        if switched { None } else { Some(StopReason::GuestExit { code: status }) }
+        if switched {
+            return None;
+        }
+        let any_waiting = self.threads.as_ref().is_some_and(|threads| threads.wake_hint().2);
+        if any_waiting { None } else { Some(StopReason::GuestExit { code: status }) }
+    }
+
+    /// One deterministic idle step for the interpreter tier (ADR 0021).
+    ///
+    /// With every thread parked, virtual time jumps straight to the next
+    /// wake - the earliest timer or wait deadline - and the woken thread
+    /// resumes. No wake source at all is a genuine deadlock, reported
+    /// rather than papered over.
+    fn idle_step_deterministic(&mut self) -> Option<StopReason> {
+        let Some(threads) = self.threads.as_mut() else {
+            return Some(StopReason::GuestDeadlock);
+        };
+        let (next_due, _interrupts, any_waiting) = threads.wake_hint();
+        if !any_waiting {
+            return Some(StopReason::GuestExit { code: self.cpu.gpr[0] });
+        }
+        let Some(due) = next_due else {
+            tracing::warn!(
+                threads = %threads.describe_threads(),
+                "every thread is parked and nothing can wake one"
+            );
+            return Some(StopReason::GuestDeadlock);
+        };
+        let now = threads.now_ms();
+        threads.advance_timers(due.saturating_sub(now).max(1));
+        let cpu = &mut self.cpu;
+        if self.threads.as_mut().is_some_and(|threads| threads.resume_any_ready(cpu)) {
+            return None;
+        }
+        // Timers fired but queued only deferred procedures; deliver them.
+        if self.threads.as_ref().is_some_and(ThreadManager::has_queued_dpc) && self.deliver_dpc() {
+            return None;
+        }
+        let description =
+            self.threads.as_ref().map(|threads| threads.describe_threads()).unwrap_or_default();
+        tracing::warn!(threads = %description, "an idle step woke nothing");
+        Some(StopReason::GuestDeadlock)
     }
 
     /// Executes one instruction through the tier-0 interpreter (ADR 0008),
@@ -2052,7 +2120,96 @@ impl Emulator {
             Ok(())
         };
         map_pramin(&self.memory, &self.devices, &self.threads, &mut machine, &mut pramin_mapped)?;
+        // How long the idle state tolerates no thread becoming runnable
+        // before calling it a deadlock: generous, because a wake can come
+        // from a wall-clock vblank chain the guest is slow to service.
+        const IDLE_DEADLOCK: std::time::Duration = std::time::Duration::from_secs(10);
+        let mut idle_since: Option<std::time::Instant> = None;
         while serviced < max_exits {
+            // Every thread parked and no interrupt in flight: nothing may
+            // execute, so idle (ADR 0021) - advance the clocks, let due
+            // timers and vblanks fire, deliver what they queue, and resume
+            // the first thread a wake readies. Guest code still runs for
+            // interrupt routines themselves, which is what the fall-through
+            // to `machine.run()` after a delivery is.
+            if self.interrupted.is_none()
+                && self.threads.as_ref().is_some_and(|threads| !threads.active_runnable())
+            {
+                advance_clock(
+                    &self.memory,
+                    &self.devices,
+                    self.threads.as_mut(),
+                    &mut self.cpu,
+                    tick_cell,
+                    &mut pacing,
+                );
+                self.attach_gamepad_when_ready();
+                self.sample_gamepad();
+                presented_owed += u64::from(pacing.advanced);
+                if presented_owed >= VBLANK_INTERVAL_MS {
+                    presented_owed = 0;
+                    self.present_display();
+                }
+                if self.display_closed() {
+                    return Ok(StopReason::HostRequested);
+                }
+                let cpu = &mut self.cpu;
+                let resumed =
+                    self.threads.as_mut().is_some_and(|threads| threads.resume_any_ready(cpu));
+                let mut proceed = resumed;
+                if !proceed
+                    && self.threads.as_ref().is_some_and(ThreadManager::has_queued_dpc)
+                    && self.deliver_dpc()
+                {
+                    proceed = true;
+                }
+                if !proceed
+                    && let Some(vector) = self.interrupt_requested()
+                    && self.deliver_interrupt(vector)
+                {
+                    proceed = true;
+                }
+                if proceed {
+                    idle_since = None;
+                    self.whp_write_cpu(&mut machine)?;
+                } else {
+                    let (next_due, interrupts, any_waiting) = self
+                        .threads
+                        .as_ref()
+                        .map(ThreadManager::wake_hint)
+                        .unwrap_or((None, false, false));
+                    if !any_waiting {
+                        return Ok(StopReason::GuestExit { code: self.cpu.gpr[0] });
+                    }
+                    if next_due.is_none() && !interrupts {
+                        let description = self
+                            .threads
+                            .as_ref()
+                            .map(|threads| threads.describe_threads())
+                            .unwrap_or_default();
+                        tracing::warn!(
+                            threads = %description,
+                            "every thread is parked and nothing can wake one"
+                        );
+                        return Ok(StopReason::GuestDeadlock);
+                    }
+                    let waited = idle_since.get_or_insert_with(std::time::Instant::now);
+                    if waited.elapsed() > IDLE_DEADLOCK {
+                        let description = self
+                            .threads
+                            .as_ref()
+                            .map(|threads| threads.describe_threads())
+                            .unwrap_or_default();
+                        tracing::warn!(
+                            threads = %description,
+                            "the idle state made no progress; reporting a deadlock"
+                        );
+                        return Ok(StopReason::GuestDeadlock);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+            }
             let exit = machine.run().map_err(|error| CoreError::Hypervisor(error.to_string()))?;
             let exit_rip = machine.exit_context().rip;
             match exit {
@@ -2133,14 +2290,26 @@ impl Emulator {
                     }
                     // Every few cancellations is a time slice (ADR 0017):
                     // rotate ready threads so a compute-only loop cannot
-                    // starve the rest of the guest.
+                    // starve the rest of the guest. Never mid-interrupt —
+                    // an ISR or DPC is atomic with respect to threads on
+                    // hardware — and never while the thread holds
+                    // DISPATCH_LEVEL, the guest's own claim that it must
+                    // not be preempted (review P2).
                     cancels += 1;
-                    if cancels.is_multiple_of(4) {
+                    if cancels.is_multiple_of(4) && self.interrupted.is_none() {
                         self.whp_read_cpu(&mut machine)?;
-                        let rotated = self
-                            .threads
-                            .as_mut()
-                            .is_some_and(|threads| threads.rotate_active(&mut self.cpu));
+                        let irql_address = self.cpu.segments[exbawks_cpu::Segment::Fs as usize]
+                            .base
+                            .wrapping_add(KPCR_IRQL_OFFSET);
+                        let raised = self
+                            .memory
+                            .read_u32(GuestVa(irql_address))
+                            .is_ok_and(|word| word & 0xFF >= DISPATCH_LEVEL);
+                        let rotated = !raised
+                            && self
+                                .threads
+                                .as_mut()
+                                .is_some_and(|threads| threads.rotate_active(&mut self.cpu));
                         if rotated {
                             self.whp_write_cpu(&mut machine)?;
                         }
@@ -2590,32 +2759,63 @@ impl Emulator {
         if self.gdt_fs_base.get() != self.cpu.segments[exbawks_cpu::Segment::Fs as usize].base {
             self.write_descriptor_table();
         }
-        machine
-            .set_registers(&[
-                (Register::Rax, RegisterValue::scalar(u64::from(self.cpu.gpr[0]))),
-                (Register::Rcx, RegisterValue::scalar(u64::from(self.cpu.gpr[1]))),
-                (Register::Rdx, RegisterValue::scalar(u64::from(self.cpu.gpr[2]))),
-                (Register::Rbx, RegisterValue::scalar(u64::from(self.cpu.gpr[3]))),
-                (Register::Rsp, RegisterValue::scalar(u64::from(self.cpu.gpr[4]))),
-                (Register::Rbp, RegisterValue::scalar(u64::from(self.cpu.gpr[5]))),
-                (Register::Rsi, RegisterValue::scalar(u64::from(self.cpu.gpr[6]))),
-                (Register::Rdi, RegisterValue::scalar(u64::from(self.cpu.gpr[7]))),
-                (Register::Rip, RegisterValue::scalar(u64::from(self.cpu.eip))),
-                (Register::Rflags, RegisterValue::scalar(u64::from(self.cpu.eflags | 0x2))),
-                // The flat data segment with the thread's KPCR base.
-                (
-                    Register::Fs,
-                    RegisterValue::segment(fs_base, 0xFFFF_FFFF, GDT_FS_SELECTOR, 0xC093),
-                ),
-            ])
-            .map_err(|error| CoreError::Hypervisor(error.to_string()))
+        // The floating-point file travels with every sync. A thread switch
+        // that moves only the integer registers leaves the partition's
+        // x87/XMM/MXCSR behind, and the DirectSound mixer and the D3D main
+        // thread then swap rounding modes and register stacks every few
+        // milliseconds - the review's confirmed-critical finding.
+        let mut entries: Vec<(Register, RegisterValue)> = vec![
+            (Register::Rax, RegisterValue::scalar(u64::from(self.cpu.gpr[0]))),
+            (Register::Rcx, RegisterValue::scalar(u64::from(self.cpu.gpr[1]))),
+            (Register::Rdx, RegisterValue::scalar(u64::from(self.cpu.gpr[2]))),
+            (Register::Rbx, RegisterValue::scalar(u64::from(self.cpu.gpr[3]))),
+            (Register::Rsp, RegisterValue::scalar(u64::from(self.cpu.gpr[4]))),
+            (Register::Rbp, RegisterValue::scalar(u64::from(self.cpu.gpr[5]))),
+            (Register::Rsi, RegisterValue::scalar(u64::from(self.cpu.gpr[6]))),
+            (Register::Rdi, RegisterValue::scalar(u64::from(self.cpu.gpr[7]))),
+            (Register::Rip, RegisterValue::scalar(u64::from(self.cpu.eip))),
+            (Register::Rflags, RegisterValue::scalar(u64::from(self.cpu.eflags | 0x2))),
+            // The flat data segment with the thread's KPCR base.
+            (Register::Fs, RegisterValue::segment(fs_base, 0xFFFF_FFFF, GDT_FS_SELECTOR, 0xC093)),
+        ];
+        for (index, name) in XMM_REGISTERS.iter().enumerate() {
+            let value = self.cpu.xmm[index];
+            entries.push((*name, RegisterValue { low: value as u64, high: (value >> 64) as u64 }));
+        }
+        for (index, name) in FP_MMX_REGISTERS.iter().enumerate() {
+            let bytes = self.cpu.x87.registers[index];
+            entries.push((
+                *name,
+                RegisterValue {
+                    low: u64::from_le_bytes(bytes[0..8].try_into().unwrap_or_default()),
+                    high: u64::from_le_bytes(bytes[8..16].try_into().unwrap_or_default()),
+                },
+            ));
+        }
+        // WHV_X64_FP_CONTROL_STATUS_REGISTER: FpControl, FpStatus, the
+        // abridged (FXSAVE-form) tag, a reserved byte, then LastFpOp; the
+        // instruction-pointer half stays zero.
+        let abridged = abridge_x87_tag(self.cpu.x87.tag);
+        let control_status = u64::from(self.cpu.x87.control)
+            | u64::from(self.cpu.x87.status) << 16
+            | u64::from(abridged) << 32
+            | u64::from(self.cpu.x87.opcode) << 48;
+        entries.push((Register::FpControlStatus, RegisterValue::scalar(control_status)));
+        // WHV_X64_XMM_CONTROL_STATUS_REGISTER: the low quadword is the
+        // last-operand pointer; `MXCSR` and its mask are the HIGH one. A
+        // zero in the control half unmasks every SSE exception, and the
+        // first inexact result then faults the guest - which is exactly
+        // what packing this into the wrong half did.
+        let xmm_control = u64::from(self.cpu.mxcsr) | 0xFFBF_u64 << 32;
+        entries.push((Register::XmmControlStatus, RegisterValue { low: 0, high: xmm_control }));
+        machine.set_registers(&entries).map_err(|error| CoreError::Hypervisor(error.to_string()))
     }
 
     /// Reads the virtual processor's state back into the guest CPU state.
     fn whp_read_cpu(&mut self, machine: &mut exbawks_whp::Machine) -> Result<(), CoreError> {
         use exbawks_whp::Register;
 
-        const NAMES: [Register; 10] = [
+        const NAMES: [Register; 28] = [
             Register::Rax,
             Register::Rcx,
             Register::Rdx,
@@ -2626,6 +2826,24 @@ impl Emulator {
             Register::Rdi,
             Register::Rip,
             Register::Rflags,
+            Register::Xmm0,
+            Register::Xmm1,
+            Register::Xmm2,
+            Register::Xmm3,
+            Register::Xmm4,
+            Register::Xmm5,
+            Register::Xmm6,
+            Register::Xmm7,
+            Register::FpMmx0,
+            Register::FpMmx1,
+            Register::FpMmx2,
+            Register::FpMmx3,
+            Register::FpMmx4,
+            Register::FpMmx5,
+            Register::FpMmx6,
+            Register::FpMmx7,
+            Register::FpControlStatus,
+            Register::XmmControlStatus,
         ];
         let values = machine
             .get_registers(&NAMES)
@@ -2635,8 +2853,78 @@ impl Emulator {
         }
         self.cpu.eip = values[8].low as u32;
         self.cpu.eflags = values[9].low as u32;
+        for index in 0..8 {
+            let value = &values[10 + index];
+            self.cpu.xmm[index] = u128::from(value.low) | u128::from(value.high) << 64;
+        }
+        for index in 0..8 {
+            let value = &values[18 + index];
+            let mut bytes = [0_u8; 16];
+            bytes[0..8].copy_from_slice(&value.low.to_le_bytes());
+            bytes[8..16].copy_from_slice(&value.high.to_le_bytes());
+            self.cpu.x87.registers[index] = bytes;
+        }
+        let control_status = values[26].low;
+        self.cpu.x87.control = control_status as u16;
+        self.cpu.x87.status = (control_status >> 16) as u16;
+        self.cpu.x87.tag = expand_x87_tag((control_status >> 32) as u8);
+        self.cpu.x87.opcode = (control_status >> 48) as u16;
+        self.cpu.mxcsr = values[27].high as u32;
         Ok(())
     }
+}
+
+/// The guest XMM registers, in file order.
+#[cfg(all(windows, target_arch = "x86_64"))]
+const XMM_REGISTERS: [exbawks_whp::Register; 8] = [
+    exbawks_whp::Register::Xmm0,
+    exbawks_whp::Register::Xmm1,
+    exbawks_whp::Register::Xmm2,
+    exbawks_whp::Register::Xmm3,
+    exbawks_whp::Register::Xmm4,
+    exbawks_whp::Register::Xmm5,
+    exbawks_whp::Register::Xmm6,
+    exbawks_whp::Register::Xmm7,
+];
+
+/// The x87 register slots, in file order.
+#[cfg(all(windows, target_arch = "x86_64"))]
+const FP_MMX_REGISTERS: [exbawks_whp::Register; 8] = [
+    exbawks_whp::Register::FpMmx0,
+    exbawks_whp::Register::FpMmx1,
+    exbawks_whp::Register::FpMmx2,
+    exbawks_whp::Register::FpMmx3,
+    exbawks_whp::Register::FpMmx4,
+    exbawks_whp::Register::FpMmx5,
+    exbawks_whp::Register::FpMmx6,
+    exbawks_whp::Register::FpMmx7,
+];
+
+/// Compresses the full x87 tag word to the FXSAVE abridged form the
+/// hypervisor register carries: one bit per register, set when the slot
+/// is not empty.
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn abridge_x87_tag(tag: u16) -> u8 {
+    let mut abridged = 0_u8;
+    for slot in 0..8 {
+        if (tag >> (slot * 2)) & 0b11 != 0b11 {
+            abridged |= 1 << slot;
+        }
+    }
+    abridged
+}
+
+/// Expands the abridged tag back to the full form: a used slot reads as
+/// valid, an empty one as empty. The valid/zero/special distinction is
+/// recomputed by the next x87 operation that cares.
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn expand_x87_tag(abridged: u8) -> u16 {
+    let mut tag = 0_u16;
+    for slot in 0..8 {
+        let pair = if abridged & (1 << slot) != 0 { 0b00 } else { 0b11 };
+        tag |= pair << (slot * 2);
+    }
+    tag
 }
 
 impl Emulator {
@@ -3868,9 +4156,11 @@ mod tests {
 
         #[cfg(windows)]
         #[test]
-        fn unimplemented_stub_halts_the_run() {
-            // Ordinal 99 (KeDelayExecutionThread) is a registered but
-            // unimplemented stub.
+        fn a_delay_with_a_bad_interval_is_rejected_not_fatal() {
+            // Ordinal 99 (KeDelayExecutionThread) was the registry's last
+            // halting stub; it is a real sleep now (ADR 0021). Called with
+            // no arguments set up, it must reject the null interval and
+            // return, not halt the run.
             let code = [0xFF, 0x15, 0x00, 0x12, 0x01, 0x00, 0xC3];
             let mut emulator = Emulator::new().expect("emulator must initialize");
             emulator
@@ -3878,7 +4168,10 @@ mod tests {
                 .expect("synthetic XBE must load");
 
             let stop = emulator.run(16).expect("the run must stop cleanly");
-            assert_eq!(stop, StopReason::UnimplementedKernelExport { ordinal: 99 });
+            assert!(
+                !matches!(stop, StopReason::UnimplementedKernelExport { .. }),
+                "the delay dispatched: {stop:?}"
+            );
         }
 
         #[cfg(windows)]

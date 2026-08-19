@@ -131,11 +131,23 @@ pub struct DisplayMode {
 pub enum WaitOutcome {
     /// The object is already signaled (an auto-reset event is consumed).
     Signaled,
-    /// The wait parks the calling thread until the object signals.
+    /// The wait parks the calling thread until the object signals or its
+    /// deadline passes (ADR 0021).
     Pending,
-    /// No other thread is runnable to ever signal the object; the wait
-    /// reports a timeout instead of deadlocking the guest.
+    /// The wait's timeout elapsed before the object signaled. A
+    /// zero-timeout poll on an unsignaled object reports this immediately.
     TimedOut,
+}
+
+/// How a wait on several objects resolved (ADR 0021).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiWaitOutcome {
+    /// One object satisfied the wait; the index names which.
+    Satisfied(u32),
+    /// The timeout elapsed with nothing satisfied.
+    TimedOut,
+    /// The wait parks the calling thread on the whole set.
+    Pending,
 }
 
 /// A kernel service failure.
@@ -314,7 +326,33 @@ pub trait KernelServices {
         false
     }
 
-    fn wait_for_object(&mut self, _handle: u32) -> Result<WaitOutcome, KernelServiceError> {
+    /// `timeout_ms` is `None` to wait forever, `Some(0)` to poll, and
+    /// otherwise a relative deadline in virtual milliseconds (ADR 0021).
+    fn wait_for_object(
+        &mut self,
+        _handle: u32,
+        _timeout_ms: Option<u64>,
+    ) -> Result<WaitOutcome, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
+    /// Begins a wait on several handles at once (ADR 0021).
+    ///
+    /// `wait_all` demands every object; otherwise the first satisfied one
+    /// wins and its index is reported.
+    fn wait_for_objects(
+        &mut self,
+        _keys: &[u32],
+        _wait_all: bool,
+        _timeout_ms: Option<u64>,
+    ) -> Result<MultiWaitOutcome, KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
+    /// Parks the calling thread with no object at all — a sleep. The
+    /// deadline wake reports success, because finishing is what a delay
+    /// does (ADR 0021).
+    fn sleep_thread(&mut self, _timeout_ms: u64) -> Result<WaitOutcome, KernelServiceError> {
         Err(KernelServiceError::Unsupported)
     }
 
@@ -386,12 +424,23 @@ pub trait KernelServices {
     fn wait_for_dispatcher_object(
         &mut self,
         _address: u32,
+        _timeout_ms: Option<u64>,
     ) -> Result<WaitOutcome, KernelServiceError> {
         Err(KernelServiceError::Unsupported)
     }
 
-    /// Wakes every thread parked on a dispatcher object's guest address.
+    /// Signals a dispatcher object by guest address. How many waiters wake
+    /// is the object's decision: an auto-reset event wakes one and is
+    /// consumed by that wake; everything else wakes all (ADR 0021).
     fn signal_dispatcher_object(&mut self, _address: u32) {}
+
+    /// Hands a released critical section to exactly one parked waiter,
+    /// returning that thread's control-block address so the releasing
+    /// export can record it as the owner (ADR 0021). `None` when nobody
+    /// is parked on the section.
+    fn transfer_section_wake(&mut self, _address: u32) -> Option<u32> {
+        None
+    }
 
     /// Opens a handle to an existing symbolic-link object.
     fn open_symbolic_link(&mut self, _name: &str) -> Result<u32, KernelServiceError> {

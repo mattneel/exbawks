@@ -29,6 +29,72 @@ The project follows Keep a Changelog structure before its first release.
   "stopped working" — the same press, in a run that lost the race, ends
   at the fault before the title acts on it.
 
+### Changed
+
+- **Waits are real now (ADR 0021).** The synchronization layer's
+  fabrications — the structural review's largest finding — are deleted and
+  replaced with the semantics the console's kernel actually has:
+
+  - A wait is a block: its keys, wait-any or wait-all, a deadline, and
+    what a timeout returns. One central arbiter decides every wake — an
+    auto-reset event hands its signal to exactly one waiter, whether
+    signaled by handle or by address; a released mutant wakes one waiter
+    and transfers ownership in the same step; a released critical section
+    stamps exactly one waiter's control block as the new owner before
+    waking it, so two threads can never again be inside one section — the
+    likeliest cause of the intermittent heap-free-list fault.
+  - Timeouts are honored everywhere: null waits forever, zero polls and
+    reports `STATUS_TIMEOUT` without parking, negative intervals become
+    virtual-millisecond deadlines whose expiry wakes the thread with the
+    right status. `KeDelayExecutionThread` is a real sleep now, not a
+    halting stub. A multi-object wait is one block; the wake writes
+    `STATUS_WAIT_0` plus the winner's index into the woken thread's saved
+    EAX, so the export reports the right object.
+  - When no thread is runnable, the runtime idles instead of lying: the
+    hypervisor tier advances the clocks and delivers due vblanks, timers,
+    and deferred procedures until a wake readies someone; the interpreter
+    tier jumps virtual time straight to the next deadline. A guest whose
+    parked threads nothing can wake stops with the new
+    `StopReason::GuestDeadlock` and the thread table — reported, not
+    papered over. Waits recorded inside an interrupt routine are dropped
+    with a warning, as the real kernel forbids them.
+  - Event and mutant handles come from monotonic cursors; a closed
+    handle's value is never reissued while its neighbours live.
+  - A thread exit now wakes joiners that waited by KTHREAD address as
+    well as by handle.
+
+  What this did to the retail title is worth recording precisely, because
+  the first reading was wrong. With real waits alone, four of four runs
+  sailed past the old intermittent heap fault at `0x001AE56C` — but their
+  logs each carried 33 "wait inside an interrupt routine was dropped"
+  warnings, and those waits were not from interrupt code: the ADR 0017
+  rotation could land mid-ISR, ordinary threads then ran with the
+  interrupt frame still live, and their waits were dropped with success
+  already in EAX. The fabrication had survived by accident. With the
+  mid-ISR rotation guard closing that hole, every wait is real — and the
+  title hits the heap fault four times in four, at the same place, with
+  the same digest. The fault was never intermittent scheduling luck; it
+  is a real divergence in the title's own allocator (it unlinks from a
+  static free-list bucket whose head was never populated — nothing ever
+  wrote to it), now reliably reproducible around controller frame 28,500.
+  A deterministic repro of the next wall is what this work actually
+  bought.
+
+- **The floating-point file travels with every hypervisor context switch.**
+  Thread switches moved ten integer registers and `FS` and nothing else,
+  so the partition's live x87/XMM/MXCSR simply carried across: the
+  DirectSound mixer and the D3D main thread inherited each other's
+  register stacks and rounding modes every few milliseconds — a confirmed
+  critical from the structural review, and structural in the narrow sense
+  too: the hypervisor crate's register set had no floating-point names at
+  all. Every context sync now carries XMM0–7, the x87 slots, the packed
+  control/status/tag words, and `MXCSR` (with the Pentium III mask), so a
+  thread's arithmetic is its own again. Two related guards: a time slice
+  never lands mid-interrupt-routine — an ISR is atomic with respect to
+  threads on real hardware — and never while the thread's own
+  `KPCR.Irql` sits at or above `DISPATCH_LEVEL`, which is the guest's
+  declared no-preemption region.
+
 ### Added
 
 - A run reports every guest thread at its stop — the identifier, what each

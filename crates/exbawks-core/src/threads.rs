@@ -88,8 +88,23 @@ const MINIMUM_STACK_BYTES: u32 = 16 * 1024;
 /// Scratch bytes kept above a new thread's initial stack pointer.
 const STACK_SCRATCH: u32 = 16;
 
+/// Everything one parked thread waits for (ADR 0021).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WaitBlock {
+    /// The objects, as handles or guest addresses, in the order the guest
+    /// named them — a wake reports the satisfied one's index.
+    pub keys: Vec<u32>,
+    /// Whether every key must signal, rather than any one of them.
+    pub all: bool,
+    /// The virtual millisecond the wait gives up at, when it has one.
+    pub deadline: Option<u64>,
+    /// What EAX reads when the deadline passes: `STATUS_TIMEOUT` for a
+    /// wait, success for a sleep, which finishes rather than fails.
+    pub timeout_status: u32,
+}
+
 /// One guest thread's schedulable state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ThreadState {
     /// Eligible to run.
     Ready,
@@ -97,11 +112,17 @@ pub(crate) enum ThreadState {
     Running,
     /// Created suspended; a resume makes it ready.
     Suspended,
-    /// Parked until the named handle signals (ADR 0017).
-    Waiting(u32),
+    /// Parked on a wait block until a key signals or the deadline passes
+    /// (ADR 0021).
+    Waiting(WaitBlock),
     /// Finished; never scheduled again.
     Terminated,
 }
+
+/// `STATUS_TIMEOUT`, the status a timed-out wait reads.
+const STATUS_TIMEOUT: u32 = 0x0000_0102;
+/// `DISPATCHER_HEADER.Type` for an auto-reset (synchronization) event.
+const SYNCHRONIZATION_EVENT_TYPE: u32 = 1;
 
 /// One guest thread record.
 #[derive(Debug)]
@@ -127,17 +148,17 @@ pub(crate) struct GuestThread {
 }
 
 /// A scheduling effect recorded during a kernel call (ADR 0011).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PendingAction {
     /// The calling thread exits with a status.
     Exit {
         /// The guest exit status.
         status: u32,
     },
-    /// The calling thread parks until the handle signals (ADR 0017).
+    /// The calling thread parks on a wait block (ADR 0021).
     Wait {
-        /// The awaited guest handle.
-        handle: u32,
+        /// Everything the thread waits for.
+        block: WaitBlock,
     },
 }
 
@@ -202,9 +223,14 @@ pub(crate) struct ThreadManager {
     /// cooperative scheduler (ADR 0011) events never block; the state exists
     /// for the guest's own signal/query bookkeeping.
     events: HashMap<u32, (bool, bool)>,
+    /// The next event handle to hand out; a cursor, never the map's size,
+    /// so a closed handle is not reissued while its neighbours live.
+    next_event_handle: u32,
     /// Guest mutant objects (handle → owner thread index and recursion
     /// count, `None` when unowned).
     mutants: HashMap<u32, Option<(usize, u32)>>,
+    /// The next mutant handle, a cursor like the event one.
+    next_mutant_handle: u32,
     /// The most recent display mode the title programmed, if any.
     display_mode: Option<DisplayMode>,
 }
@@ -250,7 +276,9 @@ impl ThreadManager {
             pool_sizes: HashMap::new(),
             gpu_instance: None,
             events: HashMap::new(),
+            next_event_handle: EVENT_HANDLE_BASE,
             mutants: HashMap::new(),
+            next_mutant_handle: MUTANT_HANDLE_BASE,
             display_mode: None,
         }
     }
@@ -547,11 +575,20 @@ impl ThreadManager {
             .iter()
             .enumerate()
             .map(|(index, thread)| {
-                let state = match thread.state {
+                let state = match &thread.state {
                     ThreadState::Ready => "ready".to_owned(),
                     ThreadState::Running => "running".to_owned(),
                     ThreadState::Suspended => "suspended".to_owned(),
-                    ThreadState::Waiting(handle) => format!("waiting on {handle:#06x}"),
+                    ThreadState::Waiting(block) => {
+                        let keys: Vec<String> =
+                            block.keys.iter().map(|key| format!("{key:#x}")).collect();
+                        match block.deadline {
+                            Some(at) => {
+                                format!("waiting on [{}] until {at}ms", keys.join(", "))
+                            }
+                            None => format!("waiting on [{}]", keys.join(", ")),
+                        }
+                    }
                     ThreadState::Terminated => "terminated".to_owned(),
                 };
                 // The active thread's context lives in the processor, not
@@ -607,29 +644,21 @@ impl ThreadManager {
         // control block, so a thread that dies without writing it there is
         // one the title waits on forever.
         self.publish_thread_exit(self.current, status);
-        // Joiners of this thread's handle wake (ADR 0017).
-        let exited_handle = 0x0000_E000 + (self.current as u32) * 4;
-        for thread in &mut self.threads {
-            if thread.state == ThreadState::Waiting(exited_handle) {
-                thread.state = ThreadState::Ready;
-            }
+        // Joiners wake, whichever way they named this thread: by its
+        // handle, or by its control block's address (ADR 0021). A
+        // terminated thread stays signaled, so every joiner wakes.
+        let exited_handle = THREAD_HANDLE_BASE + (self.current as u32) * 4;
+        self.wake_by_key(exited_handle, true);
+        if let Some(thread) = self.threads.get(self.current) {
+            let kthread = thread.kpcr.0 + KTHREAD_OFFSET;
+            self.wake_by_key(kthread, true);
         }
-        // FIFO by creation order (ADR 0011).
-        let next = match self.threads.iter().position(|thread| thread.state == ThreadState::Ready) {
-            Some(next) => next,
-            // Every remaining thread is parked on an object nothing can
-            // signal now that this one is gone. The emulated devices raise
-            // no interrupts and finish their work synchronously, so the
-            // waits are already satisfied in fact: release them rather than
-            // reporting the guest exited (the stance `WaitOutcome::TimedOut`
-            // takes when a wait begins with nothing else runnable).
-            None if self.release_parked_waits() => {
-                match self.threads.iter().position(|thread| thread.state == ThreadState::Ready) {
-                    Some(next) => next,
-                    None => return false,
-                }
-            }
-            None => return false,
+        // FIFO by creation order (ADR 0011). No thread ready means the
+        // rest are parked or done; the run loop idles or stops — waits are
+        // never fabricated complete (ADR 0021).
+        let Some(next) = self.threads.iter().position(|thread| thread.state == ThreadState::Ready)
+        else {
+            return false;
         };
         self.threads[next].state = ThreadState::Running;
         // The time-stamp counter is per-core, not per-thread, so it carries
@@ -655,43 +684,194 @@ impl ThreadManager {
         (index < self.threads.len()).then_some(index)
     }
 
-    /// Makes every parked thread ready, reporting whether any was parked.
-    fn release_parked_waits(&mut self) -> bool {
-        let mut released = false;
-        for thread in &mut self.threads {
-            if let ThreadState::Waiting(handle) = thread.state {
-                tracing::debug!(
-                    handle = format_args!("{handle:#010x}"),
-                    "releasing a parked wait: no other thread can signal it"
-                );
-                thread.state = ThreadState::Ready;
-                released = true;
-            }
+    /// Readies one thread with the given wake status in its saved EAX.
+    ///
+    /// A parked thread's export already returned, so the only way a wake
+    /// can tell it what happened — which object won a multi-wait, or that
+    /// the deadline passed — is through the register it will resume with.
+    fn ready_thread_with(&mut self, index: usize, eax: u32) {
+        if let Some(thread) = self.threads.get_mut(index) {
+            thread.cpu.gpr[0] = eax;
+            thread.state = ThreadState::Ready;
         }
-        released
     }
 
-    /// Parks the active thread on a handle and resumes the next ready one.
+    /// Whether one wait key reads as signaled for one thread, without
+    /// consuming anything.
+    fn key_signaled(&self, key: u32, for_thread: usize) -> bool {
+        if let Some((_, signaled)) = self.events.get(&key) {
+            return *signaled;
+        }
+        if let Some(owner) = self.mutants.get(&key) {
+            return match owner {
+                None => true,
+                Some((holder, _)) => *holder == for_thread,
+            };
+        }
+        if let Some(index) = self.thread_index(key) {
+            return self.threads.get(index).is_some_and(|t| t.state == ThreadState::Terminated);
+        }
+        // A guest address: the dispatcher header's signal state says.
+        self.memory
+            .read_u32(GuestVa(key.wrapping_add(DISPATCHER_SIGNAL_STATE)))
+            .is_ok_and(|state| state != 0)
+    }
+
+    /// Consumes one wait key on behalf of one thread: an auto-reset event
+    /// resets, a free mutant becomes that thread's. Everything else is
+    /// untouched by being waited on.
+    fn consume_key(&mut self, key: u32, for_thread: usize) {
+        if let Some((manual_reset, signaled)) = self.events.get_mut(&key) {
+            if !*manual_reset {
+                *signaled = false;
+            }
+            return;
+        }
+        if let Some(owner) = self.mutants.get_mut(&key)
+            && owner.is_none()
+        {
+            *owner = Some((for_thread, 1));
+        }
+    }
+
+    /// Wakes threads whose wait contains `key`, reporting how many woke.
     ///
-    /// Returns `false` when no other thread is runnable (the wait service
-    /// reports a timeout instead of parking in that case, so this is a
-    /// should-not-happen guard).
-    pub(crate) fn park_active(&mut self, handle: u32, active_cpu: &mut CpuState) -> bool {
+    /// This is the one wake arbiter (ADR 0021). A wait-any block is
+    /// satisfied outright and told which of its keys won; a wait-all block
+    /// is re-checked whole and satisfied only when every key reads
+    /// signaled, consuming what it consumes. `wake_all` is the signaled
+    /// object's own semantics: false for objects one signal hands to one
+    /// waiter, true for those that stay signaled for everyone.
+    fn wake_by_key(&mut self, key: u32, wake_all: bool) -> usize {
+        let candidates: Vec<usize> = self
+            .threads
+            .iter()
+            .enumerate()
+            .filter(|(_, thread)| {
+                matches!(&thread.state, ThreadState::Waiting(block) if block.keys.contains(&key))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let mut woken = 0;
+        for index in candidates {
+            let ThreadState::Waiting(block) = self.threads[index].state.clone() else {
+                continue;
+            };
+            if block.all {
+                if block.keys.iter().all(|k| self.key_signaled(*k, index)) {
+                    for k in &block.keys {
+                        self.consume_key(*k, index);
+                    }
+                    self.ready_thread_with(index, 0);
+                    woken += 1;
+                }
+            } else {
+                let position = block.keys.iter().position(|k| *k == key).unwrap_or(0) as u32;
+                // What the wake hands over is consumed by the thread it
+                // wakes: a mutant's woken waiter owns it from this moment.
+                self.consume_key(key, index);
+                // STATUS_WAIT_0 + index names the object that satisfied it.
+                self.ready_thread_with(index, position);
+                woken += 1;
+            }
+            if !wake_all && woken > 0 {
+                return woken;
+            }
+        }
+        woken
+    }
+
+    /// Records the wait the run loop parks the caller on (ADR 0021).
+    fn park_pending(
+        &mut self,
+        keys: Vec<u32>,
+        all: bool,
+        timeout_ms: Option<u64>,
+        timeout_status: u32,
+    ) {
+        let deadline = timeout_ms.map(|ms| self.elapsed_ms.saturating_add(ms.max(1)));
+        self.pending =
+            Some(PendingAction::Wait { block: WaitBlock { keys, all, deadline, timeout_status } });
+    }
+
+    /// Parks the active thread on a wait block and resumes the next ready
+    /// one.
+    ///
+    /// Returns `false` when no other thread is runnable. The caller stays
+    /// parked either way — the run loop then idles, advancing the clocks
+    /// and delivering interrupts until a wake makes some thread ready
+    /// (ADR 0021), instead of the wait being fabricated complete.
+    pub(crate) fn park_active(&mut self, block: WaitBlock, active_cpu: &mut CpuState) -> bool {
+        if let Some(thread) = self.threads.get_mut(self.current) {
+            thread.cpu = active_cpu.clone();
+            thread.state = ThreadState::Waiting(block);
+        }
         let Some(next) = self.threads.iter().enumerate().position(|(index, thread)| {
             index != self.current && thread.state == ThreadState::Ready
         }) else {
             return false;
         };
-        if let Some(thread) = self.threads.get_mut(self.current) {
-            thread.cpu = active_cpu.clone();
-            thread.state = ThreadState::Waiting(handle);
-        }
         self.threads[next].state = ThreadState::Running;
         let tsc = active_cpu.tsc;
         *active_cpu = self.threads[next].cpu.clone();
         active_cpu.tsc = tsc;
         self.current = next;
         true
+    }
+
+    /// Whether the active thread may execute guest code right now.
+    pub(crate) fn active_runnable(&self) -> bool {
+        self.threads.get(self.current).is_some_and(|t| t.state == ThreadState::Running)
+    }
+
+    /// Switches to any ready thread when the active one cannot run,
+    /// reporting whether guest execution may continue.
+    ///
+    /// The parked thread's context was saved when it parked, so nothing is
+    /// saved here — the live CPU state is stale by design.
+    pub(crate) fn resume_any_ready(&mut self, active_cpu: &mut CpuState) -> bool {
+        if self.active_runnable() {
+            return true;
+        }
+        let Some(next) = self.threads.iter().position(|thread| thread.state == ThreadState::Ready)
+        else {
+            return false;
+        };
+        self.threads[next].state = ThreadState::Running;
+        let tsc = active_cpu.tsc;
+        *active_cpu = self.threads[next].cpu.clone();
+        active_cpu.tsc = tsc;
+        self.current = next;
+        true
+    }
+
+    /// What could still wake a parked thread: the earliest virtual-time
+    /// wake (timer or wait deadline), whether any interrupt routine is
+    /// connected, and whether any thread is parked at all.
+    pub(crate) fn wake_hint(&self) -> (Option<u64>, bool, bool) {
+        let mut next: Option<u64> = None;
+        let mut consider = |at: u64| {
+            next = Some(next.map_or(at, |known: u64| known.min(at)));
+        };
+        for timer in &self.timers {
+            consider(timer.due_at);
+        }
+        let mut any_waiting = false;
+        for thread in &self.threads {
+            if let ThreadState::Waiting(block) = &thread.state {
+                any_waiting = true;
+                if let Some(deadline) = block.deadline {
+                    consider(deadline);
+                }
+            }
+        }
+        let interrupts = self.interrupts.iter().any(|(_, connected)| *connected);
+        (next, interrupts, any_waiting)
+    }
+
+    /// The current virtual time in milliseconds.
+    pub(crate) fn now_ms(&self) -> u64 {
+        self.elapsed_ms
     }
 
     /// Renders every thread's scheduling state for stop diagnostics.
@@ -730,11 +910,30 @@ impl ThreadManager {
     /// Advances guest time and queues the deferred procedures of any
     /// timers that have come due.
     pub(crate) fn advance_timers(&mut self, milliseconds: u64) {
-        if milliseconds == 0 || self.timers.is_empty() {
-            self.elapsed_ms = self.elapsed_ms.saturating_add(milliseconds);
+        self.elapsed_ms = self.elapsed_ms.saturating_add(milliseconds);
+        if milliseconds == 0 {
             return;
         }
-        self.elapsed_ms = self.elapsed_ms.saturating_add(milliseconds);
+        // Waits whose deadline has passed wake with their timeout status —
+        // `STATUS_TIMEOUT` for a wait, success for a sleep (ADR 0021).
+        let now = self.elapsed_ms;
+        let expired: Vec<(usize, u32)> = self
+            .threads
+            .iter()
+            .enumerate()
+            .filter_map(|(index, thread)| match &thread.state {
+                ThreadState::Waiting(block) if block.deadline.is_some_and(|at| at <= now) => {
+                    Some((index, block.timeout_status))
+                }
+                _ => None,
+            })
+            .collect();
+        for (index, status) in expired {
+            self.ready_thread_with(index, status);
+        }
+        if self.timers.is_empty() {
+            return;
+        }
         let now = self.elapsed_ms;
         let mut due = Vec::new();
         self.timers.retain_mut(|timer| {
@@ -845,7 +1044,10 @@ impl KernelServices for ThreadManager {
         manual_reset: bool,
         initially_signaled: bool,
     ) -> Result<u32, KernelServiceError> {
-        let handle = EVENT_HANDLE_BASE + self.events.len() as u32 * 4;
+        // A cursor, never the map's size: a closed handle's value must not
+        // be reissued while its neighbours live (ADR 0021).
+        let handle = self.next_event_handle;
+        self.next_event_handle = self.next_event_handle.wrapping_add(4);
         self.events.insert(handle, (manual_reset, initially_signaled));
         Ok(handle)
     }
@@ -858,19 +1060,11 @@ impl KernelServices for ThreadManager {
         let previous = *signaled;
         *signaled = true;
         let manual = *manual_reset;
-        // Wake the parked waiters: all of them for a manual-reset event,
-        // one (consuming the signal) for an auto-reset event.
-        let mut woke = false;
-        for thread in &mut self.threads {
-            if thread.state == ThreadState::Waiting(handle) {
-                thread.state = ThreadState::Ready;
-                woke = true;
-                if !manual {
-                    break;
-                }
-            }
-        }
-        if woke
+        // The arbiter wakes one waiter for an auto-reset event, all for a
+        // notification event; an auto-reset signal a waiter took is
+        // consumed by that wake (ADR 0021).
+        let woke = self.wake_by_key(handle, manual);
+        if woke > 0
             && !manual
             && let Some((_, signaled)) = self.events.get_mut(&handle)
         {
@@ -978,7 +1172,8 @@ impl KernelServices for ThreadManager {
     }
 
     fn create_mutant(&mut self, initially_owned: bool) -> Result<u32, KernelServiceError> {
-        let handle = MUTANT_HANDLE_BASE + self.mutants.len() as u32 * 4;
+        let handle = self.next_mutant_handle;
+        self.next_mutant_handle = self.next_mutant_handle.wrapping_add(4);
         self.mutants.insert(handle, initially_owned.then_some((self.current, 1)));
         self.handles.insert(handle);
         Ok(handle)
@@ -997,12 +1192,10 @@ impl KernelServices for ThreadManager {
         }
         *owner = (recursion > 1).then_some((holder, recursion - 1));
         if owner.is_none() {
-            // The mutant is free: every thread queued on it may retry.
-            for thread in &mut self.threads {
-                if thread.state == ThreadState::Waiting(handle) {
-                    thread.state = ThreadState::Ready;
-                }
-            }
+            // Exactly one waiter wakes, owning the mutant from the moment
+            // it wakes — releasing to everyone released it to no one, and
+            // two "owners" is what a mutant exists to prevent (ADR 0021).
+            self.wake_by_key(handle, false);
         }
         Ok(recursion - 1)
     }
@@ -1010,32 +1203,44 @@ impl KernelServices for ThreadManager {
     fn wait_for_dispatcher_object(
         &mut self,
         address: u32,
+        timeout_ms: Option<u64>,
     ) -> Result<WaitOutcome, KernelServiceError> {
         tracing::debug!(
             object = format_args!("{address:#010x}"),
             thread = self.current,
             "wait_for_dispatcher_object"
         );
-        // The object's own address keys the park: guest addresses never
-        // collide with the handle values this manager hands out.
-        let another_runnable = self
-            .threads
-            .iter()
-            .enumerate()
-            .any(|(index, thread)| index != self.current && thread.state == ThreadState::Ready);
-        if !another_runnable {
+        if timeout_ms == Some(0) {
             return Ok(WaitOutcome::TimedOut);
         }
-        self.pending = Some(PendingAction::Wait { handle: address });
+        // The object's own address keys the park: guest addresses never
+        // collide with the handle values this manager hands out, because
+        // every handle range sits below the image base at 0x10000 and no
+        // guest object can live in unmapped memory below it.
+        self.park_pending(vec![address], false, timeout_ms, STATUS_TIMEOUT);
         Ok(WaitOutcome::Pending)
     }
 
     fn signal_dispatcher_object(&mut self, address: u32) {
-        for thread in &mut self.threads {
-            if thread.state == ThreadState::Waiting(address) {
-                thread.state = ThreadState::Ready;
-            }
+        // The header's type byte decides the wake's reach: an auto-reset
+        // (synchronization) event hands its signal to exactly one waiter
+        // and is consumed by that wake; everything else stays signaled for
+        // every waiter (ADR 0021).
+        let kind = self.memory.read_u32(GuestVa(address)).map(|word| word & 0xFF).unwrap_or(0);
+        let auto = kind == SYNCHRONIZATION_EVENT_TYPE;
+        let woke = self.wake_by_key(address, !auto);
+        if auto && woke > 0 {
+            let _ =
+                self.memory.write_u32(GuestVa(address.wrapping_add(DISPATCHER_SIGNAL_STATE)), 0);
         }
+    }
+
+    fn transfer_section_wake(&mut self, address: u32) -> Option<u32> {
+        let index = self.threads.iter().position(|thread| {
+            matches!(&thread.state, ThreadState::Waiting(block) if block.keys.contains(&address))
+        })?;
+        self.ready_thread_with(index, 0);
+        Some(self.threads[index].kpcr.0 + KTHREAD_OFFSET)
     }
 
     fn object_for_handle(&self, handle: u32) -> Option<u32> {
@@ -1066,73 +1271,91 @@ impl KernelServices for ThreadManager {
             .any(|index| self.threads[index].state == ThreadState::Ready)
     }
 
-    fn wait_for_object(&mut self, handle: u32) -> Result<WaitOutcome, KernelServiceError> {
+    fn wait_for_object(
+        &mut self,
+        handle: u32,
+        timeout_ms: Option<u64>,
+    ) -> Result<WaitOutcome, KernelServiceError> {
         tracing::debug!(
             handle = format_args!("{handle:#x}"),
             thread = self.current,
             "wait_for_object"
         );
-        let another_runnable = self
-            .threads
-            .iter()
-            .enumerate()
-            .any(|(index, thread)| index != self.current && thread.state == ThreadState::Ready);
-        // An event: signaled means no wait (auto-reset consumes the signal).
-        if let Some((manual_reset, signaled)) = self.events.get_mut(&handle) {
-            if *signaled {
-                if !*manual_reset {
-                    *signaled = false;
-                }
-                return Ok(WaitOutcome::Signaled);
-            }
-            if !another_runnable {
-                // Nothing left can signal it. A title paces its frames on
-                // events a device interrupt would set, and this model has
-                // no interrupts and finishes device work synchronously, so
-                // the wait is satisfied in fact; reporting a timeout only
-                // makes the caller spin on it forever.
-                tracing::debug!(
-                    handle = format_args!("{handle:#x}"),
-                    "completing an event wait no thread can signal"
-                );
-                return Ok(WaitOutcome::Signaled);
-            }
-            self.pending = Some(PendingAction::Wait { handle });
-            return Ok(WaitOutcome::Pending);
+        // An event: signaled means no wait (auto-reset consumes the
+        // signal). A mutant: acquiring it is the wait's whole effect, and
+        // one this thread already holds is taken recursively. A thread:
+        // signaled once it terminates.
+        if let Some(owner) = self.mutants.get_mut(&handle)
+            && let Some((holder, recursion)) = *owner
+            && holder == self.current
+        {
+            *owner = Some((holder, recursion + 1));
+            return Ok(WaitOutcome::Signaled);
         }
-        // A mutant: acquiring it is the wait's whole effect. An unowned one
-        // (or one this thread already holds) is taken recursively; another
-        // thread's ownership parks this one until the release.
-        if let Some(owner) = self.mutants.get_mut(&handle) {
-            match *owner {
-                None => {
-                    *owner = Some((self.current, 1));
-                    return Ok(WaitOutcome::Signaled);
-                }
-                Some((holder, recursion)) if holder == self.current => {
-                    *owner = Some((holder, recursion + 1));
-                    return Ok(WaitOutcome::Signaled);
-                }
-                Some(_) if !another_runnable => return Ok(WaitOutcome::TimedOut),
-                Some(_) => {
-                    self.pending = Some(PendingAction::Wait { handle });
-                    return Ok(WaitOutcome::Pending);
-                }
+        let known = self.events.contains_key(&handle)
+            || self.mutants.contains_key(&handle)
+            || self.thread_index(handle).is_some();
+        if !known {
+            return Err(KernelServiceError::InvalidHandle);
+        }
+        if self.key_signaled(handle, self.current) {
+            self.consume_key(handle, self.current);
+            return Ok(WaitOutcome::Signaled);
+        }
+        // Unsatisfied. A poll reports the truth; anything else parks, and
+        // what wakes it is a signal, a deadline, or nothing — in which
+        // case the run loop reports the deadlock instead of this code
+        // fabricating a completion (ADR 0021).
+        if timeout_ms == Some(0) {
+            return Ok(WaitOutcome::TimedOut);
+        }
+        self.park_pending(vec![handle], false, timeout_ms, STATUS_TIMEOUT);
+        Ok(WaitOutcome::Pending)
+    }
+
+    fn wait_for_objects(
+        &mut self,
+        keys: &[u32],
+        wait_all: bool,
+        timeout_ms: Option<u64>,
+    ) -> Result<exbawks_kernel::MultiWaitOutcome, KernelServiceError> {
+        use exbawks_kernel::MultiWaitOutcome;
+        for key in keys {
+            let known = self.events.contains_key(key)
+                || self.mutants.contains_key(key)
+                || self.thread_index(*key).is_some();
+            if !known {
+                return Err(KernelServiceError::InvalidHandle);
             }
         }
-        // A thread handle: signaled once the thread terminates.
-        if handle >= 0x0000_E000 && self.handles.contains(&handle) {
-            let index = ((handle - 0x0000_E000) / 4) as usize;
-            if self.threads.get(index).is_some_and(|t| t.state == ThreadState::Terminated) {
-                return Ok(WaitOutcome::Signaled);
+        if wait_all {
+            if keys.iter().all(|key| self.key_signaled(*key, self.current)) {
+                for key in keys {
+                    self.consume_key(*key, self.current);
+                }
+                return Ok(MultiWaitOutcome::Satisfied(0));
             }
-            if !another_runnable {
-                return Ok(WaitOutcome::TimedOut);
-            }
-            self.pending = Some(PendingAction::Wait { handle });
-            return Ok(WaitOutcome::Pending);
+        } else if let Some(position) =
+            keys.iter().position(|key| self.key_signaled(*key, self.current))
+        {
+            self.consume_key(keys[position], self.current);
+            return Ok(MultiWaitOutcome::Satisfied(position as u32));
         }
-        Err(KernelServiceError::InvalidHandle)
+        if timeout_ms == Some(0) {
+            return Ok(MultiWaitOutcome::TimedOut);
+        }
+        self.park_pending(keys.to_vec(), wait_all, timeout_ms, STATUS_TIMEOUT);
+        Ok(MultiWaitOutcome::Pending)
+    }
+
+    fn sleep_thread(&mut self, timeout_ms: u64) -> Result<WaitOutcome, KernelServiceError> {
+        if timeout_ms == 0 {
+            return Ok(WaitOutcome::Signaled);
+        }
+        // No keys: only the deadline wakes it, and finishing a delay is
+        // success, not a timeout (ADR 0021).
+        self.park_pending(Vec::new(), false, Some(timeout_ms), 0);
+        Ok(WaitOutcome::Pending)
     }
 
     fn open_file(&mut self, request: FileOpenRequest) -> Result<FileOpened, KernelServiceError> {
@@ -1298,6 +1521,16 @@ mod tests {
         ThreadManager::new(memory, None, None)
     }
 
+    /// A single-key infinite wait block, as the wait services build.
+    fn block(key: u32) -> WaitBlock {
+        WaitBlock { keys: vec![key], all: false, deadline: None, timeout_status: STATUS_TIMEOUT }
+    }
+
+    /// Whether a thread waits on exactly this key.
+    fn waits_on(state: &ThreadState, key: u32) -> bool {
+        matches!(state, ThreadState::Waiting(block) if block.keys == vec![key])
+    }
+
     /// Builds a request for a child thread starting at `entry`.
     fn thread_request(entry: u32) -> ThreadCreateRequest {
         ThreadCreateRequest {
@@ -1321,11 +1554,11 @@ mod tests {
 
         // Thread 0 waits on the unsignaled event; another thread is
         // runnable, so the wait parks.
-        assert_eq!(threads.wait_for_object(event), Ok(WaitOutcome::Pending));
+        assert_eq!(threads.wait_for_object(event, None), Ok(WaitOutcome::Pending));
         let mut cpu = CpuState::default();
-        assert!(threads.park_active(event, &mut cpu), "the wait parks and switches");
+        assert!(threads.park_active(block(event), &mut cpu), "the wait parks and switches");
         assert_eq!(threads.current, 1, "a ready thread now runs");
-        assert_eq!(threads.threads[0].state, ThreadState::Waiting(event));
+        assert!(waits_on(&threads.threads[0].state, event));
 
         // Signalling the auto-reset event wakes exactly the parked waiter.
         assert_eq!(threads.set_event(event), Ok(false));
@@ -1333,22 +1566,89 @@ mod tests {
     }
 
     #[test]
-    fn a_wait_no_thread_can_signal_completes() {
+    fn a_wait_parks_even_when_nothing_else_is_runnable() {
+        // The old model fabricated a completion here; ADR 0021 parks and
+        // leaves the outcome to the run loop's idle machinery, which
+        // reports a genuine deadlock rather than papering over one.
         let mut threads = manager();
         threads.create_thread(thread_request(0x2000)).expect("the sole thread creates");
         let event = threads.create_event(false, false).expect("event creates");
-        // No other thread is runnable, so nothing can ever signal it. The
-        // wait completes rather than deadlocking or spinning the guest.
-        assert_eq!(threads.wait_for_object(event), Ok(WaitOutcome::Signaled));
+        assert_eq!(threads.wait_for_object(event, None), Ok(WaitOutcome::Pending));
     }
 
     #[test]
-    fn a_thread_join_no_thread_can_satisfy_times_out() {
+    fn a_zero_timeout_poll_reports_a_timeout_instead_of_parking() {
         let mut threads = manager();
-        let created = threads.create_thread(thread_request(0x2000)).expect("thread creates");
-        // A join on a thread that will never run is a genuine timeout: no
-        // device stands behind it, so completing it would be a fiction.
-        assert_eq!(threads.wait_for_object(created.handle), Ok(WaitOutcome::TimedOut));
+        threads.create_thread(thread_request(0x2000)).expect("the sole thread creates");
+        let event = threads.create_event(false, false).expect("event creates");
+        // NT's standard non-blocking poll: WaitForSingleObject(h, 0).
+        assert_eq!(threads.wait_for_object(event, Some(0)), Ok(WaitOutcome::TimedOut));
+        assert!(threads.pending.is_none(), "a poll never parks");
+    }
+
+    #[test]
+    fn a_wait_deadline_wakes_the_thread_with_a_timeout() {
+        let mut threads = manager();
+        threads.create_thread(thread_request(0x2000)).expect("thread 0 creates");
+        threads.create_thread(thread_request(0x3000)).expect("thread 1 creates");
+        let event = threads.create_event(false, false).expect("event creates");
+
+        assert_eq!(threads.wait_for_object(event, Some(50)), Ok(WaitOutcome::Pending));
+        let mut cpu = CpuState::default();
+        let Some(PendingAction::Wait { block }) = threads.take_pending() else {
+            panic!("a wait was recorded");
+        };
+        assert!(threads.park_active(block, &mut cpu), "the wait parks");
+        assert!(matches!(threads.threads[0].state, ThreadState::Waiting(_)));
+
+        // Short of the deadline nothing wakes; past it the thread readies
+        // with STATUS_TIMEOUT in its saved EAX.
+        threads.advance_timers(49);
+        assert!(matches!(threads.threads[0].state, ThreadState::Waiting(_)));
+        threads.advance_timers(2);
+        assert_eq!(threads.threads[0].state, ThreadState::Ready);
+        assert_eq!(threads.threads[0].cpu.gpr[0], STATUS_TIMEOUT);
+    }
+
+    #[test]
+    fn a_multi_wait_wake_names_the_winning_index() {
+        let mut threads = manager();
+        threads.create_thread(thread_request(0x2000)).expect("thread 0 creates");
+        threads.create_thread(thread_request(0x3000)).expect("thread 1 creates");
+        let first = threads.create_event(false, false).expect("event A creates");
+        let second = threads.create_event(false, false).expect("event B creates");
+
+        use exbawks_kernel::MultiWaitOutcome;
+        assert_eq!(
+            threads.wait_for_objects(&[first, second], false, None),
+            Ok(MultiWaitOutcome::Pending)
+        );
+        let mut cpu = CpuState::default();
+        let Some(PendingAction::Wait { block }) = threads.take_pending() else {
+            panic!("a wait was recorded");
+        };
+        assert_eq!(block.keys, vec![first, second], "the whole set is one block");
+        assert!(threads.park_active(block, &mut cpu));
+
+        // The SECOND object signals: the woken thread's EAX must read
+        // STATUS_WAIT_0 + 1, not the success the export saved.
+        assert_eq!(threads.set_event(second), Ok(false));
+        assert_eq!(threads.threads[0].state, ThreadState::Ready);
+        assert_eq!(threads.threads[0].cpu.gpr[0], 1, "the winner's index");
+    }
+
+    #[test]
+    fn closed_event_handles_are_not_reissued() {
+        let mut threads = manager();
+        threads.create_thread(thread_request(0x2000)).expect("thread creates");
+        let first = threads.create_event(false, false).expect("event A creates");
+        let second = threads.create_event(true, true).expect("event B creates");
+        assert!(threads.close_handle(first), "A closes");
+        let third = threads.create_event(false, false).expect("event C creates");
+        assert_ne!(third, second, "a live handle is never reissued");
+        assert_ne!(third, first, "nor is a closed one reused");
+        // B's state survived C's creation.
+        assert_eq!(threads.wait_for_object(second, None), Ok(WaitOutcome::Signaled));
     }
 
     #[test]
@@ -1374,22 +1674,27 @@ mod tests {
         let mutant = threads.create_mutant(false).expect("mutant creates");
 
         // Thread 0 takes it twice; both takes are immediate.
-        assert_eq!(threads.wait_for_object(mutant), Ok(WaitOutcome::Signaled));
-        assert_eq!(threads.wait_for_object(mutant), Ok(WaitOutcome::Signaled));
+        assert_eq!(threads.wait_for_object(mutant, None), Ok(WaitOutcome::Signaled));
+        assert_eq!(threads.wait_for_object(mutant, None), Ok(WaitOutcome::Signaled));
         assert_eq!(threads.release_mutant(mutant), Ok(1), "one level remains held");
 
         // Thread 1 cannot take it while thread 0 still holds it.
         let mut cpu = CpuState::default();
         threads.rotate_active(&mut cpu);
         assert_eq!(threads.current, 1);
-        assert_eq!(threads.wait_for_object(mutant), Ok(WaitOutcome::Pending));
-        assert!(threads.park_active(mutant, &mut cpu), "the contended wait parks");
+        assert_eq!(threads.wait_for_object(mutant, None), Ok(WaitOutcome::Pending));
+        assert!(threads.park_active(block(mutant), &mut cpu), "the contended wait parks");
 
-        // Thread 0's last release frees it and wakes the queued thread.
+        // Thread 0's last release wakes the queued thread as the OWNER:
+        // releasing to everyone released it to no one (ADR 0021).
         assert_eq!(threads.current, 0);
         assert_eq!(threads.release_mutant(mutant), Ok(0));
         assert_eq!(threads.threads[1].state, ThreadState::Ready);
-        assert_eq!(threads.wait_for_object(mutant), Ok(WaitOutcome::Signaled), "free again");
+        assert_eq!(
+            threads.mutants.get(&mutant),
+            Some(&Some((1, 1))),
+            "ownership transferred with the wake"
+        );
     }
 
     #[test]
@@ -1407,7 +1712,11 @@ mod tests {
     }
 
     #[test]
-    fn the_last_ready_thread_exiting_releases_the_parked_ones() {
+    fn the_last_ready_thread_exiting_leaves_the_parked_ones_parked() {
+        // The old model woke every parked thread here, whatever it waited
+        // on. ADR 0021 keeps them parked: whether anything can still wake
+        // them is the run loop's question, and a wait on an event nothing
+        // will signal is a deadlock to report, not to paper over.
         let mut threads = manager();
         threads.create_thread(thread_request(0x1000)).expect("thread 0 creates");
         threads.create_thread(thread_request(0x2000)).expect("thread 1 creates");
@@ -1415,19 +1724,40 @@ mod tests {
         let event = threads.create_event(false, false).expect("event creates");
         let mut cpu = CpuState::default();
 
-        // Threads 0 and 1 park on an event nothing will signal.
-        assert_eq!(threads.wait_for_object(event), Ok(WaitOutcome::Pending));
-        assert!(threads.park_active(event, &mut cpu));
-        assert_eq!(threads.wait_for_object(event), Ok(WaitOutcome::Pending));
-        assert!(threads.park_active(event, &mut cpu));
+        assert_eq!(threads.wait_for_object(event, None), Ok(WaitOutcome::Pending));
+        assert!(threads.park_active(block(event), &mut cpu));
+        assert_eq!(threads.wait_for_object(event, None), Ok(WaitOutcome::Pending));
+        assert!(threads.park_active(block(event), &mut cpu));
         assert_eq!(threads.current, 2, "the last ready thread runs");
 
-        // It exits: the guest has not finished, the waits have — the parked
-        // threads resume instead of the run reporting an exit.
-        assert!(threads.exit_active(&mut cpu, 0), "a released waiter resumes");
+        assert!(!threads.exit_active(&mut cpu, 0), "nothing is runnable");
         assert_eq!(threads.threads[2].state, ThreadState::Terminated);
-        assert_eq!(threads.threads[0].state, ThreadState::Running);
-        assert_eq!(threads.threads[1].state, ThreadState::Ready);
+        assert!(matches!(threads.threads[0].state, ThreadState::Waiting(_)));
+        assert!(matches!(threads.threads[1].state, ThreadState::Waiting(_)));
+        let (next_due, _interrupts, any_waiting) = threads.wake_hint();
+        assert!(any_waiting, "the run loop sees the parked threads");
+        assert_eq!(next_due, None, "and that nothing is due to wake them");
+    }
+
+    #[test]
+    fn a_thread_exit_wakes_a_joiner_waiting_by_pointer() {
+        // A title may join by the KTHREAD address instead of the handle;
+        // the exit must wake both key forms (ADR 0021).
+        let mut threads = manager();
+        threads.create_thread(thread_request(0x1000)).expect("thread 0 creates");
+        let created = threads.create_thread(thread_request(0x2000)).expect("thread 1 creates");
+        let mut cpu = CpuState::default();
+
+        let kthread = created.kthread.0;
+        assert_eq!(threads.wait_for_dispatcher_object(kthread, None), Ok(WaitOutcome::Pending));
+        let Some(PendingAction::Wait { block }) = threads.take_pending() else {
+            panic!("a wait was recorded");
+        };
+        assert!(threads.park_active(block, &mut cpu), "the join parks");
+        assert_eq!(threads.current, 1, "the joined thread runs");
+
+        assert!(!threads.exit_active(&mut cpu, 0) || threads.current == 0);
+        assert_eq!(threads.threads[0].state, ThreadState::Running, "the joiner resumed");
     }
 
     #[test]
