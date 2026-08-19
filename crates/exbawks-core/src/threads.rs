@@ -49,6 +49,8 @@ const KTHREAD_OFFSET: u32 = 0x200;
 const DISPATCHER_SIGNAL_STATE: u32 = 0x04;
 /// `DISPATCHER_HEADER.Type` naming a thread object.
 const THREAD_OBJECT_TYPE: u8 = 6;
+/// `DISPATCHER_HEADER.WaitListHead`, a list head that must point at itself.
+const DISPATCHER_WAIT_LIST: u32 = 0x08;
 /// Where a thread's exit status sits in its control block.
 ///
 /// The title's `GetExitCodeThread` reads exactly this: it references the
@@ -476,6 +478,14 @@ impl ThreadManager {
         self.memory.write_u32(kthread, u32::from(THREAD_OBJECT_TYPE))?;
         self.memory.write_u32(GuestVa(kthread.0 + DISPATCHER_SIGNAL_STATE), 0)?;
         self.memory.write_u32(GuestVa(kthread.0 + KTHREAD_EXIT_STATUS), STILL_ACTIVE)?;
+        // An empty list head points at itself, and a zeroed one does not.
+        // A waiter links its wait block into this list and unlinks it
+        // afterwards by writing through the neighbours it finds here, so
+        // zeros are not an empty list — they are a null dereference in
+        // whichever of the two writes goes first.
+        let wait_list = kthread.0 + DISPATCHER_WAIT_LIST;
+        self.memory.write_u32(GuestVa(wait_list), wait_list)?;
+        self.memory.write_u32(GuestVa(wait_list + 4), wait_list)?;
 
         // Synthetic KTHREAD fields XAPI consumes; TlsData points at the
         // thread's TLS area below StackBase when the image has TLS.
@@ -525,6 +535,31 @@ impl ThreadManager {
     /// Takes the scheduling action the last kernel call recorded.
     pub(crate) fn take_pending(&mut self) -> Option<PendingAction> {
         self.pending.take()
+    }
+
+    /// Every thread, as its identifier, what it is doing, and where.
+    ///
+    /// A run that wedges is a run whose threads are all waiting on each
+    /// other, and the instruction pointer alone cannot show that: it names
+    /// one thread of several. This says what every one of them is doing.
+    pub(crate) fn thread_report(&self, active_cpu: &CpuState) -> Vec<(u32, String, u32)> {
+        self.threads
+            .iter()
+            .enumerate()
+            .map(|(index, thread)| {
+                let state = match thread.state {
+                    ThreadState::Ready => "ready".to_owned(),
+                    ThreadState::Running => "running".to_owned(),
+                    ThreadState::Suspended => "suspended".to_owned(),
+                    ThreadState::Waiting(handle) => format!("waiting on {handle:#06x}"),
+                    ThreadState::Terminated => "terminated".to_owned(),
+                };
+                // The active thread's context lives in the processor, not
+                // in its saved copy, which is stale while it runs.
+                let eip = if index == self.current { active_cpu.eip } else { thread.cpu.eip };
+                (thread.id, state, eip)
+            })
+            .collect()
     }
 
     /// Records a finished thread's result in its own control block.

@@ -951,6 +951,14 @@ Graphics methods (object, method, submissions):"
         println!();
     }
 
+    let threads = emulator.thread_report();
+    if threads.len() > 1 {
+        println!("Threads:");
+        for (id, state, eip) in &threads {
+            println!("              {id:>3}  {state:<22} eip {eip:#010x}");
+        }
+    }
+
     if gamepad || gamepad_live || !presses.is_empty() {
         println!(
             "USB:          controller {}, communication area {:#010x}",

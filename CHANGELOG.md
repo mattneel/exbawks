@@ -6,7 +6,38 @@ The project follows Keep a Changelog structure before its first release.
 
 ## Unreleased
 
+### Known
+
+- **A run on the hypervisor tier is not reproducible.** Three runs of the
+  retail title from the same binary, with the same scripted press, ended
+  three ways: two on the same fault but at different controller frames
+  (28,500 and 28,610), and one that ran past it altogether to frame
+  386,764 and digested differently. Guest time on that tier follows the
+  host's wall clock, so how far the title gets between two of its own
+  threads' actions varies from run to run, and a race in what it does next
+  is decided differently each time.
+
+  This matters beyond flakiness: **a digest recorded from a hypervisor run
+  is not a golden**, whatever it agreed with last time. The no-input run
+  looks stable only because it reliably reaches the same fault. The
+  interpreter tier remains the deterministic oracle and is where a golden
+  belongs — which is what ADR 0013 said when it kept the interpreter, and
+  is now a measured fact rather than a design intention.
+
+  It also explains two things that looked like bugs and were not: a wait
+  loop seen once and never reproduced, and a controller press that
+  "stopped working" — the same press, in a run that lost the race, ends
+  at the fault before the title acts on it.
+
 ### Added
+
+- A run reports every guest thread at its stop — the identifier, what each
+  is doing (`ready`, `running`, `waiting on <handle>`, `terminated`), and
+  where. A run that stops making progress is usually several threads
+  waiting on each other, and the stopped instruction pointer cannot show
+  that because it names only one of them. The first use of it disproved a
+  theory in one line: two threads ready and two terminated, so a run that
+  looked deadlocked was not.
 
 - `exbawks run --press <button>@<frame>` presses a button on the emulated
   gamepad by controller frame, repeatably and in order — `--press
@@ -517,6 +548,13 @@ The project follows Keep a Changelog structure before its first release.
   construction may not record a golden.
 
 ### Fixed
+
+- A thread's control block now carries a self-circular `WaitListHead`, as
+  every dispatcher object must: an empty list head points at itself, and a
+  zeroed one is not an empty list but a null dereference waiting for the
+  first waiter to unlink itself. The timer objects already did this; the
+  thread block did not. Nothing observable changed, which is what a
+  latent invariant looks like when it is fixed before it is hit.
 
 - A thread that finished said so only in the emulator's own table, where no
   guest can see it. `GetExitCodeThread` asks the kernel to resolve the

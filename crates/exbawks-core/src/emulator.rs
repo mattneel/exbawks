@@ -1522,6 +1522,16 @@ impl Emulator {
         }
     }
 
+    /// Every guest thread, as its identifier, what it is doing, and where.
+    ///
+    /// A run that stops making progress is usually several threads waiting
+    /// on each other, which the stopped instruction pointer cannot show
+    /// because it names only one of them.
+    #[must_use]
+    pub fn thread_report(&self) -> Vec<(u32, String, u32)> {
+        self.threads.as_ref().map(|threads| threads.thread_report(&self.cpu)).unwrap_or_default()
+    }
+
     /// The controller frame the run has reached.
     ///
     /// This is the clock a scripted press is timed in, so a run reports it
