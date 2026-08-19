@@ -1,11 +1,12 @@
 //! Rtl runtime-library exports (HLE-007).
 //!
 //! The critical-section family operates on a guest-resident
-//! `RTL_CRITICAL_SECTION`. Under the cooperative single-thread scheduler
-//! (ADR 0011) only one guest thread runs at a time and threads switch only at
-//! kernel dispatch points, so a critical section is never contended while a
-//! thread holds it; these exports therefore maintain the lock and recursion
-//! counts for the guest's own bookkeeping without ever blocking.
+//! `RTL_CRITICAL_SECTION`. Threads switch only at kernel dispatch points,
+//! but entering a section IS one — and so is every allocation a title makes
+//! inside one — so a section can be contended and must block. It counts
+//! from minus one, as the structure does: incrementing to zero takes it,
+//! anything above is a waiter, and the first sixteen bytes are the event a
+//! releasing thread signals.
 //!
 //! `RtlNtStatusToDosError` is a pure status-code translator titles call from
 //! their error-reporting paths.
@@ -21,8 +22,23 @@ const LOCK_COUNT: u32 = 0x10;
 const RECURSION_COUNT: u32 = 0x14;
 const OWNING_THREAD: u32 = 0x18;
 
-/// The placeholder owner id for the single running thread.
-const CURRENT_THREAD: u32 = 1;
+/// A free critical section's `LockCount`.
+///
+/// It counts waiters from minus one rather than holders from zero, so
+/// incrementing it to zero is what acquires the section. This is the
+/// structure's own convention, and a title that reads the field expects it.
+const UNOWNED_LOCK_COUNT: u32 = u32::MAX;
+
+/// The pseudo-handle naming whichever thread is running, which is how a
+/// section learns its owner.
+const CURRENT_THREAD_PSEUDO_HANDLE: u32 = 0xFFFF_FFFE;
+
+/// The control block of the thread asking, or `None` where the runtime
+/// keeps no thread table (the export then behaves as it did before there
+/// was one to ask).
+fn current_thread(context: &KernelCallContext<'_>) -> Option<u32> {
+    context.services.object_for_handle(CURRENT_THREAD_PSEUDO_HANDLE)
+}
 
 /// Registers the Rtl runtime-library exports.
 pub(crate) fn register_rtl_exports(registry: &KernelRegistry) -> Result<(), KernelError> {
@@ -101,9 +117,15 @@ impl KernelExport for RtlInitializeCriticalSection {
         let Some(base) = critical_section(context) else {
             return KernelStatus::INVALID_PARAMETER;
         };
-        set_field(context, base, LOCK_COUNT, 0);
+        set_field(context, base, LOCK_COUNT, UNOWNED_LOCK_COUNT);
         set_field(context, base, RECURSION_COUNT, 0);
         set_field(context, base, OWNING_THREAD, 0);
+        // The first sixteen bytes are the event a releasing thread signals,
+        // and an empty wait list points at itself.
+        set_field(context, base, 0x00, 0);
+        set_field(context, base, 0x04, 0);
+        set_field(context, base, 0x08, base.wrapping_add(0x08));
+        set_field(context, base, 0x0C, base.wrapping_add(0x08));
         KernelStatus::SUCCESS
     }
 }
@@ -129,12 +151,53 @@ impl KernelExport for RtlEnterCriticalSection {
         let Some(base) = critical_section(context) else {
             return KernelStatus::INVALID_PARAMETER;
         };
-        let recursion = field(context, base, RECURSION_COUNT);
-        let lock = field(context, base, LOCK_COUNT);
-        set_field(context, base, RECURSION_COUNT, recursion.wrapping_add(1));
-        set_field(context, base, LOCK_COUNT, lock.wrapping_add(1));
-        set_field(context, base, OWNING_THREAD, CURRENT_THREAD);
-        KernelStatus::SUCCESS
+        // Counting up from minus one: reaching zero is what takes the
+        // section, and anything above it is a thread that has to wait.
+        let lock = field(context, base, LOCK_COUNT).wrapping_add(1);
+        set_field(context, base, LOCK_COUNT, lock);
+        let owner = current_thread(context);
+        if lock == 0 {
+            set_field(context, base, OWNING_THREAD, owner.unwrap_or(0));
+            set_field(context, base, RECURSION_COUNT, 1);
+            return KernelStatus::SUCCESS;
+        }
+
+        let held_by = field(context, base, OWNING_THREAD);
+        if owner.is_some_and(|thread| thread == held_by) {
+            // The same thread again: a critical section is recursive, and
+            // taking it twice must not wait on itself.
+            let recursion = field(context, base, RECURSION_COUNT);
+            set_field(context, base, RECURSION_COUNT, recursion.wrapping_add(1));
+            return KernelStatus::SUCCESS;
+        }
+
+        // Another thread holds it. Waiting here is the whole point of the
+        // export: a section that lets a second thread in guards nothing,
+        // and what it usually guards is a heap — where two threads at once
+        // means a free list with a link through a freed block, found much
+        // later and nowhere near the cause.
+        //
+        // The section is waited on by its own address, as the structure
+        // intends: its first sixteen bytes are the event the releasing
+        // thread signals.
+        match context.services.wait_for_dispatcher_object(base) {
+            // Parked. The caller resumes after this call returns, so the
+            // section is still the other thread's until it releases it —
+            // claiming it here would overwrite a live owner with a thread
+            // that is not running yet, and the release would then find the
+            // wrong one recorded.
+            Ok(crate::WaitOutcome::Pending) => KernelStatus::SUCCESS,
+            // Free by the time the wait was asked for, or nothing else can
+            // run and so nothing can release it. Either way no other thread
+            // is inside, and taking it is both what lets the guest continue
+            // and what is true.
+            Ok(crate::WaitOutcome::Signaled | crate::WaitOutcome::TimedOut) => {
+                set_field(context, base, OWNING_THREAD, owner.unwrap_or(0));
+                set_field(context, base, RECURSION_COUNT, 1);
+                KernelStatus::SUCCESS
+            }
+            Err(_) => KernelStatus::INVALID_PARAMETER,
+        }
     }
 }
 
@@ -160,11 +223,17 @@ impl KernelExport for RtlLeaveCriticalSection {
             return KernelStatus::INVALID_PARAMETER;
         };
         let recursion = field(context, base, RECURSION_COUNT).saturating_sub(1);
-        let lock = field(context, base, LOCK_COUNT).saturating_sub(1);
+        let lock = field(context, base, LOCK_COUNT).wrapping_sub(1);
         set_field(context, base, RECURSION_COUNT, recursion);
         set_field(context, base, LOCK_COUNT, lock);
         if recursion == 0 {
             set_field(context, base, OWNING_THREAD, 0);
+            // A lock count still at or above zero means someone is waiting
+            // on it, and releasing without waking them is a thread parked
+            // for the rest of the run.
+            if lock != UNOWNED_LOCK_COUNT {
+                context.services.signal_dispatcher_object(base);
+            }
         }
         KernelStatus::SUCCESS
     }
@@ -296,7 +365,7 @@ mod tests {
     use exbawks_memory::{GuestMemory, SoftwareAddressSpace};
     use exbawks_types::{GUEST_PAGE_SIZE, GuestRange, MemoryPermissions};
 
-    use crate::UnsupportedServices;
+    use crate::{KernelServiceError, KernelServices, UnsupportedServices, WaitOutcome};
 
     use super::*;
 
@@ -314,35 +383,139 @@ mod tests {
         (memory, cpu)
     }
 
+    /// Services that name a current thread and record waits, which is
+    /// what a critical section needs to be more than a counter.
+    #[derive(Debug, Default)]
+    struct Threaded {
+        thread: u32,
+        waited: Option<u32>,
+        signaled: Option<u32>,
+        outcome: Option<WaitOutcome>,
+    }
+
+    impl KernelServices for Threaded {
+        fn create_thread(
+            &mut self,
+            _request: crate::ThreadCreateRequest,
+        ) -> Result<crate::ThreadCreated, KernelServiceError> {
+            Err(KernelServiceError::Unsupported)
+        }
+
+        fn allocate_virtual_memory(
+            &mut self,
+            _request: crate::VirtualAllocRequest,
+        ) -> Result<crate::VirtualAllocation, KernelServiceError> {
+            Err(KernelServiceError::Unsupported)
+        }
+
+        fn exit_current_thread(&mut self, _status: u32) {}
+
+        fn close_handle(&mut self, _handle: u32) -> bool {
+            false
+        }
+
+        fn object_for_handle(&self, _handle: u32) -> Option<u32> {
+            Some(self.thread)
+        }
+
+        fn wait_for_dispatcher_object(
+            &mut self,
+            address: u32,
+        ) -> Result<WaitOutcome, KernelServiceError> {
+            self.waited = Some(address);
+            Ok(self.outcome.unwrap_or(WaitOutcome::Pending))
+        }
+
+        fn signal_dispatcher_object(&mut self, address: u32) {
+            self.signaled = Some(address);
+        }
+    }
+
+    /// Calls one export with a fresh context, so the stub can be read
+    /// between calls rather than borrowed for the whole test.
+    fn call(
+        services: &mut Threaded,
+        memory: &SoftwareAddressSpace,
+        cpu: &mut CpuState,
+        export: &dyn KernelExport,
+    ) -> KernelStatus {
+        let mut context = KernelCallContext { cpu, memory, services, stop_request: None };
+        export.call(&mut context)
+    }
+
     #[test]
-    fn enter_and_leave_balance_the_recursion_count() {
+    fn one_thread_may_take_a_section_repeatedly() {
         let cs = 0x1100;
         let (memory, mut cpu) = context_at(cs);
-        let mut services = UnsupportedServices;
-        let mut context = KernelCallContext {
-            cpu: &mut cpu,
-            memory: &memory,
-            services: &mut services,
-            stop_request: None,
-        };
+        let mut services = Threaded { thread: 0x8000_1000, ..Threaded::default() };
 
-        assert_eq!(RtlInitializeCriticalSection.call(&mut context), KernelStatus::SUCCESS);
-        assert_eq!(memory.read_u32(GuestVa(cs + RECURSION_COUNT)).unwrap(), 0);
+        call(&mut services, &memory, &mut cpu, &RtlInitializeCriticalSection);
+        assert_eq!(
+            memory.read_u32(GuestVa(cs + LOCK_COUNT)).unwrap(),
+            UNOWNED_LOCK_COUNT,
+            "a free section counts from minus one"
+        );
 
-        RtlEnterCriticalSection.call(&mut context);
-        RtlEnterCriticalSection.call(&mut context);
-        assert_eq!(memory.read_u32(GuestVa(cs + RECURSION_COUNT)).unwrap(), 2);
-        assert_eq!(memory.read_u32(GuestVa(cs + OWNING_THREAD)).unwrap(), CURRENT_THREAD);
+        call(&mut services, &memory, &mut cpu, &RtlEnterCriticalSection);
+        call(&mut services, &memory, &mut cpu, &RtlEnterCriticalSection);
+        assert_eq!(memory.read_u32(GuestVa(cs + RECURSION_COUNT)).unwrap(), 2, "recursive");
+        assert_eq!(memory.read_u32(GuestVa(cs + OWNING_THREAD)).unwrap(), 0x8000_1000);
+        assert!(services.waited.is_none(), "a thread never waits on itself");
 
-        RtlLeaveCriticalSection.call(&mut context);
+        call(&mut services, &memory, &mut cpu, &RtlLeaveCriticalSection);
         assert_eq!(memory.read_u32(GuestVa(cs + RECURSION_COUNT)).unwrap(), 1);
-        RtlLeaveCriticalSection.call(&mut context);
+        assert!(services.signaled.is_none(), "still held, so nobody is woken");
+        call(&mut services, &memory, &mut cpu, &RtlLeaveCriticalSection);
         assert_eq!(memory.read_u32(GuestVa(cs + RECURSION_COUNT)).unwrap(), 0);
+        assert_eq!(memory.read_u32(GuestVa(cs + OWNING_THREAD)).unwrap(), 0, "released");
+        assert_eq!(
+            memory.read_u32(GuestVa(cs + LOCK_COUNT)).unwrap(),
+            UNOWNED_LOCK_COUNT,
+            "and free again"
+        );
+        assert!(services.signaled.is_none(), "nobody was waiting");
+    }
+
+    #[test]
+    fn a_second_thread_waits_and_is_woken() {
+        // The defect this pins: a section that lets a second thread in
+        // guards nothing. What a title guards with one is usually its
+        // heap, and two threads inside an allocator at once leaves a free
+        // list whose links are found broken much later and nowhere near
+        // the cause.
+        let cs = 0x1100;
+        let (memory, mut cpu) = context_at(cs);
+        let mut services = Threaded { thread: 0x8000_1000, ..Threaded::default() };
+        call(&mut services, &memory, &mut cpu, &RtlInitializeCriticalSection);
+        call(&mut services, &memory, &mut cpu, &RtlEnterCriticalSection);
+
+        // A different thread asks for the same section.
+        services.thread = 0x8000_2000;
+        assert_eq!(
+            call(&mut services, &memory, &mut cpu, &RtlEnterCriticalSection),
+            KernelStatus::SUCCESS
+        );
+        assert_eq!(
+            services.waited,
+            Some(cs),
+            "it waits on the section's own address, which is its event"
+        );
         assert_eq!(
             memory.read_u32(GuestVa(cs + OWNING_THREAD)).unwrap(),
-            0,
-            "unowned when balanced"
+            0x8000_1000,
+            "a parked thread must not claim a section the holder still has"
         );
+        assert_eq!(
+            memory.read_u32(GuestVa(cs + LOCK_COUNT)).unwrap(),
+            1,
+            "the holder left it at zero, so a waiter takes it to one"
+        );
+
+        // The holder releases: the waiter must be woken, or it is parked
+        // for the rest of the run.
+        services.thread = 0x8000_1000;
+        call(&mut services, &memory, &mut cpu, &RtlLeaveCriticalSection);
+        assert_eq!(services.signaled, Some(cs), "the waiter is woken");
     }
 
     #[test]
