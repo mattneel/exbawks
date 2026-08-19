@@ -665,6 +665,37 @@ Two active threads:
    `cargo build --release -p exbawks-cli` — and the engine flag is
    `--engine interpreter|whp`, where the retail title needs `whp`.
 
+   **Waits are real now (ADR 0021), and the measurement that proved it is
+   a lesson in itself.** The fabricated-completion layer is gone: waits
+   are blocks (keys, any/all, deadline, timeout status), one arbiter
+   decides every wake, critical sections hand ownership to exactly one
+   waiter at release, timeouts are honored, and an unwakeable guest stops
+   as `GuestDeadlock` with the thread table instead of being papered
+   over. The floating-point file — which the hypervisor register set did
+   not even name — travels with every context sync; `MXCSR` lives in the
+   HIGH quadword of `XmmControlStatus`, and packing it low runs the guest
+   with every SSE exception unmasked (instant boot fault in DirectSound,
+   which at least proved the registers reach the partition).
+
+   The lesson: real waits alone measured four-of-four clean, and that
+   reading was WRONG. Those runs each dropped 33 waits "inside an
+   interrupt routine" that were not from interrupt code — the ADR 0017
+   rotation had landed mid-ISR, ordinary threads ran with the interrupt
+   frame still live, and their waits were dropped with success already
+   in EAX: the old fabrication surviving by accident. Closing that hole
+   (no rotation mid-ISR, none at `DISPATCH_LEVEL`) makes every wait real
+   — and the title faults four-of-four at `0x001AE56C`, the wall that
+   predates the input work. It is the title's own allocator unlinking
+   from a static free-list bucket head (~`0x1E2EA4`, in `.data`) that
+   nothing ever populated — the links are zero because they were never
+   written, not scribbled. At the fault, `ebx` and `esi` hold
+   `0x1000_0000`, this runtime's first `NtAllocateVirtualMemory` address,
+   so allocator fidelity (granularity, `RegionSize` rounding, the
+   free-family lies the review flagged) is the prime suspect.
+   **Reproduces on demand now**: `--engine whp --press start@20000`,
+   faults in about two minutes. Determinism of the failure is what the
+   whole change bought; chase it from the allocator, not the unlink.
+
    **Superseded:** the driver used to ask the same question six times and
    give up, cycling the port.
 
