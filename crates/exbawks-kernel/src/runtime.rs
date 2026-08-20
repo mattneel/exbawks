@@ -1,14 +1,20 @@
 //! The guest thread table and kernel service implementation (ADR 0011/0012).
+//!
+//! This is the runtime half of the kernel crate: the schedulable thread
+//! table, waits and wakes (ADR 0021), timers, deferred procedures, the
+//! kernel-object allocators, and the [`KernelServices`] implementation the
+//! exports dispatch against. It lives here, not in the composition root,
+//! because kernel objects are this crate's to own (AGENTS.md).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use exbawks_cpu::{CpuState, Segment, SegmentState};
-use exbawks_kernel::{
+use crate::{
     DisplayMode, FileInfo, FileOpenRequest, FileOpened, KernelServiceError, KernelServices,
     ThreadCreateRequest, ThreadCreated, VirtualAllocRequest, VirtualAllocation, WaitOutcome,
 };
+use exbawks_cpu::{CpuState, Segment, SegmentState};
 use exbawks_memory::{GuestMemory, MemoryError, SoftwareAddressSpace};
 use exbawks_types::{GUEST_PAGE_SIZE, GuestRange, GuestVa, MemoryPermissions};
 
@@ -20,7 +26,7 @@ use crate::hostfs::HostFileSystem;
 /// `gate_ordinal` never resolves it to a real export; the run loop treats
 /// execution arriving here as an implicit thread exit whose status is EAX
 /// (ADR 0011).
-pub(crate) const THREAD_EXIT_SENTINEL: GuestVa = GuestVa(0xFFBF_FFF4);
+pub const THREAD_EXIT_SENTINEL: GuestVa = GuestVa(0xFFBF_FFF4);
 
 /// The base of the cached physical window (ADR 0010): `VA = 0x8000_0000 |
 /// PA`, aliasing all of physical RAM. Kernel blocks are physical
@@ -77,7 +83,7 @@ const MAX_TLS_BYTES: u32 = 1024 * 1024;
 /// that region; the emulator's job is to keep the initial stack pointer
 /// *below* it so ordinary pushes never clobber it.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct TlsTemplate {
+pub struct TlsTemplate {
     /// The guest VA of the initialized TLS data's first byte.
     pub raw_start: u32,
     /// One past the initialized TLS data's last byte.
@@ -95,7 +101,7 @@ const STACK_SCRATCH: u32 = 16;
 
 /// Everything one parked thread waits for (ADR 0021).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WaitBlock {
+pub struct WaitBlock {
     /// The objects, as handles or guest addresses, in the order the guest
     /// named them — a wake reports the satisfied one's index.
     pub keys: Vec<u32>,
@@ -110,7 +116,7 @@ pub(crate) struct WaitBlock {
 
 /// One guest thread's schedulable state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ThreadState {
+pub enum ThreadState {
     /// Eligible to run.
     Ready,
     /// The active thread.
@@ -131,7 +137,7 @@ const SYNCHRONIZATION_EVENT_TYPE: u32 = 1;
 
 /// One guest thread record.
 #[derive(Debug)]
-pub(crate) struct GuestThread {
+pub struct GuestThread {
     /// The saved CPU context while the thread is not running.
     pub cpu: CpuState,
     /// The schedulable state.
@@ -154,7 +160,7 @@ pub(crate) struct GuestThread {
 
 /// A scheduling effect recorded during a kernel call (ADR 0011).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PendingAction {
+pub enum PendingAction {
     /// The calling thread exits with a status.
     Exit {
         /// The guest exit status.
@@ -181,7 +187,7 @@ struct ArmedTimer {
     period: u64,
 }
 
-pub(crate) struct ThreadManager {
+pub struct ThreadManager {
     memory: Arc<SoftwareAddressSpace>,
     threads: Vec<GuestThread>,
     current: usize,
@@ -206,7 +212,7 @@ pub(crate) struct ThreadManager {
     /// The interrupt service routines the title has registered, and
     /// whether each is currently connected. A device that raises an
     /// interrupt calls the connected routine for its vector.
-    interrupts: Vec<(exbawks_kernel::InterruptRoutine, bool)>,
+    interrupts: Vec<(crate::InterruptRoutine, bool)>,
     /// Regions the guest marked to survive a soft reboot (ADR 0015):
     /// `(base, size)` pairs from `MmPersistContiguousMemory`.
     persisted: Vec<(u32, u32)>,
@@ -257,7 +263,7 @@ const LAUNCH_DATA_PAGE_ORDINAL: u16 = 164;
 const KE_TICK_COUNT_ORDINAL: u16 = 156;
 
 impl ThreadManager {
-    pub(crate) fn new(
+    pub fn new(
         memory: Arc<SoftwareAddressSpace>,
         disc_root: Option<PathBuf>,
         hdd_root: Option<PathBuf>,
@@ -289,7 +295,7 @@ impl ThreadManager {
     }
 
     /// The claimed GPU instance-memory region, when one exists.
-    pub(crate) fn gpu_instance(&self) -> Option<(GuestVa, u32)> {
+    pub fn gpu_instance(&self) -> Option<(GuestVa, u32)> {
         self.gpu_instance
     }
 
@@ -298,7 +304,7 @@ impl ThreadManager {
     /// Saves the active thread's context from `cpu` and loads the next
     /// ready thread's context into it. Returns `false` (leaving `cpu`
     /// untouched) when no other thread is ready to run.
-    pub(crate) fn rotate_active(&mut self, cpu: &mut CpuState) -> bool {
+    pub fn rotate_active(&mut self, cpu: &mut CpuState) -> bool {
         let count = self.threads.len();
         if count < 2 {
             return false;
@@ -321,12 +327,12 @@ impl ThreadManager {
     }
 
     /// Returns the guest address of the `KeTickCount` cell, when imported.
-    pub(crate) fn tick_count_cell(&self) -> Option<GuestVa> {
+    pub fn tick_count_cell(&self) -> Option<GuestVa> {
         self.tick_count_cell
     }
 
     /// Supplies the image's TLS directory before threads are created.
-    pub(crate) fn set_tls_template(&mut self, template: TlsTemplate) {
+    pub fn set_tls_template(&mut self, template: TlsTemplate) {
         self.tls_template = Some(template);
     }
 
@@ -335,7 +341,7 @@ impl ThreadManager {
     /// Mirrors the XDK CRT's size computation — `align16(data + zero_fill) +
     /// 4` — with slack, so the region the CRT claims below `StackBase` sits
     /// wholly above the initial stack pointer.
-    pub(crate) fn tls_reserve_bytes(&self) -> u32 {
+    pub fn tls_reserve_bytes(&self) -> u32 {
         let Some(template) = self.tls_template else {
             return 0;
         };
@@ -347,19 +353,19 @@ impl ThreadManager {
 
     /// Returns the guest address of the `LaunchDataPage` variable cell, when
     /// the image imports it (ADR 0015).
-    pub(crate) fn launch_data_page_cell(&self) -> Option<GuestVa> {
+    pub fn launch_data_page_cell(&self) -> Option<GuestVa> {
         self.launch_data_page_cell
     }
 
     /// Returns the regions the guest marked to survive a soft reboot.
-    pub(crate) fn persisted_regions(&self) -> &[(u32, u32)] {
+    pub fn persisted_regions(&self) -> &[(u32, u32)] {
         &self.persisted
     }
 
     /// Builds the boot thread's KPCR/KTHREAD pages and registers thread one.
     ///
     /// Returns the KPCR address the caller wires into the active `fs` base.
-    pub(crate) fn create_boot_environment(
+    pub fn create_boot_environment(
         &mut self,
         stack_base: GuestVa,
         stack_bytes: u32,
@@ -411,7 +417,7 @@ impl ThreadManager {
     /// dereference the patched slot without faulting; ordinals with defined
     /// semantics are initialized and the rest stay zero. Returns the guest
     /// address of each variable for the loader's thunk patching.
-    pub(crate) fn build_kernel_variables(
+    pub fn build_kernel_variables(
         &mut self,
         data_ordinals: &[u16],
         image_name: &str,
@@ -566,7 +572,7 @@ impl ThreadManager {
     }
 
     /// Takes the scheduling action the last kernel call recorded.
-    pub(crate) fn take_pending(&mut self) -> Option<PendingAction> {
+    pub fn take_pending(&mut self) -> Option<PendingAction> {
         self.pending.take()
     }
 
@@ -575,7 +581,7 @@ impl ThreadManager {
     /// A run that wedges is a run whose threads are all waiting on each
     /// other, and the instruction pointer alone cannot show that: it names
     /// one thread of several. This says what every one of them is doing.
-    pub(crate) fn thread_report(&self, active_cpu: &CpuState) -> Vec<(u32, String, u32)> {
+    pub fn thread_report(&self, active_cpu: &CpuState) -> Vec<(u32, String, u32)> {
         self.threads
             .iter()
             .enumerate()
@@ -632,7 +638,7 @@ impl ThreadManager {
 
     /// True when the active thread's return to null is an intended exit
     /// rather than a fault (only the boot thread, ADR 0011).
-    pub(crate) fn active_exits_on_null_return(&self) -> bool {
+    pub fn active_exits_on_null_return(&self) -> bool {
         self.threads.get(self.current).is_some_and(|thread| thread.exits_on_null_return)
     }
 
@@ -640,7 +646,7 @@ impl ThreadManager {
     ///
     /// Returns `true` when a thread was resumed (execution continues) and
     /// `false` when no runnable thread remains (the caller stops).
-    pub(crate) fn exit_active(&mut self, active_cpu: &mut CpuState, status: u32) -> bool {
+    pub fn exit_active(&mut self, active_cpu: &mut CpuState, status: u32) -> bool {
         if let Some(thread) = self.threads.get_mut(self.current) {
             thread.state = ThreadState::Terminated;
         }
@@ -676,7 +682,7 @@ impl ThreadManager {
     }
 
     /// The display mode the title last programmed, if any.
-    pub(crate) fn display_mode(&self) -> Option<DisplayMode> {
+    pub fn display_mode(&self) -> Option<DisplayMode> {
         self.display_mode
     }
 
@@ -806,7 +812,7 @@ impl ThreadManager {
     /// parked either way — the run loop then idles, advancing the clocks
     /// and delivering interrupts until a wake makes some thread ready
     /// (ADR 0021), instead of the wait being fabricated complete.
-    pub(crate) fn park_active(&mut self, block: WaitBlock, active_cpu: &mut CpuState) -> bool {
+    pub fn park_active(&mut self, block: WaitBlock, active_cpu: &mut CpuState) -> bool {
         if let Some(thread) = self.threads.get_mut(self.current) {
             thread.cpu = active_cpu.clone();
             thread.state = ThreadState::Waiting(block);
@@ -825,7 +831,7 @@ impl ThreadManager {
     }
 
     /// Whether the active thread may execute guest code right now.
-    pub(crate) fn active_runnable(&self) -> bool {
+    pub fn active_runnable(&self) -> bool {
         self.threads.get(self.current).is_some_and(|t| t.state == ThreadState::Running)
     }
 
@@ -834,7 +840,7 @@ impl ThreadManager {
     ///
     /// The parked thread's context was saved when it parked, so nothing is
     /// saved here — the live CPU state is stale by design.
-    pub(crate) fn resume_any_ready(&mut self, active_cpu: &mut CpuState) -> bool {
+    pub fn resume_any_ready(&mut self, active_cpu: &mut CpuState) -> bool {
         if self.active_runnable() {
             return true;
         }
@@ -853,7 +859,7 @@ impl ThreadManager {
     /// What could still wake a parked thread: the earliest virtual-time
     /// wake (timer or wait deadline), whether any interrupt routine is
     /// connected, and whether any thread is parked at all.
-    pub(crate) fn wake_hint(&self) -> (Option<u64>, bool, bool) {
+    pub fn wake_hint(&self) -> (Option<u64>, bool, bool) {
         let mut next: Option<u64> = None;
         let mut consider = |at: u64| {
             next = Some(next.map_or(at, |known: u64| known.min(at)));
@@ -875,12 +881,12 @@ impl ThreadManager {
     }
 
     /// The current virtual time in milliseconds.
-    pub(crate) fn now_ms(&self) -> u64 {
+    pub fn now_ms(&self) -> u64 {
         self.elapsed_ms
     }
 
     /// Renders every thread's scheduling state for stop diagnostics.
-    pub(crate) fn describe_threads(&self) -> String {
+    pub fn describe_threads(&self) -> String {
         use std::fmt::Write as _;
         let mut out = String::new();
         for (index, thread) in self.threads.iter().enumerate() {
@@ -893,19 +899,16 @@ impl ThreadManager {
         out
     }
 
-    /// Returns the number of live (non-terminated) threads.
-    #[cfg(test)]
-    pub(crate) fn live_threads(&self) -> usize {
+    /// Returns the number of live (non-terminated) threads, for tests and
+    /// diagnostics.
+    pub fn live_threads(&self) -> usize {
         self.threads.iter().filter(|thread| thread.state != ThreadState::Terminated).count()
     }
 }
 
 impl ThreadManager {
     /// The connected service routine for one interrupt vector.
-    pub(crate) fn interrupt_routine(
-        &self,
-        vector: u32,
-    ) -> Option<exbawks_kernel::InterruptRoutine> {
+    pub fn interrupt_routine(&self, vector: u32) -> Option<crate::InterruptRoutine> {
         self.interrupts
             .iter()
             .find(|(known, connected)| *connected && known.vector == vector)
@@ -914,7 +917,7 @@ impl ThreadManager {
 
     /// Advances guest time and queues the deferred procedures of any
     /// timers that have come due.
-    pub(crate) fn advance_timers(&mut self, milliseconds: u64) {
+    pub fn advance_timers(&mut self, milliseconds: u64) {
         self.elapsed_ms = self.elapsed_ms.saturating_add(milliseconds);
         if milliseconds == 0 {
             return;
@@ -961,7 +964,7 @@ impl ThreadManager {
     }
 
     /// Takes the next queued deferred procedure call.
-    pub(crate) fn take_dpc(&mut self) -> Option<u32> {
+    pub fn take_dpc(&mut self) -> Option<u32> {
         if self.dpc_queue.is_empty() {
             return None;
         }
@@ -969,7 +972,7 @@ impl ThreadManager {
     }
 
     /// Whether any deferred procedure is waiting to run.
-    pub(crate) fn has_queued_dpc(&self) -> bool {
+    pub fn has_queued_dpc(&self) -> bool {
         !self.dpc_queue.is_empty()
     }
 }
@@ -1078,7 +1081,7 @@ impl KernelServices for ThreadManager {
         Ok(previous)
     }
 
-    fn set_interrupt_routine(&mut self, interrupt: exbawks_kernel::InterruptRoutine) {
+    fn set_interrupt_routine(&mut self, interrupt: crate::InterruptRoutine) {
         // A title re-initialises the same object rather than allocating a
         // new one, so the newest description of an object replaces the
         // older one instead of accumulating beside it.
@@ -1323,8 +1326,8 @@ impl KernelServices for ThreadManager {
         keys: &[u32],
         wait_all: bool,
         timeout_ms: Option<u64>,
-    ) -> Result<exbawks_kernel::MultiWaitOutcome, KernelServiceError> {
-        use exbawks_kernel::MultiWaitOutcome;
+    ) -> Result<crate::MultiWaitOutcome, KernelServiceError> {
+        use crate::MultiWaitOutcome;
         for key in keys {
             let known = self.events.contains_key(key)
                 || self.mutants.contains_key(key)
@@ -1674,7 +1677,7 @@ mod tests {
         let first = threads.create_event(false, false).expect("event A creates");
         let second = threads.create_event(false, false).expect("event B creates");
 
-        use exbawks_kernel::MultiWaitOutcome;
+        use crate::MultiWaitOutcome;
         assert_eq!(
             threads.wait_for_objects(&[first, second], false, None),
             Ok(MultiWaitOutcome::Pending)

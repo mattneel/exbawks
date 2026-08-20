@@ -66,6 +66,20 @@ The project follows Keep a Changelog structure before its first release.
   menu. First use took the title past difficulty select into five further
   screen transitions.
 
+### Changed (structure)
+
+- The guest kernel-object subsystem lives in `exbawks-kernel` now, where
+  AGENTS.md always said it belonged: the thread table, scheduler, waits,
+  timers, deferred procedures, kernel-object allocators, and the
+  `KernelServices` implementation (`runtime.rs`), plus the ADR 0014 host
+  file device (`hostfs.rs`) — about 2,500 lines the composition root had
+  absorbed, the structural review's largest boundary finding. The
+  composition root constructs and wires them, which is what a composition
+  root is for. No behavior changed; the thread tests moved crates with
+  the code. Still in the root and noted as debt: interrupt delivery,
+  scan-out capture, the live-gamepad reader, and the GPU/APU register
+  stubs.
+
 ### Fixed
 
 - The physical allocator's rollback path asserted that the allocation

@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use exbawks_kernel::{FileInfo, FileOpenRequest, FileOpened, KernelServiceError};
+use crate::{FileInfo, FileOpenRequest, FileOpened, KernelServiceError};
 
 /// The first guest handle the file table hands out. Disjoint from the thread
 /// handle range (`0x0000_E000`+), so one `close_handle` serves both.

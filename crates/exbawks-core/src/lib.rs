@@ -4,11 +4,9 @@
 mod config;
 mod emulator;
 mod error;
-mod hostfs;
 mod loaded;
 mod mmio;
 mod report;
-mod threads;
 mod thunk;
 
 pub use config::EmulatorConfig;

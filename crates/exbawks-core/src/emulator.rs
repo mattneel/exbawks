@@ -23,8 +23,8 @@ use exbawks_types::{
 };
 use exbawks_xbe::{XbeImage, XbeSectionFlags};
 
-use crate::threads::{PendingAction, THREAD_EXIT_SENTINEL, ThreadManager};
 use crate::{BootPlanReport, CoreError, EmulatorConfig, KernelThunkTable, LoadedImage};
+use exbawks_kernel::runtime::{PendingAction, THREAD_EXIT_SENTINEL, ThreadManager};
 
 /// The outcome of one kernel gate call attempt at the current guest EIP.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -707,7 +707,7 @@ impl Emulator {
         if tls_directory.0 != 0 {
             let field = |offset: u32| memory.read_u32(GuestVa(tls_directory.0 + offset));
             if let (Ok(raw_start), Ok(raw_end), Ok(zero_fill)) = (field(0), field(4), field(16)) {
-                threads.set_tls_template(crate::threads::TlsTemplate {
+                threads.set_tls_template(exbawks_kernel::runtime::TlsTemplate {
                     raw_start,
                     raw_end,
                     zero_fill,
