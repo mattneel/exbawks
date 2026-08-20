@@ -724,6 +724,28 @@ Two active threads:
    watchpoint slows the guest enough to dodge the bug, read that as
    timing-sensitivity, not absence.
 
+   **The deterministic tier runs the retail title now, with input.** The
+   interpreter gained the Pentium III SSE1 surface (`sse.rs`, beside the
+   x87 module), `fsincos`, `cli`/`sti` with a delivery gate honoring the
+   interrupt flag on both tiers, an I/O-port bus (`step_with_ports`),
+   MMIO routing through `MmioView`, the interrupt-return sentinel, and a
+   block-count device pump (`pump_tick_deterministic`) — one virtual
+   millisecond of timers, USB frames, vblank, DPCs, and pushbuffer per
+   4,096 blocks. Proof of determinism: two 400M-instruction runs with a
+   scripted press end bit-identical in every register. The distance to a
+   recorded title-screen golden is throughput alone — ~half a
+   console-second per two wall minutes against the ten-plus the title
+   needs. `--press` also speaks the analogue face buttons now
+   (`a@34000` confirms a menu; the first use drove five screen
+   transitions past difficulty select).
+
+   **The kernel-object subsystem lives in `exbawks-kernel`** as
+   `runtime.rs` (thread table, scheduler, waits, timers, allocators,
+   the `KernelServices` implementation) with `hostfs.rs` beside it —
+   the review's largest boundary finding, closed. The `0x7FFFFFF8`
+   intermittent is closed as killed by the scrubbed free pool (0/13
+   post-fix runs against a ~20% historical rate); reopen on sight.
+
    **Superseded:** the driver used to ask the same question six times and
    give up, cycling the port.
 
