@@ -230,7 +230,20 @@ impl KernelExport for MmFreeContiguousMemory {
         4
     }
 
-    fn call(&self, _context: &mut KernelCallContext<'_>) -> KernelStatus {
+    fn call(&self, context: &mut KernelCallContext<'_>) -> KernelStatus {
+        // MmFreeContiguousMemory(BaseAddress). The pages return to the
+        // physical pool: a title churns full-screen surfaces through this
+        // family at every menu transition, and a free that keeps nothing
+        // exhausts real-console RAM in about a minute — after which the
+        // title's out-of-memory error paths run, where its bugs live.
+        if let Some(base) = crate::startup::stack_argument(context, 0).filter(|base| *base != 0)
+            && context.services.free_contiguous(base).is_err()
+        {
+            tracing::debug!(
+                base = format_args!("{base:#010x}"),
+                "MmFreeContiguousMemory of an unknown block was ignored"
+            );
+        }
         // Returns VOID; the value in EAX is irrelevant to the caller.
         KernelStatus::SUCCESS
     }

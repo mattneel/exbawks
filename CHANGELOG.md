@@ -31,6 +31,36 @@ The project follows Keep a Changelog structure before its first release.
 
 ### Changed
 
+- **The menu-transition crash is dead, and the diagnosis is a story worth
+  keeping.** The deterministic fault at `0x001AE56C` was the title's own
+  out-of-memory error path: a stack dump at the fault held `E_OUTOFMEMORY`
+  beside a request for exactly one 640x480 surface, and the crash was
+  D3D's failure cleanup freeing a static default object — a bug the title
+  genuinely has, that no real console ever hits, because no real console
+  fails that allocation. Ours did: `MmFreeContiguousMemory` was a no-op
+  over a bump allocator, so every surface the title freed at a menu
+  transition leaked, and sixty-four megabytes exhaust in about a minute
+  of menus. Doubling the RAM made the fault vanish, which confirmed it.
+
+  The physical allocator now carries a free pool: freed runs coalesce
+  with their neighbours and are reused first, the cursor only grows when
+  nothing fits, and `MmFreeContiguousMemory` really frees (recorded
+  size, persisted ADR 0015 regions excluded). Freed pages are scrubbed
+  before pooling, because every allocation path promises zeroed memory —
+  a promise that was only ever free because the bump allocator handed out
+  untouched RAM; the first unscrubbed build handed a fresh commit
+  somebody else's data, and the title's heap read a leftover as a link.
+
+- `NtAllocateVirtualMemory` fidelity, from Cxbx-Reloaded's `VMManager`:
+  fresh reservations are 64 KiB aligned, as the console's kernel places
+  them (an allocator finds its arena by masking a block pointer down to
+  that alignment, so page-packed reservations send every such lookup into
+  the wrong arena), and commits proceed page by page so a commit spanning
+  already-committed and fresh pages succeeds the way the real kernel's
+  does instead of failing the whole request. Both close real divergences
+  from the console, though the crash's cause turned out to be the leak
+  above.
+
 - **Waits are real now (ADR 0021).** The synchronization layer's
   fabrications — the structural review's largest finding — are deleted and
   replaced with the semantics the console's kernel actually has:

@@ -111,6 +111,32 @@ impl SoftwareAddressSpace {
         Ok(allocator.allocate(pages)?.start_pa())
     }
 
+    /// Returns page-rounded physical pages to the allocator's free pool.
+    ///
+    /// The pages are scrubbed here, because every allocation path promises
+    /// zeroed memory — a promise that used to be free when the bump
+    /// allocator only handed out untouched RAM. A reused page that kept
+    /// its old contents hands a fresh commit somebody else's data, and a
+    /// title's lazily-initialized structures then read garbage as state.
+    /// The scrub is a write like any other, so cached translations of
+    /// anything that lived there are dropped too (ADR 0005).
+    pub fn free_physical(&self, start: GuestPa, bytes: u32) {
+        let pages = bytes.max(1).div_ceil(GUEST_PAGE_SIZE);
+        let first = start.0 / GUEST_PAGE_SIZE;
+        {
+            let mut physical = self.physical.write();
+            let begin = (first as usize) * GUEST_PAGE_SIZE as usize;
+            let end = begin.saturating_add((pages as usize) * GUEST_PAGE_SIZE as usize);
+            let limit = physical.len();
+            if let Some(slice) = physical.get_mut(begin..end.min(limit)) {
+                slice.fill(0);
+            }
+        }
+        self.bump_physical_generations(first * GUEST_PAGE_SIZE, (pages * GUEST_PAGE_SIZE) as usize);
+        let mut allocator = self.allocator.lock();
+        allocator.free(exbawks_types::GuestPage(first), pages);
+    }
+
     /// Advances the physical allocator so every page below `end` is spoken
     /// for (soft-reboot restore keeps persisted regions out of reuse).
     pub fn reserve_physical_through(&self, end: GuestPa) {

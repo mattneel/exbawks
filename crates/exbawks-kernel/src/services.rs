@@ -442,6 +442,12 @@ pub trait KernelServices {
         None
     }
 
+    /// Frees a contiguous kernel-window allocation by its base address,
+    /// returning its physical pages to the pool.
+    fn free_contiguous(&mut self, _address: u32) -> Result<(), KernelServiceError> {
+        Err(KernelServiceError::Unsupported)
+    }
+
     /// Opens a handle to an existing symbolic-link object.
     fn open_symbolic_link(&mut self, _name: &str) -> Result<u32, KernelServiceError> {
         Err(KernelServiceError::Unsupported)

@@ -43,6 +43,11 @@ const USER_ALLOC_END: u32 = 0x7F00_0000;
 /// The Win32 `MEM_COMMIT` allocation-type flag: back the range with pages.
 const MEM_COMMIT: u32 = 0x0000_1000;
 
+/// The alignment of a fresh reservation, as the console's kernel places
+/// them: blocks reserved by `NtAllocateVirtualMemory` are 64 KiB aligned
+/// with sizes rounded at page granularity.
+const RESERVE_ALIGN: u32 = 0x1_0000;
+
 /// The KTHREAD block offset inside each thread's KPCR page.
 const KTHREAD_OFFSET: u32 = 0x200;
 /// `DISPATCHER_HEADER.SignalState`, which a finished thread sets.
@@ -1426,6 +1431,29 @@ impl KernelServices for ThreadManager {
         Ok(range.start())
     }
 
+    fn free_contiguous(&mut self, address: u32) -> Result<(), KernelServiceError> {
+        // The recorded size makes the free exact; an address this runtime
+        // never handed out is refused rather than guessed at. Persisted
+        // regions (ADR 0015) stay out of the pool: a title frees its
+        // launch page only by rebooting.
+        let size = self.pool_sizes.remove(&address).ok_or(KernelServiceError::NotFound)?;
+        let physical = address & 0x1FFF_FFFF;
+        if self
+            .persisted
+            .iter()
+            .any(|(start, len)| *start <= address && address < start.saturating_add(*len))
+        {
+            return Ok(());
+        }
+        self.memory.free_physical(exbawks_types::GuestPa(physical), size);
+        tracing::trace!(
+            address = format_args!("{address:#010x}"),
+            size = format_args!("{size:#x}"),
+            "contiguous free returned pages to the pool"
+        );
+        Ok(())
+    }
+
     fn set_file_position(&mut self, handle: u32, offset: u64) -> Result<(), KernelServiceError> {
         self.files.set_position(handle, offset)
     }
@@ -1457,7 +1485,13 @@ impl KernelServices for ThreadManager {
         let rounded = span.max(1).div_ceil(page).saturating_mul(page);
 
         let base = if request.base == 0 {
-            let start = self.user_cursor;
+            // A fresh reservation is 64 KiB aligned, exactly as the
+            // console's kernel places one; only the size rounds at page
+            // granularity. An allocator finds its arena header by masking
+            // a block pointer down to that alignment, so a reservation
+            // this runtime packs at page granularity sends every such
+            // lookup into the wrong arena — whose memory reads as zeros.
+            let start = self.user_cursor.next_multiple_of(RESERVE_ALIGN);
             let end = start
                 .checked_add(rounded)
                 .filter(|end| *end <= USER_ALLOC_END)
@@ -1472,18 +1506,40 @@ impl KernelServices for ThreadManager {
         // range unbacked (the real reserve/commit region map is MEM-007), so
         // an access before a later commit faults as it should.
         if request.allocation_type & MEM_COMMIT != 0 {
-            let range = GuestRange::new(GuestVa(base), u64::from(rounded))
-                .map_err(|_| KernelServiceError::ResourceExhausted)?;
             let permissions = protect_to_permissions(request.protect);
-            if self.memory.map_anonymous(range, permissions).is_err() {
-                // A range already committed by an earlier call: re-apply the
-                // protection rather than double-mapping.
-                self.memory
-                    .protect(range, permissions)
+            // Page by page, because a commit may overlap pages an earlier
+            // commit already backed: the kernel commits the fresh ones and
+            // leaves the rest committed, and a title extending its heap
+            // relies on that. Refusing the mixed case fails the extend,
+            // and an allocator's failure path is where its bookkeeping
+            // and its lists part company.
+            let mut cursor = base;
+            let end = base.checked_add(rounded).ok_or(KernelServiceError::ResourceExhausted)?;
+            while cursor < end {
+                let range = GuestRange::new(GuestVa(cursor), u64::from(page))
                     .map_err(|_| KernelServiceError::ResourceExhausted)?;
+                if self.memory.map_anonymous(range, permissions).is_err() {
+                    // Already committed: re-apply the protection instead.
+                    self.memory.protect(range, permissions).map_err(|_| {
+                        tracing::warn!(
+                            page = format_args!("{cursor:#010x}"),
+                            "a commit page could neither map nor re-protect"
+                        );
+                        KernelServiceError::ResourceExhausted
+                    })?;
+                }
+                cursor = cursor.saturating_add(page);
             }
         }
 
+        tracing::debug!(
+            requested_base = format_args!("{:#010x}", request.base),
+            requested_size = format_args!("{:#x}", request.size),
+            allocation_type = format_args!("{:#x}", request.allocation_type),
+            base = format_args!("{base:#010x}"),
+            size = format_args!("{rounded:#x}"),
+            "NtAllocateVirtualMemory"
+        );
         Ok(VirtualAllocation { base: GuestVa(base), size: rounded })
     }
 }
@@ -1868,6 +1924,8 @@ mod tests {
         };
         let first = threads.allocate_virtual_memory(request).expect("first allocation");
         let second = threads.allocate_virtual_memory(request).expect("second allocation");
-        assert_eq!(second.base.0, first.base.0 + 0x1000, "the cursor advances past the first");
+        assert!(second.base.0 > first.base.0, "the cursor advances past the first");
+        assert_eq!(first.base.0 % 0x1_0000, 0, "a fresh reservation is 64 KiB aligned");
+        assert_eq!(second.base.0 % 0x1_0000, 0, "every fresh reservation is");
     }
 }
