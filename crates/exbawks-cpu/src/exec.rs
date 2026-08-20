@@ -158,10 +158,60 @@ pub fn step_with_ports(
 ) -> Result<(), ExecError> {
     let address = GuestVa(state.eip);
     let instruction = decode_at(state.eip, memory, address)?;
+    step_decoded(state, memory, ports, &instruction, address)
+}
+
+/// [`step_with_ports`], decoding through a cache validated by physical
+/// page generation (ADR 0005), so unchanged code decodes once.
+pub fn step_cached(
+    state: &mut CpuState,
+    memory: &dyn GuestMemory,
+    ports: &dyn PortBus,
+    cache: &mut crate::cache::InstructionCache,
+) -> Result<(), ExecError> {
+    let address = GuestVa(state.eip);
+    let instruction = match cache.get(state.eip, memory.page_table()) {
+        Some(instruction) => instruction,
+        None => {
+            let instruction = decode_at(state.eip, memory, address)?;
+            cache.put(state.eip, instruction, memory);
+            instruction
+        }
+    };
+    step_decoded(state, memory, ports, &instruction, address)
+}
+
+/// Decodes the single instruction at `eip` without executing it.
+///
+/// The run loop shares one cached decode between its kernel-gate probe
+/// and the execution step, which is what makes a step cost one decode
+/// instead of three.
+pub fn decode_one(eip: u32, memory: &dyn GuestMemory) -> Result<Instruction, ExecError> {
+    decode_at(eip, memory, GuestVa(eip))
+}
+
+/// Executes one already-decoded instruction, advancing EIP and the TSC.
+pub fn step_instruction(
+    state: &mut CpuState,
+    memory: &dyn GuestMemory,
+    ports: &dyn PortBus,
+    instruction: &Instruction,
+) -> Result<(), ExecError> {
+    step_decoded(state, memory, ports, instruction, GuestVa(state.eip))
+}
+
+/// Executes one already-decoded instruction.
+fn step_decoded(
+    state: &mut CpuState,
+    memory: &dyn GuestMemory,
+    ports: &dyn PortBus,
+    instruction: &Instruction,
+    address: GuestVa,
+) -> Result<(), ExecError> {
     match instruction.mnemonic() {
-        Mnemonic::Out | Mnemonic::In => execute_port_io(state, ports, &instruction, address)?,
+        Mnemonic::Out | Mnemonic::In => execute_port_io(state, ports, instruction, address)?,
         _ => {
-            if execute(state, memory, &instruction, address)? == Flow::Next {
+            if execute(state, memory, instruction, address)? == Flow::Next {
                 state.eip = state.eip.wrapping_add(instruction.len() as u32);
             }
             state.tsc = state.tsc.wrapping_add(1);

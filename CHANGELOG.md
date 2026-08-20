@@ -47,14 +47,47 @@ The project follows Keep a Changelog structure before its first release.
   it before), boot EFLAGS with the flag set as the kernel leaves it, and
   the cache-control no-ops.
 
-  Measured: two 400-million-instruction runs with a scripted press end in
-  bit-identical registers — determinism holds through input, USB
-  enumeration, interrupts, timers, and the pump. What remains between
-  here and a recorded title-screen golden is throughput, not
-  correctness: the tier runs about half a console-second per two wall
-  minutes, and the title needs ten-plus console-seconds to draw its
-  first frame. A golden is recordable today by patience; making it cheap
-  is an optimization task, not a semantics one.
+  **The goal is reached: the deterministic tier renders the retail
+  title's screen with a reproducible digest.** Two four-billion-
+  instruction runs draw the full title screen and digest identically,
+  and at an intermediate stop the digest matches one the hypervisor tier
+  produced — cross-tier agreement on the frame, bit-for-bit. The digest
+  itself lives beside the private fixtures, never in this repository.
+
+  Getting there took a chain of fixes, each found by measurement after
+  the previous one proved insufficient, and the instruments failed twice
+  before they told the truth:
+
+  - One decode per step instead of three (classification, gate probe,
+    step), sharing a generation-validated cache — with the cancelled
+    JIT's per-block planning removed from the loop, 3.05 became 25.6
+    million instructions a second. The cache alone had made things
+    slower; the measurement that revealed why also revealed the loop.
+  - The virtual millisecond grew from 4,096 instructions to 65,536: the
+    title's own audio tick costs about five thousand instructions per
+    millisecond, and a millisecond smaller than the work it must hold
+    means the guest treads water forever.
+  - Deterministic time slices in the pump: the title's main thread polls
+    its sound loads in a loop with no kernel call in it, and a purely
+    cooperative tier starves the mixer thread that does the loading.
+    Rotation by block count is a pure function of the run, so ADR 0017's
+    determinism objection to slices does not apply here.
+  - PRAMIN routes at claim time, on the kernel-dispatch path: the guest
+    writes its GPU objects through the window within the same pump tick
+    as the claim, and a redirect one tick late latched those writes into
+    the device stub — every DMA object then resolved as zeros and fences
+    released to physical address zero, which a fence-waiting title
+    interprets as a GPU that never finishes.
+  - The MMX unit (aliasing the x87 file, as the hardware does) and the
+    x87 `fsincos`, which the title's D3D uses for vertex copies and
+    matrix setup.
+
+  Two instrumentation lessons are recorded because they cost real time:
+  a heartbeat that samples on pump-tick boundaries photographs freshly
+  delivered interrupt routines and nothing else, and a sampler whose
+  period shares a factor with the vblank cycle locks phase and
+  photographs one instruction forever. Sample off the boundary, with a
+  prime period.
 
 - The early intermittent `GuestFault` at `0x7FFFFFF8` is closed as fixed
   by the scrubbed free pool: zero occurrences in thirteen post-scrub runs

@@ -378,7 +378,15 @@ impl DeviceSpace {
         let region = DeviceRegion::of(address);
         let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         stats[Self::slot(region)].reads += 1;
-        tracing::trace!(?region, address = format_args!("{address:#010x}"), "MMIO read");
+        tracing::trace!(
+            ?region,
+            address = format_args!("{address:#010x}"),
+            value = format_args!(
+                "{:#010x}",
+                u32::from_le_bytes(*output.first_chunk().unwrap_or(&[0; 4]))
+            ),
+            "MMIO read"
+        );
     }
 
     /// Accepts one device write, latching it for readback.

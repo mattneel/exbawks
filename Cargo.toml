@@ -66,3 +66,8 @@ module_name_repetitions = "allow"
 todo = "warn"
 unimplemented = "warn"
 unwrap_used = "allow"
+
+# Line-level debug info in release, so a stack sampler can name what a
+# run spends its time in; codegen is unchanged.
+[profile.release]
+debug = 1

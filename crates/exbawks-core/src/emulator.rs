@@ -3,14 +3,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use exbawks_cpu::{
-    BasicBlockDecoder, CpuState, DecodeConfig, DecodedBlock, ExecError, classify_register_op,
-    indirect_call_slot,
+    BasicBlockDecoder, CpuState, DecodeConfig, DecodedBlock, ExecError, indirect_call_slot,
 };
 use exbawks_debug::{NoopTrace, TraceEvent, TraceSink};
 use exbawks_gpu::{GraphicsFrontend, NullGraphicsBackend};
 use exbawks_jit::{
-    BlockExit, BlockKey, CodeCache, CodegenBackend, CompiledBlock, CraneliftBackend,
-    DirectRewriteBackend, Dispatcher, PhysicalPageDependency,
+    BlockKey, CodeCache, CodegenBackend, CompiledBlock, CraneliftBackend, DirectRewriteBackend,
+    PhysicalPageDependency,
 };
 use exbawks_kernel::{
     KernelCallContext, KernelRegistry, KernelStatus, gate_address, gate_ordinal,
@@ -47,17 +46,6 @@ pub enum GateAssist {
     },
     /// The current instruction is not a kernel gate call.
     NotAGateCall,
-}
-
-/// How the run loop treats the instruction at one address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EntryClass {
-    /// The direct backend translates the first instruction.
-    Translatable,
-    /// Decodable but untranslatable: probe the gate, then interpret.
-    Assisted,
-    /// Unfetchable or undecodable: the interpreter reports the typed fault.
-    Interpreted,
 }
 
 /// Extracts the faulting guest address a memory error carries, when any.
@@ -108,6 +96,18 @@ impl exbawks_usb::UsbMemory for WindowMemory<'_> {
         }
         self.0.write(GuestVa(0x8000_0000 | physical), bytes).is_ok()
     }
+}
+
+/// The ordinals `EXBAWKS_GATE_FRAME` asks to dump, read once: an
+/// environment lookup on every kernel dispatch dominates the dispatch.
+fn gate_frame_ordinals() -> &'static [u16] {
+    use std::sync::OnceLock;
+    static ORDINALS: OnceLock<Vec<u16>> = OnceLock::new();
+    ORDINALS.get_or_init(|| {
+        std::env::var("EXBAWKS_GATE_FRAME")
+            .map(|value| value.split(',').filter_map(|item| item.trim().parse().ok()).collect())
+            .unwrap_or_default()
+    })
 }
 
 /// The device space's I/O ports, as the interpreter's port bus.
@@ -281,6 +281,23 @@ const MAX_CAPTURE_BYTES: u64 = 64 * 1024 * 1024;
 /// The console's time-stamp counter ticks per millisecond: a 733 MHz CPU
 /// clock, which is what a title's `rdtsc`-based pacing expects.
 const XBOX_TSC_PER_MILLISECOND: u64 = 733_333;
+
+/// Executed instructions per virtual millisecond on the deterministic
+/// tier (KRN-003): the clock a title polls for pacing, and the
+/// denominator the TSC top-up in the deterministic pump is computed
+/// against.
+///
+/// The value must be large enough that a title's own per-millisecond
+/// housekeeping fits inside the millisecond with room to make progress.
+/// The retail title's audio tick walks a table costing about five
+/// thousand instructions per millisecond; at the old 4,096 the tick
+/// consumed more than the whole millisecond and the title crawled in
+/// place — 92% of an unbiased sample profile inside that one loop. The
+/// console's own rate is ~733,000 cycles per millisecond; 65,536 keeps
+/// runs an order of magnitude shorter than real time while leaving
+/// per-millisecond work at a few percent, and stays a power of two so
+/// the tick arithmetic is exact.
+const BLOCKS_PER_VIRTUAL_MS: u64 = 65_536;
 
 /// The address a called interrupt routine returns to.
 ///
@@ -491,6 +508,8 @@ impl EmulatorBuilder {
             live_gamepad: None,
             scripted_input: None,
             vblank_owed_blocks: 0,
+            decoded: None,
+            pramin_routed: false,
             interrupted: None,
             watch_write: None,
             brightest_frame: None,
@@ -539,6 +558,10 @@ pub struct Emulator {
     live_gamepad: Option<std::sync::Arc<LiveGamepad>>,
     /// Virtual milliseconds owed toward the next deterministic vblank.
     vblank_owed_blocks: u64,
+    /// The interpreter's decoded-instruction cache (ADR 0005 validated).
+    decoded: Option<exbawks_cpu::cache::InstructionCache>,
+    /// Whether the deterministic tier has routed PRAMIN at the claim.
+    pramin_routed: bool,
     /// Presses the run makes on its own, by controller frame.
     ///
     /// A run driven by one of these is reproducible, which a run driven by
@@ -780,6 +803,18 @@ impl Emulator {
         let Some(instruction) = block.instructions.first() else {
             return Ok(GateAssist::NotAGateCall);
         };
+        let instruction = *instruction;
+        self.gate_call_with(&instruction)
+    }
+
+    /// [`Self::try_kernel_gate_call`] over an instruction the caller has
+    /// already decoded, so the interpreter loop's cached decode serves the
+    /// gate probe too.
+    fn gate_call_with(
+        &mut self,
+        instruction: &exbawks_cpu::DecodedInstruction,
+    ) -> Result<GateAssist, CoreError> {
+        let address = GuestVa(self.cpu.eip);
         let Some(slot) = indirect_call_slot(instruction) else {
             return Ok(GateAssist::NotAGateCall);
         };
@@ -818,9 +853,7 @@ impl Emulator {
         tracing::trace!(ordinal, name = export.name(), "dispatching kernel gate call");
         // A named ordinal's call frame, for tracking a value (an HRESULT, a
         // handle) through guest code that never stores it to memory.
-        if std::env::var("EXBAWKS_GATE_FRAME").is_ok_and(|value| {
-            value.split(',').any(|wanted| wanted.trim().parse::<u16>() == Ok(ordinal))
-        }) {
+        if gate_frame_ordinals().contains(&ordinal) {
             let esp = self.cpu.gpr[4];
             let mut stack = String::new();
             for slot in 0..24_u32 {
@@ -866,6 +899,9 @@ impl Emulator {
         // caller-clobbered register under the guest ABI.
         self.cpu.gpr[0] = status.0;
 
+        // A claim the export just made must take effect before the next
+        // guest instruction touches the window.
+        self.route_pramin_if_claimed();
         Ok(GateAssist::Dispatched { ordinal, resume: GuestVa(return_address), status, stop })
     }
 
@@ -1045,9 +1081,7 @@ impl Emulator {
     }
 
     fn run_blocks(&mut self, max_blocks: usize) -> Result<StopReason, CoreError> {
-        /// Executed blocks per KeTickCount millisecond (KRN-003): the
-        /// deterministic virtual clock a title polls for pacing.
-        const BLOCKS_PER_TICK: usize = 4096;
+        const BLOCKS_PER_TICK: usize = BLOCKS_PER_VIRTUAL_MS as usize;
 
         if self.loaded.is_none() {
             return Err(CoreError::NoImageLoaded);
@@ -1072,9 +1106,20 @@ impl Emulator {
                         executed,
                         eip = format_args!("{:#010x}", self.cpu.eip),
                         tsc = self.cpu.tsc,
+                        devices = %self.devices.summary(),
                         "run heartbeat"
                     );
                 }
+            }
+            // An unbiased sample: the heartbeat lands on a pump-tick
+            // boundary, where a freshly delivered interrupt routine's
+            // entry is what the instruction pointer always shows; this
+            // one lands mid-tick, where execution actually lives.
+            // The period is prime, so it cannot lock phase with the
+            // vblank cycle (65,536 instructions) the way a power of two
+            // does — a correlated sampler photographs one phase forever.
+            if executed % 1_000_003 == 524_309 && tracing::enabled!(tracing::Level::DEBUG) {
+                tracing::debug!(eip = format_args!("{:#010x}", self.cpu.eip), "run sample");
             }
             // Every thread parked means no guest code may run: virtual
             // time jumps to the next wake instead (ADR 0021).
@@ -1119,40 +1164,13 @@ impl Emulator {
                 }
                 continue;
             }
-            match self.classify_entry(start) {
-                EntryClass::Translatable => {
-                    let (_, compiled) = self.compiled_block_at(start)?;
-                    let Some(emitted) = compiled.executable.as_ref() else {
-                        return Ok(StopReason::RuntimeIncomplete);
-                    };
-
-                    let exit = Dispatcher.run(emitted, &mut self.cpu)?;
-                    self.cpu.tsc =
-                        self.cpu.tsc.wrapping_add(emitted.translated_instructions() as u64);
-                    match exit {
-                        BlockExit::DirectSuccessor => {}
-                        BlockExit::UnsupportedInstruction => {
-                            if let Some(stop) = self.assist_at_current_eip()? {
-                                return Ok(stop);
-                            }
-                        }
-                        _ => {
-                            return Ok(StopReason::UnsupportedInstruction {
-                                address: GuestVa(self.cpu.eip),
-                            });
-                        }
-                    }
-                }
-                EntryClass::Assisted => {
-                    if let Some(stop) = self.assist_at_current_eip()? {
-                        return Ok(stop);
-                    }
-                }
-                EntryClass::Interpreted => {
-                    if let Some(stop) = self.interpret_step()? {
-                        return Ok(stop);
-                    }
-                }
+            // Interpret, with the gate probe on the same cached decode.
+            // The register-only direct backend the loop once preferred is
+            // ADR 0013's cancelled JIT: classifying, planning, and
+            // dispatching per block cost more than every instruction it
+            // could execute, and `plan` still exercises it on demand.
+            if let Some(stop) = self.assist_at_current_eip()? {
+                return Ok(stop);
             }
         }
 
@@ -1164,44 +1182,93 @@ impl Emulator {
     /// Only translatable entries reach the code cache, so untranslatable
     /// regions neither churn executable buffers nor pollute the cache with
     /// zero-coverage blocks.
-    fn classify_entry(&self, start: GuestVa) -> EntryClass {
-        let Ok(bytes) = self.fetch_executable(start, 15) else {
-            return EntryClass::Interpreted;
-        };
-        let decoder = BasicBlockDecoder::new(DecodeConfig {
-            max_instructions: 1,
-            max_bytes: bytes.len().max(1),
-        });
-        let Ok(block) = decoder.decode(start, &bytes) else {
-            return EntryClass::Interpreted;
-        };
-        match block.instructions.first() {
-            Some(instruction) if classify_register_op(instruction).is_some() => {
-                EntryClass::Translatable
+    /// Probes the kernel gate at the current EIP, then falls back to one
+    /// interpreter step — from ONE decode, cached by physical-page
+    /// generation. The loop used to decode three times per instruction
+    /// (classification, the gate probe, and the step), which the stack
+    /// sampler showed as the tier's dominant cost.
+    fn assist_at_current_eip(&mut self) -> Result<Option<StopReason>, CoreError> {
+        let memory = self.memory.clone();
+        let eip = self.cpu.eip;
+        let mut cache = self.decoded.take().unwrap_or_default();
+        let decoded = {
+            let view = crate::mmio::MmioView::new(&memory, &self.devices);
+            match cache.get(eip, memory.page_table()) {
+                Some(instruction) => Ok(instruction),
+                None => match exbawks_cpu::decode_one(eip, &view) {
+                    Ok(instruction) => {
+                        cache.put(eip, instruction, &view);
+                        Ok(instruction)
+                    }
+                    Err(error) => Err(error),
+                },
             }
-            Some(_) => EntryClass::Assisted,
-            None => EntryClass::Interpreted,
+        };
+        self.decoded = Some(cache);
+        let instruction = match decoded {
+            Ok(instruction) => instruction,
+            Err(error) => return Ok(Some(self.stop_for_exec_error(error))),
+        };
+
+        // The `call [slot]` gate fast path, from the shared decode.
+        if indirect_call_slot(&instruction).is_some() {
+            match self.gate_call_with(&instruction)? {
+                GateAssist::Dispatched { stop: Some(stop), .. } => return Ok(Some(stop)),
+                // An unimplemented stub cannot correctly clean the stdcall
+                // stack or return meaningful values, so halt rather than
+                // continue past it with corrupted guest state.
+                GateAssist::Dispatched { ordinal, status, .. }
+                    if status == KernelStatus::NOT_IMPLEMENTED =>
+                {
+                    return Ok(Some(StopReason::UnimplementedKernelExport { ordinal }));
+                }
+                GateAssist::Dispatched { .. } => return Ok(self.apply_pending_scheduling()),
+                GateAssist::MissingExport { ordinal } => {
+                    return Ok(Some(StopReason::MissingKernelExport { ordinal }));
+                }
+                GateAssist::NotAGateCall => {}
+            }
+        }
+
+        let view = crate::mmio::MmioView::new(&memory, &self.devices);
+        let ports = DevicePorts(&self.devices);
+        match exbawks_cpu::step_instruction(&mut self.cpu, &view, &ports, &instruction) {
+            Ok(()) => Ok(None),
+            Err(error) => Ok(Some(self.stop_for_exec_error(error))),
         }
     }
 
-    /// Probes the kernel gate at the current EIP, then falls back to one
-    /// interpreter step.
-    fn assist_at_current_eip(&mut self) -> Result<Option<StopReason>, CoreError> {
-        match self.try_kernel_gate_call()? {
-            GateAssist::Dispatched { stop: Some(stop), .. } => Ok(Some(stop)),
-            // An unimplemented stub cannot correctly clean the stdcall
-            // stack or return meaningful values, so halt rather than
-            // continue past it with corrupted guest state.
-            GateAssist::Dispatched { ordinal, status, .. }
-                if status == KernelStatus::NOT_IMPLEMENTED =>
-            {
-                Ok(Some(StopReason::UnimplementedKernelExport { ordinal }))
+    /// Routes the PRAMIN window at the GPU instance claim, the moment
+    /// one exists.
+    ///
+    /// The pusher resolves every object through instance memory, and the
+    /// guest writes its objects through the PRAMIN window immediately
+    /// after claiming — within one pump tick. A redirect that arrives a
+    /// tick late latches those writes into the device stub instead of
+    /// instance RAM, and every DMA object then resolves as zeros: fences
+    /// release to physical zero and the title waits on them forever. So
+    /// the check runs after every kernel dispatch, where the claim itself
+    /// surfaces, and costs a bool when there is nothing to do.
+    fn route_pramin_if_claimed(&mut self) {
+        if !self.pramin_routed
+            && let Some((base, size)) = self.threads.as_ref().and_then(ThreadManager::gpu_instance)
+        {
+            self.devices.set_pramin(base.0, size);
+            self.pramin_routed = true;
+        }
+    }
+
+    /// The controlled stop one interpreter error maps to.
+    fn stop_for_exec_error(&self, error: ExecError) -> StopReason {
+        match error {
+            ExecError::Unsupported { address } | ExecError::InvalidInstruction { address } => {
+                StopReason::UnsupportedInstruction { address }
             }
-            GateAssist::Dispatched { .. } => Ok(self.apply_pending_scheduling()),
-            GateAssist::MissingExport { ordinal } => {
-                Ok(Some(StopReason::MissingKernelExport { ordinal }))
+            ExecError::Divide { address } => StopReason::GuestFault { address },
+            ExecError::Memory(error) => {
+                let address = memory_fault_address(&error).unwrap_or(GuestVa(self.cpu.eip));
+                StopReason::GuestFault { address }
             }
-            GateAssist::NotAGateCall => self.interpret_step(),
         }
     }
 
@@ -1293,17 +1360,34 @@ impl Emulator {
         {
             let _ = self.memory.write_u32(cell, ticks.wrapping_add(1));
         }
+        // The time-stamp counter runs at the console's clock rate against
+        // this tier's virtual millisecond, not at one tick per retired
+        // instruction: a title calibrates its waits by RDTSC, and a
+        // counter 180 times slower than the tick clock reads as frozen —
+        // DirectSound's init spins on it forever, which is exactly the
+        // stall the hypervisor tier once had from a genuinely frozen TSC.
+        // The interpreter's own per-instruction increment supplies the
+        // remainder, so the two advance sources stay consistent.
+        self.cpu.tsc = self
+            .cpu
+            .tsc
+            .wrapping_add(XBOX_TSC_PER_MILLISECOND.saturating_sub(BLOCKS_PER_VIRTUAL_MS));
         if let Some(threads) = self.threads.as_mut() {
             threads.advance_timers(1);
         }
         self.devices.advance_usb_frames(&WindowMemory(&self.memory.clone()), 1);
         self.attach_gamepad_when_ready();
         self.sample_gamepad();
+        self.route_pramin_if_claimed();
+        // Submissions retire every tick, not every vblank: the hypervisor
+        // tier consumes them the moment the kick write exits, and a title
+        // serializing on fences would otherwise crawl one batch per
+        // sixteen virtual milliseconds. An empty queue costs nothing.
+        self.consume_gpu_submissions();
         self.vblank_owed_blocks += 1;
         if self.vblank_owed_blocks >= VBLANK_INTERVAL_MS {
             self.vblank_owed_blocks = 0;
             self.devices.raise_vblank();
-            self.consume_gpu_submissions();
             self.present_display();
         }
         // Interrupts and deferred procedures run as guest code on the
@@ -1313,6 +1397,29 @@ impl Emulator {
                 self.deliver_dpc();
             } else if let Some(vector) = self.interrupt_requested() {
                 self.deliver_interrupt(vector);
+            } else {
+                // A deterministic time slice: the console preempts on its
+                // timer interrupt, and a thread polling in a loop with no
+                // kernel call in it would otherwise starve every other
+                // thread forever — the retail title's main thread polls
+                // its sound loads exactly that way while the mixer thread
+                // does the loading. Rotation by executed block count is a
+                // pure function of the run, so determinism holds (this is
+                // the amendment ADR 0017 declined only because its slices
+                // came from the wall clock). The same guards as the
+                // hypervisor tier's slices apply: never mid-interrupt,
+                // never at or above DISPATCH_LEVEL.
+                let irql_address = self.cpu.segments[exbawks_cpu::Segment::Fs as usize]
+                    .base
+                    .wrapping_add(KPCR_IRQL_OFFSET);
+                let raised = self
+                    .memory
+                    .read_u32(GuestVa(irql_address))
+                    .is_ok_and(|word| word & 0xFF >= DISPATCH_LEVEL);
+                if !raised {
+                    let cpu = &mut self.cpu;
+                    self.threads.as_mut().map(|threads| threads.rotate_active(cpu));
+                }
             }
         }
     }
@@ -1354,30 +1461,6 @@ impl Emulator {
         Some(StopReason::GuestDeadlock)
     }
 
-    /// Executes one instruction through the tier-0 interpreter (ADR 0008),
-    /// converting typed interpreter failures into controlled stop reasons.
-    fn interpret_step(&mut self) -> Result<Option<StopReason>, CoreError> {
-        let memory = self.memory.clone();
-        // Devices are routed here too, so the deterministic tier reaches
-        // the same hardware the hypervisor tier does — an APU status read
-        // is a device answer on both, never a fault on one of them, and
-        // the I/O ports go to the same latch the hypervisor exits reach.
-        let view = crate::mmio::MmioView::new(&memory, &self.devices);
-        let ports = DevicePorts(&self.devices);
-        match exbawks_cpu::step_with_ports(&mut self.cpu, &view, &ports) {
-            Ok(()) => Ok(None),
-            Err(ExecError::Unsupported { address } | ExecError::InvalidInstruction { address }) => {
-                Ok(Some(StopReason::UnsupportedInstruction { address }))
-            }
-            Err(ExecError::Divide { address }) => Ok(Some(StopReason::GuestFault { address })),
-            Err(ExecError::Memory(error)) => {
-                let address = memory_fault_address(&error).unwrap_or(GuestVa(self.cpu.eip));
-                Ok(Some(StopReason::GuestFault { address }))
-            }
-        }
-    }
-
-    /// Decodes and plans the current entry block.
     /// The most-submitted graphics methods, as (object handle, method,
     /// count) triples ordered by count.
     ///
@@ -1514,6 +1597,7 @@ impl Emulator {
         tracing::debug!(
             dpc = format_args!("{dpc:#010x}"),
             routine = format_args!("{routine:#010x}"),
+            tsc = self.cpu.tsc,
             "calling a queued deferred procedure"
         );
         true
@@ -1524,6 +1608,7 @@ impl Emulator {
         if let Some(saved) = self.interrupted.take() {
             tracing::debug!(
                 returned = format_args!("{:#010x}", self.cpu.gpr[0]),
+                tsc = self.cpu.tsc,
                 "a guest interrupt routine returned"
             );
             self.cpu = *saved;

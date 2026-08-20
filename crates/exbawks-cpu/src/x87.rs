@@ -34,6 +34,133 @@ const STACK_FAULT: u16 = 0x0040;
 /// The tag word's code for a register holding nothing.
 const TAG_EMPTY: u16 = 0x3;
 
+/// Which physical x87 slot an MMX register names (`mm0` is slot 0,
+/// independent of the stack top).
+fn mmx_register(register: Register, address: GuestVa) -> Result<usize, ExecError> {
+    if (Register::MM0..=Register::MM7).contains(&register) {
+        Ok(register as usize - Register::MM0 as usize)
+    } else {
+        Err(ExecError::Unsupported { address })
+    }
+}
+
+/// Reads one MMX register's 64 bits.
+fn read_mm(state: &CpuState, slot: usize) -> u64 {
+    let bytes = state.x87.registers[slot];
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
+/// Writes one MMX register, with the aliasing the hardware performs: the
+/// exponent field reads all-ones and the slot is marked in use.
+fn write_mm(state: &mut CpuState, slot: usize, value: u64) {
+    let slot_bytes = &mut state.x87.registers[slot];
+    slot_bytes[..8].copy_from_slice(&value.to_le_bytes());
+    slot_bytes[8] = 0xFF;
+    slot_bytes[9] = 0xFF;
+    state.x87.tag &= !(TAG_EMPTY << (slot * 2));
+    state.x87.status &= !TOP_MASK;
+}
+
+/// The 64-bit source of a two-operand MMX instruction.
+fn mmx_pair(
+    state: &CpuState,
+    memory: GuestMemoryRef<'_>,
+    instruction: &Instruction,
+    address: GuestVa,
+) -> Result<(usize, u64), ExecError> {
+    let destination = mmx_register(instruction.op_register(0), address)?;
+    let source = match instruction.op_kind(1) {
+        OpKind::Register => read_mm(state, mmx_register(instruction.op_register(1), address)?),
+        OpKind::Memory => {
+            let location = effective_address_for(state, instruction, address)?;
+            let mut bytes = [0_u8; 8];
+            memory.read(location, &mut bytes)?;
+            u64::from_le_bytes(bytes)
+        }
+        _ => return Err(ExecError::Unsupported { address }),
+    };
+    Ok((destination, source))
+}
+
+/// `movq`: 64 bits between an MMX register and memory or another register.
+fn mmx_movq(
+    state: &mut CpuState,
+    memory: GuestMemoryRef<'_>,
+    instruction: &Instruction,
+    address: GuestVa,
+) -> Result<(), ExecError> {
+    match (instruction.op_kind(0), instruction.op_kind(1)) {
+        (OpKind::Register, _) => {
+            let (destination, source) = mmx_pair(state, memory, instruction, address)?;
+            write_mm(state, destination, source);
+            Ok(())
+        }
+        (OpKind::Memory, OpKind::Register) => {
+            let source = read_mm(state, mmx_register(instruction.op_register(1), address)?);
+            let location = effective_address_for(state, instruction, address)?;
+            memory.write(location, &source.to_le_bytes())?;
+            Ok(())
+        }
+        _ => Err(ExecError::Unsupported { address }),
+    }
+}
+
+/// `movd`: 32 bits between an MMX register's low half and a register or
+/// memory; a load zeroes the high half.
+fn mmx_movd(
+    state: &mut CpuState,
+    memory: GuestMemoryRef<'_>,
+    instruction: &Instruction,
+    address: GuestVa,
+) -> Result<(), ExecError> {
+    let gpr = |register: Register| -> Option<usize> {
+        if (Register::EAX..=Register::EDI).contains(&register) {
+            Some(register as usize - Register::EAX as usize)
+        } else {
+            None
+        }
+    };
+    match (instruction.op_kind(0), instruction.op_kind(1)) {
+        (OpKind::Register, _) if mmx_register(instruction.op_register(0), address).is_ok() => {
+            let destination = mmx_register(instruction.op_register(0), address)?;
+            let value = match instruction.op_kind(1) {
+                OpKind::Register => gpr(instruction.op_register(1))
+                    .map(|index| state.gpr[index])
+                    .ok_or(ExecError::Unsupported { address })?,
+                OpKind::Memory => {
+                    let location = effective_address_for(state, instruction, address)?;
+                    let mut bytes = [0_u8; 4];
+                    memory.read(location, &mut bytes)?;
+                    u32::from_le_bytes(bytes)
+                }
+                _ => return Err(ExecError::Unsupported { address }),
+            };
+            write_mm(state, destination, u64::from(value));
+            Ok(())
+        }
+        (_, OpKind::Register) => {
+            let source = mmx_register(instruction.op_register(1), address)?;
+            let value = read_mm(state, source) as u32;
+            match instruction.op_kind(0) {
+                OpKind::Register => {
+                    let index = gpr(instruction.op_register(0))
+                        .ok_or(ExecError::Unsupported { address })?;
+                    state.gpr[index] = value;
+                }
+                OpKind::Memory => {
+                    let location = effective_address_for(state, instruction, address)?;
+                    memory.write(location, &value.to_le_bytes())?;
+                }
+                _ => return Err(ExecError::Unsupported { address }),
+            }
+            Ok(())
+        }
+        _ => Err(ExecError::Unsupported { address }),
+    }
+}
+
 impl CpuState {
     /// Which physical register `st(index)` names.
     fn physical(&self, index: usize) -> usize {
@@ -296,6 +423,19 @@ fn owns(mnemonic: Mnemonic) -> bool {
         Fstp, Fsub, Fsubp, Fsubr, Fsubrp, Ftst, Fucom, Fucomi, Fucomip, Fucomp, Fucompp, Fxam,
         Fxch, Fyl2x,
     };
+    if matches!(
+        mnemonic,
+        Mnemonic::Movq
+            | Mnemonic::Movntq
+            | Mnemonic::Movd
+            | Mnemonic::Emms
+            | Mnemonic::Pxor
+            | Mnemonic::Por
+            | Mnemonic::Pand
+            | Mnemonic::Pandn
+    ) {
+        return true;
+    }
     matches!(
         mnemonic,
         Fsincos
@@ -400,6 +540,33 @@ fn run(
     match mnemonic {
         M::Fninit => {
             state.x87 = crate::X87State::default();
+            return Ok(());
+        }
+        // -- the MMX unit, which aliases this register file ---------------
+        // An MMX register is the 64-bit mantissa of the corresponding
+        // physical x87 slot; a write sets the exponent bits and marks the
+        // slot in use, as the hardware's aliasing does, and `emms` hands
+        // the file back to the floating-point unit.
+        // The non-temporal store differs only in cache hints, and the
+        // interpreter models no cache.
+        M::Movq | M::Movntq => return mmx_movq(state, memory, instruction, address),
+        M::Movd => return mmx_movd(state, memory, instruction, address),
+        M::Emms => {
+            state.x87.tag = 0xFFFF;
+            state.x87.status &= !TOP_MASK;
+            return Ok(());
+        }
+        M::Pxor | M::Por | M::Pand | M::Pandn => {
+            let (destination, source) = mmx_pair(state, memory, instruction, address)?;
+            let existing = read_mm(state, mmx_register(instruction.op_register(0), address)?);
+            let result = match mnemonic {
+                M::Pxor => existing ^ source,
+                M::Por => existing | source,
+                M::Pand => existing & source,
+                _ => !existing & source,
+            };
+            let _ = destination;
+            write_mm(state, mmx_register(instruction.op_register(0), address)?, result);
             return Ok(());
         }
         M::Fnclex => {
