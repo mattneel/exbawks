@@ -144,7 +144,9 @@ impl Default for CpuState {
         Self {
             gpr: [0; 8],
             eip: 0,
-            eflags: 0x0000_0002,
+            // Bit 1 is architecturally fixed; the interrupt flag starts
+            // set, as the kernel leaves it when it hands a title control.
+            eflags: 0x0000_0202,
             segments: [SegmentState::default(); 6],
             xmm: [0; 8],
             mxcsr: 0x1F80,

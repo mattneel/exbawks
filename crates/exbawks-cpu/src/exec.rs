@@ -123,12 +123,91 @@ enum Flow {
 /// mid-repeat fault leaves the partial progress hardware would leave; the
 /// EIP still never moves on a fault, keeping the instruction restartable.
 pub fn step(state: &mut CpuState, memory: &dyn GuestMemory) -> Result<(), ExecError> {
+    step_with_ports(state, memory, &NoPorts)
+}
+
+/// Where `in` and `out` instructions read and write.
+///
+/// The console's I/O ports are a device surface like its MMIO ranges; a
+/// caller without one passes [`NoPorts`], which answers zero and swallows
+/// writes — the behavior of a bus with nothing listening.
+pub trait PortBus {
+    /// One port read of `bytes` bytes, zero-extended.
+    fn port_read(&self, port: u16, bytes: u8) -> u32;
+
+    /// One port write of the low `bytes` bytes of `value`.
+    fn port_write(&self, port: u16, bytes: u8, value: u32);
+}
+
+/// A bus with nothing listening: reads are zero, writes vanish.
+pub struct NoPorts;
+
+impl PortBus for NoPorts {
+    fn port_read(&self, _port: u16, _bytes: u8) -> u32 {
+        0
+    }
+
+    fn port_write(&self, _port: u16, _bytes: u8, _value: u32) {}
+}
+
+/// [`step`], with I/O port instructions routed to `ports`.
+pub fn step_with_ports(
+    state: &mut CpuState,
+    memory: &dyn GuestMemory,
+    ports: &dyn PortBus,
+) -> Result<(), ExecError> {
     let address = GuestVa(state.eip);
     let instruction = decode_at(state.eip, memory, address)?;
-    if execute(state, memory, &instruction, address)? == Flow::Next {
-        state.eip = state.eip.wrapping_add(instruction.len() as u32);
+    match instruction.mnemonic() {
+        Mnemonic::Out | Mnemonic::In => execute_port_io(state, ports, &instruction, address)?,
+        _ => {
+            if execute(state, memory, &instruction, address)? == Flow::Next {
+                state.eip = state.eip.wrapping_add(instruction.len() as u32);
+            }
+            state.tsc = state.tsc.wrapping_add(1);
+            return Ok(());
+        }
     }
+    state.eip = state.eip.wrapping_add(instruction.len() as u32);
     state.tsc = state.tsc.wrapping_add(1);
+    Ok(())
+}
+
+/// `in`/`out` between EAX's low bytes and a port named by DX or an
+/// immediate. The string forms stay unsupported until a title uses one.
+fn execute_port_io(
+    state: &mut CpuState,
+    ports: &dyn PortBus,
+    instruction: &Instruction,
+    address: GuestVa,
+) -> Result<(), ExecError> {
+    let accumulator_first = instruction.mnemonic() == Mnemonic::In;
+    let port_operand = u32::from(accumulator_first);
+    let port = match instruction.op_kind(port_operand) {
+        OpKind::Immediate8 => u16::from(instruction.immediate8()),
+        OpKind::Register if instruction.op_register(port_operand) == Register::DX => {
+            (state.gpr[2] & 0xFFFF) as u16
+        }
+        _ => return Err(ExecError::Unsupported { address }),
+    };
+    let accumulator = instruction.op_register(if accumulator_first { 0 } else { 1 });
+    let bytes = match accumulator {
+        Register::AL => 1_u8,
+        Register::AX => 2,
+        Register::EAX => 4,
+        _ => return Err(ExecError::Unsupported { address }),
+    };
+    let mask: u32 = match bytes {
+        1 => 0xFF,
+        2 => 0xFFFF,
+        _ => u32::MAX,
+    };
+    if accumulator_first {
+        let value = ports.port_read(port, bytes) & mask;
+        state.gpr[0] = (state.gpr[0] & !mask) | value;
+    } else {
+        ports.port_write(port, bytes, state.gpr[0] & mask);
+    }
     Ok(())
 }
 
@@ -173,8 +252,13 @@ fn execute(
     if let Some(flow) = branch(state, memory, instruction, address)? {
         return Ok(flow);
     }
-    // The floating-point unit owns its own mnemonics (ADR 0018).
+    // The floating-point unit owns its own mnemonics (ADR 0018), and the
+    // SSE unit owns the vector ones beside it.
     if let Some(result) = crate::x87::execute(state, memory, instruction, address) {
+        result?;
+        return Ok(Flow::Next);
+    }
+    if let Some(result) = crate::sse::execute(state, memory, instruction, address) {
         result?;
         return Ok(Flow::Next);
     }
@@ -329,6 +413,20 @@ fn execute_straightline(
 ) -> Result<(), ExecError> {
     match instruction.mnemonic() {
         Mnemonic::Nop | Mnemonic::Pause => Ok(()),
+        // Cache control: the interpreter models no cache, so writing one
+        // back or invalidating it changes nothing it can observe.
+        Mnemonic::Wbinvd | Mnemonic::Invd | Mnemonic::Clflush => Ok(()),
+        // The interrupt flag: the guest runs in ring zero and may gate
+        // interrupt delivery. The run loop checks the flag before it
+        // delivers, so clearing it here really defers the interrupt.
+        Mnemonic::Cli => {
+            state.eflags &= !flags::INTERRUPT;
+            Ok(())
+        }
+        Mnemonic::Sti => {
+            state.eflags |= flags::INTERRUPT;
+            Ok(())
+        }
         Mnemonic::Mov => mov(state, memory, instruction, address),
         Mnemonic::Movzx => widen(state, memory, instruction, address, false),
         Mnemonic::Movsx => widen(state, memory, instruction, address, true),

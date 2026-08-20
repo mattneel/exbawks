@@ -29,6 +29,51 @@ The project follows Keep a Changelog structure before its first release.
   "stopped working" — the same press, in a run that lost the race, ends
   at the fault before the title acts on it.
 
+### Added
+
+- The deterministic tier can run the retail title's world now (the review's
+  P3, in progress). The interpreter gained the Pentium III SSE1 surface —
+  moves, packed and scalar arithmetic with the architectural second-operand
+  min/max rule, compares including the `comiss` flag image, shuffles,
+  conversions honoring `MXCSR` rounding, and the control instructions —
+  plus `fsincos` and the cache-control no-ops. Its run loop now routes the
+  same device space the hypervisor tier reaches (MMIO and I/O ports both),
+  recognizes the interrupt-return sentinel, and pumps devices by executed
+  block count instead of not at all: one virtual millisecond of timers,
+  USB frames, vblank, deferred procedures, and pushbuffer consumption per
+  tick, so this tier renders — identically at identical block counts,
+  which is what a golden requires. Also `cli`/`sti` with a delivery gate
+  that honors the interrupt flag (on both tiers — delivery never checked
+  it before), boot EFLAGS with the flag set as the kernel leaves it, and
+  the cache-control no-ops.
+
+  Measured: two 400-million-instruction runs with a scripted press end in
+  bit-identical registers — determinism holds through input, USB
+  enumeration, interrupts, timers, and the pump. What remains between
+  here and a recorded title-screen golden is throughput, not
+  correctness: the tier runs about half a console-second per two wall
+  minutes, and the title needs ten-plus console-seconds to draw its
+  first frame. A golden is recordable today by patience; making it cheap
+  is an optimization task, not a semantics one.
+
+- The early intermittent `GuestFault` at `0x7FFFFFF8` is closed as fixed
+  by the scrubbed free pool: zero occurrences in thirteen post-scrub runs
+  against a roughly one-in-five historical rate — about a five percent
+  chance of that streak were it still alive. Reopen on sight.
+
+- `--press` speaks the analogue face buttons: `a@52000` presses the
+  console's A — a pressure byte, not a bit, and the button that confirms a
+  menu. First use took the title past difficulty select into five further
+  screen transitions.
+
+### Fixed
+
+- The physical allocator's rollback path asserted that the allocation
+  being rolled back was the cursor's latest — true of a bump allocator,
+  false the moment the free pool could satisfy an allocation, and a guest
+  can arrange for the mapping failure that triggers a rollback. It now
+  returns pool-sourced allocations to the pool instead of panicking.
+
 ### Changed
 
 - **The menu-transition crash is dead, and the diagnosis is a story worth

@@ -5,6 +5,7 @@ mod decode;
 mod exec;
 pub mod flags;
 mod interpret;
+mod sse;
 mod state;
 mod subset;
 mod x87;
@@ -12,7 +13,7 @@ mod x87;
 pub use decode::{
     BasicBlockDecoder, BlockDecodeError, BlockStop, DecodeConfig, DecodedBlock, format_instruction,
 };
-pub use exec::{ExecError, step};
+pub use exec::{ExecError, NoPorts, PortBus, step, step_with_ports};
 pub use interpret::{InterpretError, step_register_only};
 pub use state::{CpuState, Gpr, Segment, SegmentState, X87State};
 pub use subset::{AluOp, RegisterOp, RegisterOperand, classify_register_op, indirect_call_slot};

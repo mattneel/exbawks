@@ -8,5 +8,5 @@ pub mod ohci;
 
 pub use device::{GamepadDevice, Setup};
 pub use dualsense::translate as translate_controller_report;
-pub use gamepad::{GamepadState, InputSource, NoInput, ScriptedInput, button};
+pub use gamepad::{GamepadState, InputSource, NoInput, ScriptedInput, analogue, button};
 pub use ohci::{OhciController, UsbMemory};

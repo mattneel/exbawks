@@ -292,13 +292,15 @@ fn owns(mnemonic: Mnemonic) -> bool {
         F2xm1, Fabs, Fadd, Faddp, Fchs, Fcom, Fcomi, Fcomip, Fcomp, Fcompp, Fcos, Fdiv, Fdivp,
         Fdivr, Fdivrp, Fiadd, Ficom, Ficomp, Fidiv, Fidivr, Fild, Fimul, Fist, Fistp, Fisub,
         Fisubr, Fld, Fld1, Fldl2e, Fldl2t, Fldlg2, Fldln2, Fldpi, Fldz, Fmul, Fmulp, Fnclex,
-        Fninit, Fnstcw, Fnstsw, Fpatan, Fprem, Fptan, Frndint, Fscale, Fsin, Fsqrt, Fst, Fstp,
-        Fsub, Fsubp, Fsubr, Fsubrp, Ftst, Fucom, Fucomi, Fucomip, Fucomp, Fucompp, Fxam, Fxch,
-        Fyl2x,
+        Fninit, Fnstcw, Fnstsw, Fpatan, Fprem, Fptan, Frndint, Fscale, Fsin, Fsincos, Fsqrt, Fst,
+        Fstp, Fsub, Fsubp, Fsubr, Fsubrp, Ftst, Fucom, Fucomi, Fucomip, Fucomp, Fucompp, Fxam,
+        Fxch, Fyl2x,
     };
     matches!(
         mnemonic,
-        Fld | Fst
+        Fsincos
+            | Fld
+            | Fst
             | Fstp
             | Fild
             | Fist
@@ -524,6 +526,14 @@ fn run(
         M::Fsin => {
             let value = state.read_st(0);
             state.write_st(0, value.sin());
+            state.x87.status &= !C2;
+        }
+        M::Fsincos => {
+            // The sine replaces st(0) and the cosine is pushed above it,
+            // leaving cos in st(0) and sin in st(1).
+            let value = state.read_st(0);
+            state.write_st(0, value.sin());
+            state.push_st(value.cos());
             state.x87.status &= !C2;
         }
         M::Fcos => {

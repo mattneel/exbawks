@@ -156,9 +156,10 @@ struct RunArgs {
     #[arg(long)]
     gamepad_live: bool,
     /// Presses a button on the emulated gamepad, as `name@frame` — for
-    /// example `start@40000`. Repeatable, and reproducible, so a run
-    /// driven by these may record a golden. Names: up, down, left, right,
-    /// start, back, left-stick, right-stick.
+    /// example `start@40000` or `a@52000`. Repeatable, and reproducible,
+    /// so a run driven by these may record a golden. Names: up, down,
+    /// left, right, start, back, left-stick, right-stick, a, b, x, y,
+    /// black, white, left-trigger, right-trigger.
     #[arg(long, value_name = "BUTTON@FRAME")]
     press: Vec<String>,
     /// How many controller frames each scripted press is held for.
@@ -659,8 +660,8 @@ struct RunOptions<'a> {
     gamepad: bool,
     /// Whether that gamepad is fed by a real controller.
     gamepad_live: bool,
-    /// Scripted presses, as controller frame and button mask.
-    presses: &'a [(u64, u16)],
+    /// Scripted presses, as controller frame and the state pressed then.
+    presses: &'a [(u64, exbawks_usb::GamepadState)],
     /// How long each scripted press is held.
     press_frames: u64,
     /// Whether to show what the title draws in a window.
@@ -1423,8 +1424,12 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
 }
 
 /// Parses `--press` arguments of the form `name@frame`.
-fn parse_presses(arguments: &[String]) -> Result<Vec<(u64, u16)>> {
-    use exbawks_usb::button;
+///
+/// The digital names set a button bit; the face buttons and triggers are
+/// the console's analogue pressure bytes, pressed at full pressure — `a`
+/// is what confirms a menu.
+fn parse_presses(arguments: &[String]) -> Result<Vec<(u64, exbawks_usb::GamepadState)>> {
+    use exbawks_usb::{GamepadState, analogue, button};
 
     arguments
         .iter()
@@ -1432,25 +1437,35 @@ fn parse_presses(arguments: &[String]) -> Result<Vec<(u64, u16)>> {
             let (name, frame) = argument.split_once('@').with_context(|| {
                 format!("expected a press as name@frame, for example start@40000: {argument}")
             })?;
-            let buttons = match name.trim().to_ascii_lowercase().as_str() {
-                "up" => button::UP,
-                "down" => button::DOWN,
-                "left" => button::LEFT,
-                "right" => button::RIGHT,
-                "start" => button::START,
-                "back" => button::BACK,
-                "left-stick" => button::LEFT_STICK,
-                "right-stick" => button::RIGHT_STICK,
+            let mut state = GamepadState::default();
+            match name.trim().to_ascii_lowercase().as_str() {
+                "up" => state.buttons = button::UP,
+                "down" => state.buttons = button::DOWN,
+                "left" => state.buttons = button::LEFT,
+                "right" => state.buttons = button::RIGHT,
+                "start" => state.buttons = button::START,
+                "back" => state.buttons = button::BACK,
+                "left-stick" => state.buttons = button::LEFT_STICK,
+                "right-stick" => state.buttons = button::RIGHT_STICK,
+                "a" => state.analogue[analogue::A] = u8::MAX,
+                "b" => state.analogue[analogue::B] = u8::MAX,
+                "x" => state.analogue[analogue::X] = u8::MAX,
+                "y" => state.analogue[analogue::Y] = u8::MAX,
+                "black" => state.analogue[analogue::BLACK] = u8::MAX,
+                "white" => state.analogue[analogue::WHITE] = u8::MAX,
+                "left-trigger" => state.analogue[analogue::LEFT_TRIGGER] = u8::MAX,
+                "right-trigger" => state.analogue[analogue::RIGHT_TRIGGER] = u8::MAX,
                 other => anyhow::bail!(
                     "unknown button {other}: expected up, down, left, right, start, back, \
-                     left-stick, or right-stick"
+                     left-stick, right-stick, a, b, x, y, black, white, left-trigger, or \
+                     right-trigger"
                 ),
-            };
+            }
             let frame = frame
                 .trim()
                 .parse::<u64>()
                 .with_context(|| format!("a press frame must be a number: {frame}"))?;
-            Ok((frame, buttons))
+            Ok((frame, state))
         })
         .collect()
 }

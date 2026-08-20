@@ -138,12 +138,15 @@ impl ScriptedInput {
     /// being down, so a press that is never released is one press; holding
     /// each briefly and letting go is what a person does and what a menu
     /// expects. Presses are taken in frame order and a later one replaces
-    /// whatever the previous release left.
+    /// whatever the previous release left. Each press is a whole controller
+    /// state, so the analogue face buttons — the console's A is a pressure
+    /// byte, not a bit, and A is what confirms a menu — press as naturally
+    /// as the digital ones.
     #[must_use]
-    pub fn taps(presses: &[(u64, u16)], hold: u64) -> Self {
+    pub fn taps(presses: &[(u64, GamepadState)], hold: u64) -> Self {
         let mut steps = vec![(0, GamepadState::default())];
-        for (frame, buttons) in presses {
-            steps.push((*frame, GamepadState { buttons: *buttons, ..GamepadState::default() }));
+        for (frame, state) in presses {
+            steps.push((*frame, *state));
             steps.push((frame.saturating_add(hold.max(1)), GamepadState::default()));
         }
         Self::new(steps)
@@ -173,7 +176,9 @@ mod tests {
     fn a_tap_is_pressed_and_then_let_go() {
         // A title watches for the moment a button goes down, so a press
         // that is never released is one press however long it is held.
-        let script = ScriptedInput::taps(&[(100, button::START), (300, button::UP)], 50);
+        let press = |buttons: u16| GamepadState { buttons, ..GamepadState::default() };
+        let script =
+            ScriptedInput::taps(&[(100, press(button::START)), (300, press(button::UP))], 50);
 
         assert_eq!(script.sample(0).expect("a state").buttons, 0, "nothing at the start");
         assert_eq!(script.sample(99).expect("a state").buttons, 0);

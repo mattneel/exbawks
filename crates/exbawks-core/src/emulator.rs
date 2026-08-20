@@ -110,6 +110,19 @@ impl exbawks_usb::UsbMemory for WindowMemory<'_> {
     }
 }
 
+/// The device space's I/O ports, as the interpreter's port bus.
+struct DevicePorts<'a>(&'a crate::mmio::DeviceSpace);
+
+impl exbawks_cpu::PortBus for DevicePorts<'_> {
+    fn port_read(&self, port: u16, _bytes: u8) -> u32 {
+        self.0.port_read(port)
+    }
+
+    fn port_write(&self, port: u16, _bytes: u8, value: u32) {
+        self.0.port_write(port, value);
+    }
+}
+
 /// Guest physical memory as borrowed dwords, addressed physically.
 ///
 /// The graphics engine reads texels and writes pixels by the million; going
@@ -477,6 +490,7 @@ impl EmulatorBuilder {
             #[cfg(windows)]
             live_gamepad: None,
             scripted_input: None,
+            vblank_owed_blocks: 0,
             interrupted: None,
             watch_write: None,
             brightest_frame: None,
@@ -523,6 +537,8 @@ pub struct Emulator {
     /// a host operation, so it exists only where there is one.
     #[cfg(windows)]
     live_gamepad: Option<std::sync::Arc<LiveGamepad>>,
+    /// Virtual milliseconds owed toward the next deterministic vblank.
+    vblank_owed_blocks: u64,
     /// Presses the run makes on its own, by controller frame.
     ///
     /// A run driven by one of these is reproducible, which a run driven by
@@ -1044,11 +1060,13 @@ impl Emulator {
 
         for executed in 0..max_blocks {
             if executed.is_multiple_of(BLOCKS_PER_TICK) {
-                if let Some(cell) = tick_cell
-                    && let Ok(ticks) = self.memory.read_u32(cell)
-                {
-                    let _ = self.memory.write_u32(cell, ticks.wrapping_add(1));
-                }
+                // One deterministic millisecond: the devices advance by
+                // executed work, never by the host's clock, which is what
+                // makes a digest from this tier a golden (ADR 0013). The
+                // same devices the hypervisor tier pumps by wall time run
+                // here by block count — vblanks, timers, USB frames, and
+                // the pushbuffer all included, so this tier renders.
+                self.pump_tick_deterministic(tick_cell);
                 if executed > 0 && executed.is_multiple_of(BLOCKS_PER_HEARTBEAT) {
                     tracing::info!(
                         executed,
@@ -1069,6 +1087,12 @@ impl Emulator {
                 continue;
             }
             let start = GuestVa(self.cpu.eip);
+            // An interrupt routine returned to its sentinel: restore the
+            // displaced context and continue where the interrupt landed.
+            if start == INTERRUPT_RETURN_SENTINEL {
+                self.finish_interrupt();
+                continue;
+            }
             // A thread's start routine returned (ADR 0011): a created thread
             // returns to the exit sentinel; the boot thread, whose stack has
             // no set-up return address, returns to null. Either exits the
@@ -1256,6 +1280,43 @@ impl Emulator {
         if any_waiting { None } else { Some(StopReason::GuestExit { code: status }) }
     }
 
+    /// One virtual millisecond of device time for the deterministic tier.
+    ///
+    /// Everything the hypervisor tier's wall-clock pump does, driven by
+    /// executed blocks instead: the tick cell, timers and wait deadlines,
+    /// USB frames, the vertical blank with its interrupt, deferred
+    /// procedures, pushbuffer consumption, and the window when one is
+    /// open. Identical work at identical block counts, every run.
+    fn pump_tick_deterministic(&mut self, tick_cell: Option<GuestVa>) {
+        if let Some(cell) = tick_cell
+            && let Ok(ticks) = self.memory.read_u32(cell)
+        {
+            let _ = self.memory.write_u32(cell, ticks.wrapping_add(1));
+        }
+        if let Some(threads) = self.threads.as_mut() {
+            threads.advance_timers(1);
+        }
+        self.devices.advance_usb_frames(&WindowMemory(&self.memory.clone()), 1);
+        self.attach_gamepad_when_ready();
+        self.sample_gamepad();
+        self.vblank_owed_blocks += 1;
+        if self.vblank_owed_blocks >= VBLANK_INTERVAL_MS {
+            self.vblank_owed_blocks = 0;
+            self.devices.raise_vblank();
+            self.consume_gpu_submissions();
+            self.present_display();
+        }
+        // Interrupts and deferred procedures run as guest code on the
+        // current thread; the interpreter simply keeps executing them.
+        if self.interrupted.is_none() {
+            if self.threads.as_ref().is_some_and(ThreadManager::has_queued_dpc) {
+                self.deliver_dpc();
+            } else if let Some(vector) = self.interrupt_requested() {
+                self.deliver_interrupt(vector);
+            }
+        }
+    }
+
     /// One deterministic idle step for the interpreter tier (ADR 0021).
     ///
     /// With every thread parked, virtual time jumps straight to the next
@@ -1297,7 +1358,13 @@ impl Emulator {
     /// converting typed interpreter failures into controlled stop reasons.
     fn interpret_step(&mut self) -> Result<Option<StopReason>, CoreError> {
         let memory = self.memory.clone();
-        match exbawks_cpu::step(&mut self.cpu, memory.as_ref()) {
+        // Devices are routed here too, so the deterministic tier reaches
+        // the same hardware the hypervisor tier does — an APU status read
+        // is a device answer on both, never a fault on one of them, and
+        // the I/O ports go to the same latch the hypervisor exits reach.
+        let view = crate::mmio::MmioView::new(&memory, &self.devices);
+        let ports = DevicePorts(&self.devices);
+        match exbawks_cpu::step_with_ports(&mut self.cpu, &view, &ports) {
             Ok(()) => Ok(None),
             Err(ExecError::Unsupported { address } | ExecError::InvalidInstruction { address }) => {
                 Ok(Some(StopReason::UnsupportedInstruction { address }))
@@ -1373,6 +1440,11 @@ impl Emulator {
             // Already inside one. Hardware would nest by priority; this
             // waits, which costs latency and never loses the request
             // because the device keeps its status bit raised.
+            return false;
+        }
+        // The guest gates delivery with the interrupt flag; a cleared IF
+        // defers the interrupt, and the device's raised status retries it.
+        if self.cpu.eflags & 0x200 == 0 {
             return false;
         }
         let Some(routine) =
@@ -1650,7 +1722,7 @@ impl Emulator {
     ///
     /// Each entry is a controller frame and the buttons pressed then, held
     /// briefly and released, as a person's press is.
-    pub fn set_scripted_input(&mut self, presses: &[(u64, u16)], hold: u64) {
+    pub fn set_scripted_input(&mut self, presses: &[(u64, exbawks_usb::GamepadState)], hold: u64) {
         self.scripted_input = Some(exbawks_usb::ScriptedInput::taps(presses, hold));
     }
 
