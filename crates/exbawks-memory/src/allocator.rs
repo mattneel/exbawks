@@ -105,11 +105,19 @@ impl PhysicalAllocator {
         self.page_count
     }
 
+    /// Returns an allocation that never took effect.
+    ///
+    /// A cursor-tail allocation moves the cursor back; one that came from
+    /// the free pool goes back to the pool. This must never assert: the
+    /// path runs when a mapping fails, and a guest can arrange for a
+    /// mapping to fail.
     pub(crate) fn rollback_last(&mut self, start: GuestPage, page_count: u32) {
-        let expected_end =
-            start.0.checked_add(page_count).expect("a completed allocation cannot overflow");
-        assert_eq!(self.next_page, expected_end, "only the latest allocation can roll back");
-        self.next_page = start.0;
+        let end = start.0.saturating_add(page_count);
+        if self.next_page == end {
+            self.next_page = start.0;
+        } else {
+            self.free(start, page_count);
+        }
     }
 }
 
@@ -143,6 +151,21 @@ mod tests {
         assert_eq!(allocator.allocate(4).expect("reused").0, run.0);
         // The second copy of the run must not be handed out again.
         assert_eq!(allocator.allocate(4).expect("fresh").0, 4);
+    }
+
+    #[test]
+    fn a_pool_sourced_allocation_rolls_back_into_the_pool() {
+        // The rollback path runs when a mapping fails, and a guest can
+        // arrange for a mapping to fail — it must never panic, whichever
+        // side of the cursor the allocation came from.
+        let mut allocator = PhysicalAllocator::new(16);
+        let first = allocator.allocate(4).expect("first");
+        let _second = allocator.allocate(4).expect("second");
+        allocator.free(first, 4);
+        let pooled = allocator.allocate(4).expect("from the pool");
+        assert_eq!(pooled.0, first.0, "the pool satisfied it");
+        allocator.rollback_last(pooled, 4);
+        assert_eq!(allocator.allocate(4).expect("again").0, pooled.0, "back in the pool");
     }
 
     #[test]
