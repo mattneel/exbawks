@@ -696,6 +696,34 @@ Two active threads:
    faults in about two minutes. Determinism of the failure is what the
    whole change bought; chase it from the allocator, not the unlink.
 
+   **Chased, and dead.** The deterministic fault was the title's own
+   out-of-memory error path: a full-stack `--peek` at the fault (the
+   faulting thread's ESP was bit-identical across runs, so fixed peek
+   addresses worked) held `E_OUTOFMEMORY` beside a request for exactly
+   one 640x480 surface, and the "corruption" was D3D's failure cleanup
+   freeing a static default object — a real title bug no console ever
+   hits, because no console fails that allocation. Ours did:
+   `MmFreeContiguousMemory` was a no-op over a bump allocator, so every
+   surface freed at a menu transition leaked, and the console's 64 MiB
+   exhausts in about a minute of menus. Doubling `--ram-mib` made the
+   fault vanish, which settled it.
+
+   The physical allocator now carries a scrubbed, coalescing free pool
+   and `MmFreeContiguousMemory` really frees. The scrub is not optional:
+   the first unscrubbed build handed a fresh commit somebody else's old
+   data, and the title's heap read a leftover `0xFFFFFF00` as a
+   free-list link. Every allocation path promises zeroed pages, and that
+   promise was only ever free because the bump allocator handed out
+   untouched RAM. Four runs of four at the console's own 64 MiB now pass
+   the menu transition to budget exhaustion.
+
+   Diagnosis techniques that carried the whole hunt, in the order they
+   paid: trace the kernel calls (zero frees was the tell); peek the
+   faulting thread's whole stack frame when ESP repeats across runs;
+   loop the run until the wanted fault is the one caught; and when a
+   watchpoint slows the guest enough to dodge the bug, read that as
+   timing-sensitivity, not absence.
+
    **Superseded:** the driver used to ask the same question six times and
    give up, cycling the port.
 
