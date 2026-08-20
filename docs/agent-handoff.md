@@ -739,6 +739,20 @@ Two active threads:
    (`a@34000` confirms a menu; the first use drove five screen
    transitions past difficulty select).
 
+   **The program goal is reached: the deterministic tier renders the
+   retail title's screen with a reproducible digest.** Two four-billion-
+   instruction interpreter runs draw the full title screen and digest
+   identically, and an intermediate digest matches the hypervisor tier's
+   frame bit-for-bit. The chain that got there is in the CHANGELOG; the
+   two most reusable pieces: run the burn-down by measuring after every
+   fix rather than stacking theories, and distrust any sampler whose
+   period shares structure with the thing sampled — a heartbeat on
+   pump-tick boundaries photographs freshly delivered interrupt entries,
+   and a period sharing a factor with the vblank cycle phase-locks onto
+   one instruction. Golden runs:
+   `--engine interpreter --max-blocks 4000000000 --frame-digest`, about
+   five minutes; the digest belongs beside the private fixtures.
+
    **The kernel-object subsystem lives in `exbawks-kernel`** as
    `runtime.rs` (thread table, scheduler, waits, timers, allocators,
    the `KernelServices` implementation) with `hostfs.rs` beside it —
